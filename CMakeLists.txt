@@ -22,13 +22,13 @@ if(EMSCRIPTEN)
 
     set(DAWN_PORT "${emdawnwebgpu_SOURCE_DIR}/emdawnwebgpu.port.py")
 
-    target_compile_options(app PRIVATE "--use-port=${DAWN_PORT}" "--use-port=sdl3")
+    target_compile_options(app PRIVATE "--use-port=${DAWN_PORT}" "-Oz")
     target_link_options(app PRIVATE
         "--use-port=${DAWN_PORT}"
-        "--use-port=sdl3"
-        "-sASYNCIFY=1"
+        "-sASYNCIFY=0"
         "-sALLOW_MEMORY_GROWTH=1"
         "--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
+        "-Oz"
     )
 
     set_target_properties(app PROPERTIES SUFFIX ".html")
@@ -48,6 +48,11 @@ if(EMSCRIPTEN)
             "-sWASM=2"
             "-sENVIRONMENT=web"
             "-sMALLOC=emmalloc"
+            "-sASSERTIONS=0"
+            "-sSAFE_HEAP=0"
+            "-sSTACK_OVERFLOW_CHECK=0"
+            "-sDEMANGLE_SUPPORT=0"
+            "-sGL_ASSERTIONS=0"
         )
     endif()
 
