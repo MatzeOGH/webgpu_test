@@ -18,7 +18,7 @@ if(EMSCRIPTEN)
     )
     FetchContent_MakeAvailable(emdawnwebgpu)
 
-    add_executable(app src/main.cpp src/Renderer.cpp)
+    add_executable(app src/main_web.cpp src/Framework.cpp src/Renderer.cpp)
 
     set(DAWN_PORT "${emdawnwebgpu_SOURCE_DIR}/emdawnwebgpu.port.py")
 
@@ -91,12 +91,12 @@ elseif(WIN32)
     find_package(Dawn  REQUIRED)
     find_package(SDL3  REQUIRED CONFIG)
 
-    add_executable(app WIN32 src/main.cpp src/Renderer.cpp)
+    add_executable(app src/main_SDL.cpp src/Framework.cpp src/Renderer.cpp)
     target_link_libraries(app PRIVATE dawn::webgpu_dawn SDL3::SDL3)
 
     # Copy SDL3.dll, dxil.dll, and dxcompiler.dll next to the exe at runtime.
     set(DXIL_DIR "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Redist/D3D/x64")
-    foreach(DLL dxil.dll dxcompiler.dll)
+    foreach(DLL dxil.dll dxcompiler.dll d3dcompiler_47.dll)
         add_custom_command(TARGET app POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${DXIL_DIR}/${DLL}"
