@@ -5,10 +5,8 @@
 #include <webgpu/webgpu_cpp.h>
 #include <cstring>
 
-// EM_JS imports — compiled as real WASM imports, not EM_ASM string tricks.
-// JS side writes window.joystickX/Y; these read them back each frame.
-EM_JS(float, js_joy_x, (), { return window.joystickX || 0; });
-EM_JS(float, js_joy_y, (), { return window.joystickY || 0; });
+// JS writes directly into these via HEAPF32 — no return-value path needed.
+static float g_js_joy_x = 0.f, g_js_joy_y = 0.f;
 
 // ---- Touch input -----------------------------------------------------------
 
@@ -188,8 +186,17 @@ int main() {
     emscripten_set_touchend_callback(   "#canvas", nullptr, true, on_touchend);
     emscripten_set_touchcancel_callback("#canvas", nullptr, true, on_touchend);
 
+    // Expose window.setJoystick(x,y) that writes directly into C++ floats via HEAPF32.
+    // Re-reads HEAPF32 each call so memory growth never stales the typed-array view.
+    EM_ASM({
+        window['setJoystick'] = function(x, y) {
+            HEAPF32[$0 >> 2] = x;
+            HEAPF32[$1 >> 2] = y;
+        };
+    }, &g_js_joy_x, &g_js_joy_y);
+
     emscripten_set_main_loop_arg([](void*){
-        input_set_look_joystick(js_joy_x(), js_joy_y());
+        input_set_look_joystick(g_js_joy_x, g_js_joy_y);
         webgpu_tick();
     }, nullptr, 0, false);
     return 0;

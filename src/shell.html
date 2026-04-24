@@ -130,8 +130,7 @@
                         "px), calc(-50% + " +
                         ny * MAX_R +
                         "px))";
-                    window.joystickX = nx;
-                    window.joystickY = ny;
+                    if (window.setJoystick) window.setJoystick(nx, ny);
                 }
 
                 base.addEventListener(
