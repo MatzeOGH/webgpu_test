@@ -722,7 +722,7 @@ fn cs_main(
     }
 
     // Load mesh (falls back to triangle if file not found)
-    loadMeshForRendering("C:/Users/matth/Documents/Aurora/Aurora/assets/roman_stone_capital_high/Roman_Stone_Capital_tfpvdgeda_High.gltf");
+    loadMeshForRendering("assets/Roman_Stone_Capital_tfpvdgeda_High.gltf");
 }
 
 void renderer_resize(uint32_t w, uint32_t h)

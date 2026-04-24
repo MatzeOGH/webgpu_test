@@ -106,8 +106,8 @@
 
       function setJoy(nx, ny) {
         knob.style.transform = 'translate(calc(-50% + ' + (nx * MAX_R) + 'px), calc(-50% + ' + (ny * MAX_R) + 'px))';
-        if (typeof Module !== 'undefined' && Module['_web_set_look_joystick'])
-          Module['_web_set_look_joystick'](nx, ny);
+        window._joyX = nx;
+        window._joyY = ny;
       }
 
       base.addEventListener('touchstart', function (e) {
