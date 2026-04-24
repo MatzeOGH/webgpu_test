@@ -5,6 +5,45 @@
 #include <webgpu/webgpu_cpp.h>
 #include <cstring>
 
+// ---- Touch input -----------------------------------------------------------
+
+static int   g_cam_touch_id = -1;
+static float g_touch_last_x = 0.f, g_touch_last_y = 0.f;
+
+static EM_BOOL on_touchstart(int, const EmscriptenTouchEvent* e, void*) {
+    if (g_cam_touch_id == -1 && e->numTouches > 0) {
+        g_cam_touch_id = e->touches[0].identifier;
+        g_touch_last_x = (float)e->touches[0].targetX;
+        g_touch_last_y = (float)e->touches[0].targetY;
+        input_set_mouse_button(0, true);
+    }
+    return EM_TRUE;
+}
+
+static EM_BOOL on_touchmove(int, const EmscriptenTouchEvent* e, void*) {
+    for (int i = 0; i < e->numTouches; i++) {
+        if (e->touches[i].identifier == g_cam_touch_id) {
+            float dx = (float)e->touches[i].targetX - g_touch_last_x;
+            float dy = (float)e->touches[i].targetY - g_touch_last_y;
+            g_touch_last_x = (float)e->touches[i].targetX;
+            g_touch_last_y = (float)e->touches[i].targetY;
+            input_set_mouse_delta(dx, dy);
+            break;
+        }
+    }
+    return EM_TRUE;
+}
+
+// touchend: e->touches holds *remaining* touches (not the one that ended)
+static EM_BOOL on_touchend(int, const EmscriptenTouchEvent* e, void*) {
+    if (g_cam_touch_id == -1) return EM_TRUE;
+    for (int i = 0; i < e->numTouches; i++)
+        if (e->touches[i].identifier == g_cam_touch_id) return EM_TRUE;
+    g_cam_touch_id = -1;
+    input_set_mouse_button(0, false);
+    return EM_TRUE;
+}
+
 // Maps a browser KeyboardEvent.code string to a USB HID scancode (= SDL3 scancode).
 static int browser_code_to_scancode(const char* code) {
     if (!code || !code[0]) return -1;
@@ -68,19 +107,45 @@ static EM_BOOL on_keyup(int, const EmscriptenKeyboardEvent* e, void*) {
 
 static EM_BOOL on_mousemove(int, const EmscriptenMouseEvent* e, void*) {
     input_set_mouse_pos((float)e->targetX, (float)e->targetY);
-    input_set_mouse_delta((float)e->movementX, (float)e->movementY);
+    EmscriptenPointerlockChangeEvent ls{};
+    if (emscripten_get_pointerlock_status(&ls) == EMSCRIPTEN_RESULT_SUCCESS && ls.isActive) {
+        float dx = std::max(-100.f, std::min(100.f, (float)e->movementX));
+        float dy = std::max(-100.f, std::min(100.f, (float)e->movementY));
+        input_set_mouse_delta(dx, dy);
+    }
+    return EM_FALSE;
+}
+
+static EM_BOOL on_pointerlockchange(int, const EmscriptenPointerlockChangeEvent* e, void*) {
+    if (e->isActive)
+        input_skip_mouse(3);
     return EM_FALSE;
 }
 
 static EM_BOOL on_mousedown(int, const EmscriptenMouseEvent* e, void*) {
     input_set_mouse_button(e->button, true);
-    emscripten_request_pointerlock("#canvas", false);
+    if (e->button == 0) {
+        EmscriptenPointerlockChangeEvent ls{};
+        if (emscripten_get_pointerlock_status(&ls) != EMSCRIPTEN_RESULT_SUCCESS || !ls.isActive)
+            emscripten_request_pointerlock("#canvas", false);
+    }
     return EM_FALSE;
 }
 
 static EM_BOOL on_mouseup(int, const EmscriptenMouseEvent* e, void*) {
     input_set_mouse_button(e->button, false);
+    if (e->button == 0)
+        emscripten_exit_pointerlock();
     return EM_FALSE;
+}
+
+static EM_BOOL on_wheel(int, const EmscriptenWheelEvent* e, void*) {
+    // deltaY > 0 = scroll down in browser; negate so positive = zoom in
+    float delta = -(float)e->deltaY;
+    // Normalize: pixel mode (~100px/click) → ~1 per click; line mode (~3/click) → use as-is
+    if (e->deltaMode == 0) delta /= 100.f;
+    input_set_scroll(delta);
+    return EM_TRUE;
 }
 
 static EM_BOOL on_resize(int, const EmscriptenUiEvent*, void*) {
@@ -105,12 +170,18 @@ int main() {
     surfDesc.nextInChain = &canvas;
     webgpu_init(webgpu_instance().CreateSurface(&surfDesc));
 
+    emscripten_set_pointerlockchange_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, true, on_pointerlockchange);
     emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, true, on_keydown);
     emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW,   nullptr, true, on_keyup);
     emscripten_set_mousemove_callback("#canvas", nullptr, true, on_mousemove);
     emscripten_set_mousedown_callback("#canvas", nullptr, true, on_mousedown);
     emscripten_set_mouseup_callback(  "#canvas", nullptr, true, on_mouseup);
+    emscripten_set_wheel_callback(    "#canvas", nullptr, true, on_wheel);
     emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, on_resize);
+    emscripten_set_touchstart_callback( "#canvas", nullptr, true, on_touchstart);
+    emscripten_set_touchmove_callback(  "#canvas", nullptr, true, on_touchmove);
+    emscripten_set_touchend_callback(   "#canvas", nullptr, true, on_touchend);
+    emscripten_set_touchcancel_callback("#canvas", nullptr, true, on_touchend);
 
     emscripten_set_main_loop_arg([](void*){ webgpu_tick(); }, nullptr, 0, false);
     return 0;

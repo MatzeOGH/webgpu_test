@@ -8,7 +8,9 @@ struct InputState {
     bool  keys[512]{};
     float mx = 0, my = 0;
     float mdx = 0, mdy = 0;
+    float scroll = 0;
     bool  btns[3]{};
+    int   skip_mouse = 0;
 };
 
 static InputState* s = nullptr;
@@ -101,13 +103,16 @@ bool webgpu_ready() { return g_ready; }
 
 void input_set_key(int sc, bool down)           { if (s && sc >= 0 && sc < 512) s->keys[sc] = down; }
 void input_set_mouse_pos(float x, float y)      { if (s) { s->mx = x; s->my = y; } }
-void input_set_mouse_delta(float dx, float dy)  { if (s) { s->mdx += dx; s->mdy += dy; } }
+void input_set_mouse_delta(float dx, float dy)  { if (s) { if (s->skip_mouse > 0) return; s->mdx += dx; s->mdy += dy; } }
 void input_set_mouse_button(int b, bool down)   { if (s && b >= 0 && b < 3) s->btns[b] = down; }
+void input_set_scroll(float d)                  { if (s) s->scroll += d; }
 
 bool  input_key_down(int sc)     { return s && sc >= 0 && sc < 512 && s->keys[sc]; }
-float input_mouse_x()            { return s ? s->mx  : 0.f; }
-float input_mouse_y()            { return s ? s->my  : 0.f; }
-float input_mouse_delta_x()      { return s ? s->mdx : 0.f; }
-float input_mouse_delta_y()      { return s ? s->mdy : 0.f; }
+float input_mouse_x()            { return s ? s->mx     : 0.f; }
+float input_mouse_y()            { return s ? s->my     : 0.f; }
+float input_mouse_delta_x()      { return s ? s->mdx    : 0.f; }
+float input_mouse_delta_y()      { return s ? s->mdy    : 0.f; }
+float input_scroll_delta()       { return s ? s->scroll : 0.f; }
 bool  input_mouse_down(int b)    { return s && b >= 0 && b < 3 && s->btns[b]; }
-void  input_reset_frame()        { if (s) { s->mdx = 0.f; s->mdy = 0.f; } }
+void  input_reset_frame()        { if (s) { s->mdx = 0.f; s->mdy = 0.f; s->scroll = 0.f; if (s->skip_mouse > 0) --s->skip_mouse; } }
+void  input_skip_mouse(int n)    { if (s) s->skip_mouse = n; }

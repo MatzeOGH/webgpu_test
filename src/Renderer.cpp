@@ -253,22 +253,24 @@ void renderer_frame() {
     g_last_time = now;
     dt = std::min(dt, 0.1f);
 
-    // Camera — mouse look
+    // Camera — mouse look (only while LMB held)
     const float kSens  = 0.002f;
     const float kSpeed = 5.0f;
-    g_cam.yaw   += input_mouse_delta_x() * kSens;
-    g_cam.pitch -= input_mouse_delta_y() * kSens;
-    g_cam.pitch  = std::max(-1.5f, std::min(1.5f, g_cam.pitch));
+    if (input_mouse_down(0)) {
+        g_cam.yaw   += input_mouse_delta_x() * kSens;
+        g_cam.pitch -= input_mouse_delta_y() * kSens;
+        g_cam.pitch  = std::max(-1.5f, std::min(1.5f, g_cam.pitch));
+    }
 
     // Forward vector from yaw/pitch (unit length by construction)
     float cp = std::cos(g_cam.pitch), sp = std::sin(g_cam.pitch);
     float cy = std::cos(g_cam.yaw),   sy = std::sin(g_cam.yaw);
     Vec3 fwd = {sy*cp, sp, -cy*cp};
 
-    // WASD — move on XZ plane, right = rotate fwd 90° in XZ
+    // WASD — free flight: W/S along full forward (incl. Y), A/D strafe horizontally
     float move = kSpeed * dt;
-    if (input_key_down(Key::W)) { g_cam.x += fwd.x*move; g_cam.z += fwd.z*move; }
-    if (input_key_down(Key::S)) { g_cam.x -= fwd.x*move; g_cam.z -= fwd.z*move; }
+    if (input_key_down(Key::W)) { g_cam.x += fwd.x*move; g_cam.y += fwd.y*move; g_cam.z += fwd.z*move; }
+    if (input_key_down(Key::S)) { g_cam.x -= fwd.x*move; g_cam.y -= fwd.y*move; g_cam.z -= fwd.z*move; }
     if (input_key_down(Key::A)) { g_cam.x -= cy*move;    g_cam.z -= sy*move; }
     if (input_key_down(Key::D)) { g_cam.x += cy*move;    g_cam.z += sy*move; }
 
