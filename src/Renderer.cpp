@@ -749,8 +749,8 @@ void renderer_frame()
     // Thumbstick look (2 rad/s at full deflection)
     float jx = input_look_joystick_x(), jy = input_look_joystick_y();
     if (jx != 0.f || jy != 0.f) {
-        gCamYaw   += jx * 2.0f * dt;
-        gCamPitch -= jy * 2.0f * dt;
+        gCamYaw   += jx * 0.5f * dt;
+        gCamPitch -= jy * 0.5f * dt;
         gCamPitch  = std::clamp(gCamPitch, -1.5f, 1.5f);
     }
 
@@ -768,7 +768,7 @@ void renderer_frame()
     // Upload camera uniforms
     {
         Mat4 view = mat4_look_at(gCamPos, v3_norm(fwd), {0,1,0});
-        Mat4 proj = mat4_perspective(1.047f, (float)gWidth / (float)gHeight, 0.01f, 1000.f);
+        Mat4 proj = mat4_perspective(1.047f, (float)gWidth / (float)gHeight, 0.01f, 100000.f);
         CameraUniforms cu{};
         std::copy(view.begin(), view.end(), cu.view);
         std::copy(proj.begin(), proj.end(), cu.proj);
@@ -835,7 +835,7 @@ void renderer_frame()
 
     // Render pass
     WGPURenderPassEncoder pass = RenderPassBuilder{}
-        .color(frameView, WGPULoadOp_Clear, WGPUStoreOp_Store, {0.05, 0.05, 0.08, 1.0})
+        .color(frameView, WGPULoadOp_Clear, WGPUStoreOp_Store, {0.95, 0.05, 0.95, 1.0})
         .depth_stencil(gDepthView)
         .begin(encoder);
 
