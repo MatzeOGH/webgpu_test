@@ -747,9 +747,12 @@ void renderer_frame()
         gCamPitch  = std::clamp(gCamPitch, -1.5f, 1.5f);
     }
     // Thumbstick look (2 rad/s at full deflection)
-    gCamYaw   += input_look_joystick_x() * 2.0f * dt;
-    gCamPitch -= input_look_joystick_y() * 2.0f * dt;
-    gCamPitch  = std::clamp(gCamPitch, -1.5f, 1.5f);
+    float jx = input_look_joystick_x(), jy = input_look_joystick_y();
+    if (jx != 0.f || jy != 0.f) {
+        gCamYaw   += jx * 2.0f * dt;
+        gCamPitch -= jy * 2.0f * dt;
+        gCamPitch  = std::clamp(gCamPitch, -1.5f, 1.5f);
+    }
 
     float cp = std::cos(gCamPitch), sp = std::sin(gCamPitch);
     float cy = std::cos(gCamYaw),   sy = std::sin(gCamYaw);
