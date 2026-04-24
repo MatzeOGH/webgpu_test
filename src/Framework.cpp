@@ -11,6 +11,7 @@ struct InputState {
     float scroll = 0;
     bool  btns[3]{};
     int   skip_mouse = 0;
+    float joy_x = 0, joy_y = 0;
 };
 
 static InputState* s = nullptr;
@@ -116,3 +117,7 @@ float input_scroll_delta()       { return s ? s->scroll : 0.f; }
 bool  input_mouse_down(int b)    { return s && b >= 0 && b < 3 && s->btns[b]; }
 void  input_reset_frame()        { if (s) { s->mdx = 0.f; s->mdy = 0.f; s->scroll = 0.f; if (s->skip_mouse > 0) --s->skip_mouse; } }
 void  input_skip_mouse(int n)    { if (s) s->skip_mouse = n; }
+
+void  input_set_look_joystick(float x, float y) { if (s) { s->joy_x = x; s->joy_y = y; } }
+float input_look_joystick_x()   { return s ? s->joy_x : 0.f; }
+float input_look_joystick_y()   { return s ? s->joy_y : 0.f; }
