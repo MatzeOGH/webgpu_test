@@ -5,13 +5,6 @@
 #include <webgpu/webgpu_cpp.h>
 #include <cstring>
 
-// Exported setter called from the JS thumbstick
-extern "C" {
-EMSCRIPTEN_KEEPALIVE void web_set_look_joystick(float x, float y) {
-    input_set_look_joystick(x, y);
-}
-}
-
 // ---- Touch input -----------------------------------------------------------
 
 static int   g_cam_touch_id = -1;
@@ -190,6 +183,12 @@ int main() {
     emscripten_set_touchend_callback(   "#canvas", nullptr, true, on_touchend);
     emscripten_set_touchcancel_callback("#canvas", nullptr, true, on_touchend);
 
-    emscripten_set_main_loop_arg([](void*){ webgpu_tick(); }, nullptr, 0, false);
+    emscripten_set_main_loop_arg([](void*){
+        // Poll joystick globals written by JS — avoids fragile Module._fn API
+        float jx = (float)EM_ASM_DOUBLE({ return window._joyX || 0.0; });
+        float jy = (float)EM_ASM_DOUBLE({ return window._joyY || 0.0; });
+        input_set_look_joystick(jx, jy);
+        webgpu_tick();
+    }, nullptr, 0, false);
     return 0;
 }

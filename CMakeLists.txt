@@ -27,9 +27,9 @@ if(EMSCRIPTEN)
         "--use-port=${DAWN_PORT}"
         "-sASYNCIFY=0"
         "-sALLOW_MEMORY_GROWTH=1"
-        "-sEXPORTED_FUNCTIONS=[\"_main\",\"_web_set_look_joystick\"]"
-        "--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
+"--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
         "-Oz"
+        "--preload-file=${CMAKE_SOURCE_DIR}/assets@/assets"
     )
 
     set_target_properties(app PROPERTIES SUFFIX ".html")
