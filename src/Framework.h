@@ -32,6 +32,11 @@ void input_reset_frame();
 // Skip the next n mouse delta events (use after enabling pointer lock / relative mode)
 void input_skip_mouse(int n);
 
+// Virtual thumbstick look axis — set by platform, consumed by renderer each frame
+void  input_set_look_joystick(float x, float y); // -1..1 per axis
+float input_look_joystick_x();
+float input_look_joystick_y();
+
 // Key constants — USB HID position codes, identical to SDL3 scancodes
 // and to the values produced by browser KeyboardEvent.code on web builds.
 namespace Key {

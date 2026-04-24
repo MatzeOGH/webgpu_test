@@ -18,7 +18,7 @@ if(EMSCRIPTEN)
     )
     FetchContent_MakeAvailable(emdawnwebgpu)
 
-    add_executable(app src/main_web.cpp src/Framework.cpp src/Renderer.cpp)
+    add_executable(app src/main_web.cpp src/Framework.cpp src/Renderer.cpp src/ClusteredMesh.cpp)
 
     set(DAWN_PORT "${emdawnwebgpu_SOURCE_DIR}/emdawnwebgpu.port.py")
 
@@ -27,6 +27,7 @@ if(EMSCRIPTEN)
         "--use-port=${DAWN_PORT}"
         "-sASYNCIFY=0"
         "-sALLOW_MEMORY_GROWTH=1"
+        "-sEXPORTED_FUNCTIONS=[\"_main\",\"_web_set_look_joystick\"]"
         "--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
         "-Oz"
     )
@@ -91,7 +92,7 @@ elseif(WIN32)
     find_package(Dawn  REQUIRED)
     find_package(SDL3  REQUIRED CONFIG)
 
-    add_executable(app src/main_SDL.cpp src/Framework.cpp src/Renderer.cpp)
+    add_executable(app src/main_SDL.cpp src/Framework.cpp src/Renderer.cpp src/ClusteredMesh.cpp)
     target_link_libraries(app PRIVATE dawn::webgpu_dawn SDL3::SDL3)
 
     # Copy SDL3.dll, dxil.dll, and dxcompiler.dll next to the exe at runtime.

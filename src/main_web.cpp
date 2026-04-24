@@ -5,6 +5,13 @@
 #include <webgpu/webgpu_cpp.h>
 #include <cstring>
 
+// Exported setter called from the JS thumbstick
+extern "C" {
+EMSCRIPTEN_KEEPALIVE void web_set_look_joystick(float x, float y) {
+    input_set_look_joystick(x, y);
+}
+}
+
 // ---- Touch input -----------------------------------------------------------
 
 static int   g_cam_touch_id = -1;

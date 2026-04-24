@@ -9,6 +9,31 @@
     body { overflow: hidden; background: #000; }
     canvas { display: block; touch-action: none; }
 
+    #joystick-base {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.1);
+      border: 2px solid rgba(255,255,255,0.35);
+      touch-action: none;
+      z-index: 100;
+    }
+    #joystick-knob {
+      width: 50px;
+      height: 50px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.4);
+      border: 2px solid rgba(255,255,255,0.7);
+      pointer-events: none;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+    }
+
     #touch-controls {
       position: fixed;
       bottom: 24px;
@@ -47,6 +72,11 @@
 <body>
   <canvas id="canvas"></canvas>
 
+  <!-- Thumbstick (bottom-right) -->
+  <div id="joystick-base">
+    <div id="joystick-knob"></div>
+  </div>
+
   <!-- WASD d-pad overlay (bottom-left): row1=[_,W,_]  row2=[A,S,D] -->
   <div id="touch-controls">
     <div class="dpad-empty"></div>
@@ -64,6 +94,64 @@
       function resize() { c.width = window.innerWidth; c.height = window.innerHeight; }
       resize();
       window.addEventListener('resize', resize);
+    })();
+
+    // Thumbstick — calls exported web_set_look_joystick(x, y) with -1..1 axes
+    (function () {
+      var base = document.getElementById('joystick-base');
+      var knob = document.getElementById('joystick-knob');
+      var touchId = null;
+      var baseCX = 0, baseCY = 0;
+      var MAX_R = 35; // px — (120 - 50) / 2
+
+      function setJoy(nx, ny) {
+        knob.style.transform = 'translate(calc(-50% + ' + (nx * MAX_R) + 'px), calc(-50% + ' + (ny * MAX_R) + 'px))';
+        if (typeof Module !== 'undefined' && Module['_web_set_look_joystick'])
+          Module['_web_set_look_joystick'](nx, ny);
+      }
+
+      base.addEventListener('touchstart', function (e) {
+        e.preventDefault();
+        if (touchId !== null) return;
+        var t = e.changedTouches[0];
+        touchId = t.identifier;
+        var r = base.getBoundingClientRect();
+        baseCX = r.left + r.width * 0.5;
+        baseCY = r.top  + r.height * 0.5;
+        knob.style.transition = 'none';
+      }, { passive: false });
+
+      document.addEventListener('touchmove', function (e) {
+        if (touchId === null) return;
+        for (var i = 0; i < e.changedTouches.length; i++) {
+          var t = e.changedTouches[i];
+          if (t.identifier !== touchId) continue;
+          var dx = t.clientX - baseCX, dy = t.clientY - baseCY;
+          var dist = Math.sqrt(dx * dx + dy * dy);
+          var nx = 0, ny = 0;
+          if (dist > 1) {
+            var clamped = Math.min(dist, MAX_R);
+            nx = (dx / dist) * (clamped / MAX_R);
+            ny = (dy / dist) * (clamped / MAX_R);
+          }
+          setJoy(nx, ny);
+          e.preventDefault();
+          break;
+        }
+      }, { passive: false });
+
+      function onEnd(e) {
+        if (touchId === null) return;
+        for (var i = 0; i < e.changedTouches.length; i++) {
+          if (e.changedTouches[i].identifier !== touchId) continue;
+          touchId = null;
+          knob.style.transition = 'transform 0.1s ease-out';
+          setJoy(0, 0);
+          break;
+        }
+      }
+      document.addEventListener('touchend',    onEnd, { passive: false });
+      document.addEventListener('touchcancel', onEnd, { passive: false });
     })();
 
     // WASD buttons — dispatch synthetic KeyboardEvents so the existing C++ handlers pick them up
