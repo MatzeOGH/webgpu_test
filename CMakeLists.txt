@@ -30,6 +30,7 @@ if(EMSCRIPTEN)
 "--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
         "-Oz"
         "--preload-file=${CMAKE_SOURCE_DIR}/assets@/assets"
+        "-sINVOKE_RUN=0"
     )
 
     set_target_properties(app PROPERTIES SUFFIX ".html")
