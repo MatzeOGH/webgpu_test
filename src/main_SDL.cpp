@@ -17,7 +17,6 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[]) {
 
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
     app->window = SDL_CreateWindow("WebGPU App", kWidth, kHeight, 0);
-    SDL_SetWindowRelativeMouseMode(app->window, true);
 
     void* hwnd  = SDL_GetPointerProperty(SDL_GetWindowProperties(app->window),
                       SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
@@ -63,16 +62,27 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
         break;
     case SDL_EVENT_MOUSE_MOTION:
         input_set_mouse_pos(event->motion.x, event->motion.y);
-        input_set_mouse_delta(event->motion.xrel, event->motion.yrel);
+        if (SDL_GetWindowRelativeMouseMode(app->window))
+            input_set_mouse_delta(event->motion.xrel, event->motion.yrel);
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        if (!SDL_GetWindowRelativeMouseMode(app->window))
+        if (event->button.button == SDL_BUTTON_LEFT && !SDL_GetWindowRelativeMouseMode(app->window)) {
             SDL_SetWindowRelativeMouseMode(app->window, true);
+            input_skip_mouse(1);
+        }
         input_set_mouse_button(event->button.button - 1, true);
         break;
     case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (event->button.button == SDL_BUTTON_LEFT)
+            SDL_SetWindowRelativeMouseMode(app->window, false);
         input_set_mouse_button(event->button.button - 1, false);
         break;
+    case SDL_EVENT_MOUSE_WHEEL: {
+        float dy = event->wheel.y;
+        if (event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) dy = -dy;
+        input_set_scroll(dy);
+        break;
+    }
     case SDL_EVENT_WINDOW_RESIZED:
         if (webgpu_ready())
             renderer_resize((uint32_t)event->window.data1, (uint32_t)event->window.data2);

@@ -16,6 +16,7 @@ void input_set_key(int scancode, bool down);
 void input_set_mouse_pos(float x, float y);
 void input_set_mouse_delta(float dx, float dy);
 void input_set_mouse_button(int button, bool down);
+void input_set_scroll(float delta);
 
 // Input read — called by game / renderer code
 bool  input_key_down(int scancode);
@@ -24,9 +25,12 @@ float input_mouse_y();
 bool  input_mouse_down(int button);
 float input_mouse_delta_x();
 float input_mouse_delta_y();
+float input_scroll_delta();
 
 // Call once per frame after renderer has consumed input
 void input_reset_frame();
+// Skip the next n mouse delta events (use after enabling pointer lock / relative mode)
+void input_skip_mouse(int n);
 
 // Key constants — USB HID position codes, identical to SDL3 scancodes
 // and to the values produced by browser KeyboardEvent.code on web builds.

@@ -2,23 +2,104 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>WebGPU</title>
   <style>
-    * { margin: 0; padding: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body { overflow: hidden; background: #000; }
-    canvas { display: block; }
+    canvas { display: block; touch-action: none; }
+
+    #touch-controls {
+      position: fixed;
+      bottom: 24px;
+      left: 24px;
+      display: grid;
+      grid-template-columns: repeat(3, 64px);
+      grid-template-rows: repeat(2, 64px);
+      gap: 6px;
+      z-index: 100;
+    }
+    .dpad-btn {
+      background: rgba(255,255,255,0.2);
+      border: 2px solid rgba(255,255,255,0.45);
+      border-radius: 10px;
+      color: #fff;
+      font-size: 22px;
+      font-weight: bold;
+      font-family: monospace;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      outline: none;
+      transition: background 0.05s;
+    }
+    .dpad-btn:active,
+    .dpad-btn.pressed {
+      background: rgba(255,255,255,0.45);
+    }
+    .dpad-empty { pointer-events: none; }
   </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
+
+  <!-- WASD d-pad overlay (bottom-left): row1=[_,W,_]  row2=[A,S,D] -->
+  <div id="touch-controls">
+    <div class="dpad-empty"></div>
+    <button id="btn-w" class="dpad-btn" tabindex="-1">W</button>
+    <div class="dpad-empty"></div>
+    <button id="btn-a" class="dpad-btn" tabindex="-1">A</button>
+    <button id="btn-s" class="dpad-btn" tabindex="-1">S</button>
+    <button id="btn-d" class="dpad-btn" tabindex="-1">D</button>
+  </div>
+
   <script>
+    // Canvas resize
     (function () {
       var c = document.getElementById('canvas');
       function resize() { c.width = window.innerWidth; c.height = window.innerHeight; }
       resize();
       window.addEventListener('resize', resize);
     })();
+
+    // WASD buttons — dispatch synthetic KeyboardEvents so the existing C++ handlers pick them up
+    (function () {
+      function fakeKey(code, type) {
+        window.dispatchEvent(new KeyboardEvent(type, { code: code, bubbles: true, cancelable: true }));
+      }
+      function bindBtn(id, code) {
+        var el = document.getElementById(id);
+        el.addEventListener('touchstart', function (e) {
+          e.preventDefault();
+          el.classList.add('pressed');
+          fakeKey(code, 'keydown');
+        }, { passive: false });
+        el.addEventListener('touchend', function (e) {
+          e.preventDefault();
+          el.classList.remove('pressed');
+          fakeKey(code, 'keyup');
+        }, { passive: false });
+        el.addEventListener('touchcancel', function (e) {
+          e.preventDefault();
+          el.classList.remove('pressed');
+          fakeKey(code, 'keyup');
+        }, { passive: false });
+        // Also support mouse (desktop testing)
+        el.addEventListener('mousedown',  function () { fakeKey(code, 'keydown'); });
+        el.addEventListener('mouseup',    function () { fakeKey(code, 'keyup');   });
+        el.addEventListener('mouseleave', function () { fakeKey(code, 'keyup');   });
+      }
+      bindBtn('btn-w', 'KeyW');
+      bindBtn('btn-a', 'KeyA');
+      bindBtn('btn-s', 'KeyS');
+      bindBtn('btn-d', 'KeyD');
+    })();
   </script>
+
   {{{ SCRIPT }}}
 </body>
 </html>
