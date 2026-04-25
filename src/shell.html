@@ -91,8 +91,13 @@
             (function () {
                 var c = document.getElementById("canvas");
                 function resize() {
-                    c.width = window.innerWidth;
-                    c.height = window.innerHeight;
+                    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+                    var w = window.innerWidth;
+                    var h = window.innerHeight;
+                    c.style.width = w + "px";
+                    c.style.height = h + "px";
+                    c.width = Math.floor(w * dpr);
+                    c.height = Math.floor(h * dpr);
                 }
                 resize();
                 window.addEventListener("resize", resize);
