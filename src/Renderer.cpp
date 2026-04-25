@@ -312,6 +312,7 @@ static void initClusteredRenderPipeline(const ClusteredMeshGPU& mesh)
     if (gClusteredBGL) { wgpuBindGroupLayoutRelease(gClusteredBGL);  gClusteredBGL = {}; }
 
     const char clusteredShaderCode[] = R"(
+enable primitive_index;
 
 struct CameraUniforms {
     view : mat4x4<f32>,
@@ -332,8 +333,7 @@ struct ClusterN {
     refinedError         : f32,
     meshletVertexOffset  : u32,
     meshletTriangleOffset: u32,
-    vertexCount          : u32,
-    triangleCount        : u32,
+    packedCounts         : u32,
 }
 
 // must match MeshVertex in C++ (8 x f32 = 32 bytes)
@@ -362,6 +362,30 @@ fn cluster_color(id: u32) -> vec3<f32> {
     return vec3<f32>(r, g, b);
 }
 
+// taken from unreal engine
+fn murmurMix(hash: u32) -> u32 {
+    var h = hash;
+
+    h = h ^ (h >> 16u);
+    h = h * 0x85ebca6bu;
+    h = h ^ (h >> 13u);
+    h = h * 0xc2b2ae35u;
+    h = h ^ (h >> 16u);
+
+    return h;
+}
+
+// taken from unreal engine
+fn intToColor(index: u32) -> vec3<f32> {
+    let hash = murmurMix(index);
+
+    let r = f32((hash >> 0u) & 255u);
+    let g = f32((hash >> 8u) & 255u);
+    let b = f32((hash >> 16u) & 255u);
+
+    return vec3<f32>(r, g, b) * (1.0 / 255.0);
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     let cluster_id  = packed >> 8u;
@@ -371,15 +395,18 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     let v           = vertices[global_vtx];
     var out: VertexOut;
     out.pos    = camera.proj * camera.view * vec4<f32>(v.x, v.y, v.z, 1.0);
-    out.color  = cluster_color(cluster_id);
+    out.color  = intToColor(cluster_id);
     out.normal = vec3<f32>(v.nx, v.ny, v.nz);
     return out;
 }
 
+
+
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut, @builtin(primitive_index) prim_id: u32) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
     let diffuse   = max(dot(normalize(in.normal), light_dir), 0.08);
+    let color = intToColor(prim_id);
     return vec4<f32>(in.color, 1.0);
 }
     )";
@@ -449,7 +476,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 static void loadMeshForRendering(const char* path)
 {
     static ClusteredMeshGPU sMesh{};
-    if (!loadGltfMeshToGPU(path, gDevice, gQueue, sMesh))
+    if (!loadClusteredMeshFromFile(path, gDevice, gQueue, sMesh))
     {
         fprintf(stderr, "loadMeshForRendering: failed to load %s — falling back to triangle\n", path);
         return;
@@ -492,6 +519,8 @@ void renderer_init(wgpu::Device device, wgpu::Queue queue, wgpu::Surface surface
     // ---- Fallback pipeline (hardcoded triangle, CameraUniforms bind group) ----
     {
         const char fallbackShader[] = R"(
+enable primitive_index;
+
 struct Uniforms {
     view : mat4x4<f32>,
     proj : mat4x4<f32>,
@@ -506,9 +535,35 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
     else { p = vec2f(0.0, 0.5); }
     return u.proj * u.view * vec4f(p, 0.0, 1.0);
 }
+
+// taken from unreal engine
+fn murmurMix(hash: u32) -> u32 {
+    var h = hash;
+
+    h = h ^ (h >> 16u);
+    h = h * 0x85ebca6bu;
+    h = h ^ (h >> 13u);
+    h = h * 0xc2b2ae35u;
+    h = h ^ (h >> 16u);
+
+    return h;
+}
+
+// taken from unreal engine
+fn intToColor(index: u32) -> vec3<f32> {
+    let hash = murmurMix(index);
+
+    let r = f32((hash >> 0u) & 255u);
+    let g = f32((hash >> 8u) & 255u);
+    let b = f32((hash >> 16u) & 255u);
+
+    return vec3<f32>(r, g, b) * (1.0 / 255.0);
+}
+
 @fragment
-fn fs_main() -> @location(0) vec4f {
-    return vec4f(1.0, 0.4, 1.0, 1.0);
+fn fs_main( @builtin(primitive_index) prim_id: u32) -> @location(0) vec4f {
+    let color = intToColor(prim_id);
+    return vec4f(color, 1.0);
 }
         )";
 
@@ -570,7 +625,7 @@ struct ClusterN {
     refinedCenterX       : f32, refinedCenterY: f32, refinedCenterZ: f32,
     refinedRadius        : f32, refinedError  : f32,
     meshletVertexOffset  : u32, meshletTriangleOffset: u32,
-    vertexCount          : u32, triangleCount : u32,
+    packedCounts         : u32,
 }
 struct VisibleClusters { count : atomic<u32>, ids : array<u32>, }
 
@@ -640,7 +695,7 @@ struct ClusterN {
     refinedCenterX       : f32, refinedCenterY: f32, refinedCenterZ: f32,
     refinedRadius        : f32, refinedError  : f32,
     meshletVertexOffset  : u32, meshletTriangleOffset: u32,
-    vertexCount          : u32, triangleCount : u32,
+    packedCounts         : u32,
 }
 struct VisibleClusters { count : u32, ids : array<u32>, }
 struct DrawArgs {
@@ -675,11 +730,13 @@ fn cs_main(
     let cluster_id = visible.ids[wgid.x];
     if (lid.x == 0u) {
         ws_cluster = clusters[cluster_id];
-        ws_base    = atomicAdd(&draw_args.index_count, ws_cluster.triangleCount * 3u);
+        let tri_count = (ws_cluster.packedCounts >> 8u) & 0xFFu;
+        ws_base    = atomicAdd(&draw_args.index_count, tri_count * 3u);
     }
     workgroupBarrier();
     let tri_idx = lid.x;
-    if (tri_idx >= ws_cluster.triangleCount) { return; }
+    let tri_count = (ws_cluster.packedCounts >> 8u) & 0xFFu;
+    if (tri_idx >= tri_count) { return; }
     let tri_byte = ws_cluster.meshletTriangleOffset + tri_idx * 3u;
     let i0 = read_u8(&meshlet_tris, tri_byte + 0u);
     let i1 = read_u8(&meshlet_tris, tri_byte + 1u);
@@ -722,7 +779,7 @@ fn cs_main(
     }
 
     // Load mesh (falls back to triangle if file not found)
-    loadMeshForRendering("assets/Roman_Stone_Capital_tfpvdgeda_High.gltf");
+    loadMeshForRendering("assets/rsc.nanite");
 }
 
 void renderer_resize(uint32_t w, uint32_t h)
@@ -760,6 +817,11 @@ void renderer_frame()
     Vec3 right = v3_norm(v3_cross(fwd, {0,1,0}));
 
     float spd = 50.f * dt;
+    // Analog move joystick (mobile) — knob down = backward, so negate my
+    float mx = input_move_joystick_x(), my = input_move_joystick_y();
+    gCamPos = v3_add(gCamPos, v3_scale(fwd,   spd * (-my)));
+    gCamPos = v3_add(gCamPos, v3_scale(right,  spd * mx));
+    // Digital WASD (desktop; joystick values are 0 when no touch)
     if (input_key_down(Key::W)) gCamPos = v3_add(gCamPos, v3_scale(fwd,   spd));
     if (input_key_down(Key::S)) gCamPos = v3_add(gCamPos, v3_scale(fwd,  -spd));
     if (input_key_down(Key::A)) gCamPos = v3_add(gCamPos, v3_scale(right, -spd));

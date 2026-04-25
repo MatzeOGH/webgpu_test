@@ -7,6 +7,7 @@
 
 // JS writes directly into these via HEAPF32 — no return-value path needed.
 static float g_js_joy_x = 0.f, g_js_joy_y = 0.f;
+static float g_js_move_x = 0.f, g_js_move_y = 0.f;
 
 // ---- Touch input -----------------------------------------------------------
 
@@ -186,17 +187,22 @@ int main() {
     emscripten_set_touchend_callback(   "#canvas", nullptr, true, on_touchend);
     emscripten_set_touchcancel_callback("#canvas", nullptr, true, on_touchend);
 
-    // Expose window.setJoystick(x,y) that writes directly into C++ floats via HEAPF32.
-    // Re-reads HEAPF32 each call so memory growth never stales the typed-array view.
+    // Expose window.setJoystick and window.setMoveJoystick that write directly into
+    // C++ floats via HEAPF32. Re-reads HEAPF32 each call so memory growth never stales the view.
     EM_ASM({
         window['setJoystick'] = function(x, y) {
             HEAPF32[$0 >> 2] = x;
             HEAPF32[$1 >> 2] = y;
         };
-    }, &g_js_joy_x, &g_js_joy_y);
+        window['setMoveJoystick'] = function(x, y) {
+            HEAPF32[$2 >> 2] = x;
+            HEAPF32[$3 >> 2] = y;
+        };
+    }, &g_js_joy_x, &g_js_joy_y, &g_js_move_x, &g_js_move_y);
 
     emscripten_set_main_loop_arg([](void*){
         input_set_look_joystick(g_js_joy_x, g_js_joy_y);
+        input_set_move_joystick(g_js_move_x, g_js_move_y);
         webgpu_tick();
     }, nullptr, 0, false);
     return 0;

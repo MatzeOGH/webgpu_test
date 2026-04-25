@@ -96,6 +96,9 @@ elseif(WIN32)
     add_executable(app src/main_SDL.cpp src/Framework.cpp src/Renderer.cpp src/ClusteredMesh.cpp)
     target_link_libraries(app PRIVATE dawn::webgpu_dawn SDL3::SDL3)
 
+    add_executable(nanite_builder src/mainNaniteBuilder.cpp src/ClusteredMesh.cpp)
+    target_link_libraries(nanite_builder PRIVATE dawn::webgpu_dawn)
+
     # Copy SDL3.dll, dxil.dll, and dxcompiler.dll next to the exe at runtime.
     set(DXIL_DIR "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Redist/D3D/x64")
     foreach(DLL dxil.dll dxcompiler.dll d3dcompiler_47.dll)
