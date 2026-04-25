@@ -189,6 +189,36 @@ static WGPUBindGroup       gClusteredBG{};
 static WGPUTexture     gDepthTexture{};
 static WGPUTextureView gDepthView{};
 
+// Offscreen scene color (rendered into) and post-process output (written by compute)
+static WGPUTexture     gSceneColorTexture{};
+static WGPUTextureView gSceneColorView{};
+static WGPUTexture     gPostOutputTexture{};
+static WGPUTextureView gPostOutputView{};
+static WGPUSampler     gLinearSampler{};
+
+// Post-process (Sobel) compute
+struct PostFxUniforms {
+    float    outlineColor[3]; // 12
+    uint32_t darkOutline;     //  4 — 1 = dark, 0 = colored
+    float    znear;           //  4
+    float    zfar;            //  4
+    float    _pad[2]{};       //  8
+};
+static_assert(sizeof(PostFxUniforms) == 32);
+
+static WGPUBuffer          gPostFxUniforms{};
+static WGPUComputePipeline gSobelPipeline{};
+static WGPUBindGroupLayout gSobelBGL{};
+static WGPUBindGroup       gSobelBG{};
+
+// Final blit pass
+static WGPURenderPipeline  gBlitPipeline{};
+static WGPUBindGroupLayout gBlitBGL{};
+static WGPUBindGroup       gBlitBG{};
+
+static constexpr WGPUTextureFormat kSceneColorFormat = WGPUTextureFormat_RGBA8Unorm;
+static constexpr WGPUTextureFormat kDepthFormat      = WGPUTextureFormat_Depth32Float;
+
 // Camera
 static Vec3  gCamPos   = {0.f, 0.f, 3.f};
 static float gCamYaw   = 0.f;
@@ -216,15 +246,77 @@ static void recreate_depth_texture(uint32_t w, uint32_t h)
     if (gDepthView)    { wgpuTextureViewRelease(gDepthView);    gDepthView    = nullptr; }
     if (gDepthTexture) { wgpuTextureRelease(gDepthTexture);     gDepthTexture = nullptr; }
     WGPUTextureDescriptor desc{
-        .usage         = WGPUTextureUsage_RenderAttachment,
+        .usage         = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding,
         .dimension     = WGPUTextureDimension_2D,
         .size          = { w, h, 1 },
-        .format        = WGPUTextureFormat_Depth24Plus,
+        .format        = kDepthFormat,
         .mipLevelCount = 1,
         .sampleCount   = 1,
     };
     gDepthTexture = wgpuDeviceCreateTexture(gDevice, &desc);
     gDepthView    = wgpuTextureCreateView(gDepthTexture, nullptr);
+}
+
+static void recreate_scene_textures(uint32_t w, uint32_t h)
+{
+    if (gSceneColorView)    { wgpuTextureViewRelease(gSceneColorView);    gSceneColorView    = nullptr; }
+    if (gSceneColorTexture) { wgpuTextureRelease(gSceneColorTexture);     gSceneColorTexture = nullptr; }
+    if (gPostOutputView)    { wgpuTextureViewRelease(gPostOutputView);    gPostOutputView    = nullptr; }
+    if (gPostOutputTexture) { wgpuTextureRelease(gPostOutputTexture);     gPostOutputTexture = nullptr; }
+
+    {
+        WGPUTextureDescriptor desc{
+            .label         = WEBGPU_STR("scene color"),
+            .usage         = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding,
+            .dimension     = WGPUTextureDimension_2D,
+            .size          = { w, h, 1 },
+            .format        = kSceneColorFormat,
+            .mipLevelCount = 1,
+            .sampleCount   = 1,
+        };
+        gSceneColorTexture = wgpuDeviceCreateTexture(gDevice, &desc);
+        gSceneColorView    = wgpuTextureCreateView(gSceneColorTexture, nullptr);
+    }
+    {
+        WGPUTextureDescriptor desc{
+            .label         = WEBGPU_STR("post output"),
+            .usage         = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding,
+            .dimension     = WGPUTextureDimension_2D,
+            .size          = { w, h, 1 },
+            .format        = kSceneColorFormat,
+            .mipLevelCount = 1,
+            .sampleCount   = 1,
+        };
+        gPostOutputTexture = wgpuDeviceCreateTexture(gDevice, &desc);
+        gPostOutputView    = wgpuTextureCreateView(gPostOutputTexture, nullptr);
+    }
+}
+
+static void rebuild_postfx_bindgroups()
+{
+    if (gSobelBG) { wgpuBindGroupRelease(gSobelBG); gSobelBG = {}; }
+    if (gBlitBG)  { wgpuBindGroupRelease(gBlitBG);  gBlitBG  = {}; }
+    if (!gSobelBGL || !gBlitBGL || !gSceneColorView || !gPostOutputView || !gPostFxUniforms || !gLinearSampler) {
+        return;
+    }
+    {
+        WGPUBindGroupEntry entries[4] = {
+            { .binding = 0, .textureView = gSceneColorView },
+            { .binding = 1, .textureView = gDepthView },
+            { .binding = 2, .textureView = gPostOutputView },
+            { .binding = 3, .buffer = gPostFxUniforms, .offset = 0, .size = sizeof(PostFxUniforms) },
+        };
+        WGPUBindGroupDescriptor bgd{ .layout = gSobelBGL, .entryCount = 4, .entries = entries };
+        gSobelBG = wgpuDeviceCreateBindGroup(gDevice, &bgd);
+    }
+    {
+        WGPUBindGroupEntry entries[2] = {
+            { .binding = 0, .textureView = gPostOutputView },
+            { .binding = 1, .sampler = gLinearSampler },
+        };
+        WGPUBindGroupDescriptor bgd{ .layout = gBlitBGL, .entryCount = 2, .entries = entries };
+        gBlitBG = wgpuDeviceCreateBindGroup(gDevice, &bgd);
+    }
 }
 
 // ---- Per-mesh init ---------------------------------------------------------
@@ -350,16 +442,8 @@ struct MeshVertex {
 
 struct VertexOut {
     @builtin(position) pos   : vec4<f32>,
-    @location(0)       color : vec3<f32>,
+    @location(0)  @interpolate(flat)     color : vec3<f32>,
     @location(1)       normal: vec3<f32>,
-}
-
-fn cluster_color(id: u32) -> vec3<f32> {
-    let h = id * 2246822519u + 2654435761u;
-    let r = f32((h       ) & 0xFFu) / 255.0;
-    let g = f32((h >>  8u) & 0xFFu) / 255.0;
-    let b = f32((h >> 16u) & 0xFFu) / 255.0;
-    return vec3<f32>(r, g, b);
 }
 
 // taken from unreal engine
@@ -395,7 +479,7 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     let v           = vertices[global_vtx];
     var out: VertexOut;
     out.pos    = camera.proj * camera.view * vec4<f32>(v.x, v.y, v.z, 1.0);
-    out.color  = intToColor(cluster_id);
+    out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
     out.normal = vec3<f32>(v.nx, v.ny, v.nz);
     return out;
 }
@@ -403,11 +487,10 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
 
 
 @fragment
-fn fs_main(in: VertexOut, @builtin(primitive_index) prim_id: u32) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
-    let diffuse   = max(dot(normalize(in.normal), light_dir), 0.08);
-    let color = intToColor(prim_id);
-    return vec4<f32>(in.color, 1.0);
+    let diffuse = max(dot(normalize(in.normal), light_dir), 0.08);
+    return vec4<f32>(in.normal, 1.0);
 }
     )";
 
@@ -431,12 +514,12 @@ fn fs_main(in: VertexOut, @builtin(primitive_index) prim_id: u32) -> @location(0
     WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(gDevice, &plDesc);
 
     WGPUDepthStencilState depthStencil{
-        .format            = WGPUTextureFormat_Depth24Plus,
+        .format            = kDepthFormat,
         .depthWriteEnabled = WGPUOptionalBool_True,
         .depthCompare      = WGPUCompareFunction_Less,
     };
     WGPUColorTargetState colorTarget{
-        .format    = gSurfaceFormat,
+        .format    = kSceneColorFormat,
         .writeMask = WGPUColorWriteMask_All,
     };
     WGPUFragmentState fragment{
@@ -505,6 +588,7 @@ void renderer_init(wgpu::Device device, wgpu::Queue queue, wgpu::Surface surface
 
     reconfigure_surface(gWidth, gHeight);
     recreate_depth_texture(gWidth, gHeight);
+    recreate_scene_textures(gWidth, gHeight);
 
     // Camera uniform buffer
     {
@@ -514,6 +598,33 @@ void renderer_init(wgpu::Device device, wgpu::Queue queue, wgpu::Surface surface
             .size  = sizeof(CameraUniforms),
         };
         viewUniforms = wgpuDeviceCreateBuffer(gDevice, &desc);
+    }
+
+    // PostFx uniform buffer
+    {
+        WGPUBufferDescriptor desc{
+            .label = WEBGPU_STR("postfx uniforms"),
+            .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+            .size  = sizeof(PostFxUniforms),
+        };
+        gPostFxUniforms = wgpuDeviceCreateBuffer(gDevice, &desc);
+    }
+
+    // Linear sampler for the final blit pass
+    {
+        WGPUSamplerDescriptor desc{
+            .label         = WEBGPU_STR("blit sampler"),
+            .addressModeU  = WGPUAddressMode_ClampToEdge,
+            .addressModeV  = WGPUAddressMode_ClampToEdge,
+            .addressModeW  = WGPUAddressMode_ClampToEdge,
+            .magFilter     = WGPUFilterMode_Linear,
+            .minFilter     = WGPUFilterMode_Linear,
+            .mipmapFilter  = WGPUMipmapFilterMode_Nearest,
+            .lodMinClamp   = 0.f,
+            .lodMaxClamp   = 1.f,
+            .maxAnisotropy = 1,
+        };
+        gLinearSampler = wgpuDeviceCreateSampler(gDevice, &desc);
     }
 
     // ---- Fallback pipeline (hardcoded triangle, CameraUniforms bind group) ----
@@ -585,11 +696,11 @@ fn fs_main( @builtin(primitive_index) prim_id: u32) -> @location(0) vec4f {
         WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(gDevice, &pld);
 
         WGPUDepthStencilState ds{
-            .format            = WGPUTextureFormat_Depth24Plus,
+            .format            = kDepthFormat,
             .depthWriteEnabled = WGPUOptionalBool_True,
             .depthCompare      = WGPUCompareFunction_Less,
         };
-        WGPUColorTargetState ct{ .format = gSurfaceFormat, .writeMask = WGPUColorWriteMask_All };
+        WGPUColorTargetState ct{ .format = kSceneColorFormat, .writeMask = WGPUColorWriteMask_All };
         WGPUFragmentState frag{ .module = sm, .entryPoint = WEBGPU_STR("fs_main"), .targetCount = 1, .targets = &ct };
         WGPURenderPipelineDescriptor pd{
             .layout   = pl,
@@ -778,6 +889,174 @@ fn cs_main(
         wgpuPipelineLayoutRelease(pl);
     }
 
+    // ---- Sobel post-process compute pipeline -------------------------------
+    {
+        const char sobelShader[] = R"(
+struct PostFxUniforms {
+    outlineColor : vec3<f32>,
+    darkOutline  : u32,
+    znear        : f32,
+    zfar         : f32,
+    _pad0        : f32,
+    _pad1        : f32,
+}
+
+@group(0) @binding(0) var sceneColor : texture_2d<f32>;
+@group(0) @binding(1) var sceneDepth : texture_depth_2d;
+@group(0) @binding(2) var outImage   : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(3) var<uniform> fx : PostFxUniforms;
+
+const SobelX = array<i32, 8>( 1, 0, -1,  2, -2,  1, 0, -1);
+const SobelY = array<i32, 8>( 1, 2,  1,  0,  0, -1,-2, -1);
+const Taps   = array<vec2<i32>, 8>(
+    vec2<i32>(-1,  1), vec2<i32>( 0,  1), vec2<i32>( 1,  1),
+    vec2<i32>(-1,  0),                    vec2<i32>( 1,  0),
+    vec2<i32>(-1, -1), vec2<i32>( 0, -1), vec2<i32>( 1, -1),
+);
+
+fn linearize_depth(z: f32) -> f32 {
+    let n = fx.znear;
+    let f = fx.zfar;
+    return (n * f) / (f - z * (f - n));
+}
+
+fn density(z: f32) -> f32 {
+    return log2(linearize_depth(z) + 1.0) * 10.0;
+}
+
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dim = textureDimensions(sceneColor);
+    if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+
+    let pix     = vec2<i32>(i32(gid.x), i32(gid.y));
+    let maxXY   = vec2<i32>(i32(dim.x) - 1, i32(dim.y) - 1);
+
+    let color   = textureLoad(sceneColor, pix, 0).rgb;
+    let centerZ = textureLoad(sceneDepth, pix, 0);
+
+    let bDarkOutline = fx.darkOutline != 0u;
+    let bInnerBorder = !bDarkOutline;
+
+    var gradX = 0.0;
+    var gradY = 0.0;
+
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let tapPix = clamp(pix + Taps[i], vec2<i32>(0, 0), maxXY);
+        var tapZ   = textureLoad(sceneDepth, tapPix, 0);
+        // Forward-Z analog of Unreal's max(tap, center): clamp tap so it is
+        // not farther than the center. Sky pixels (cleared depth) are exempt
+        // when bInnerBorder so outlines appear against the background.
+        let isSky = tapZ >= 0.999;
+        if (!(isSky && bInnerBorder)) {
+            tapZ = min(tapZ, centerZ);
+        }
+        let d = density(tapZ);
+        gradX = gradX + f32(SobelX[i]) * d;
+        gradY = gradY + f32(SobelY[i]) * d;
+    }
+
+    let outline = max(abs(gradX), abs(gradY));
+
+    var combined : vec3<f32>;
+    if (bDarkOutline) {
+        combined = color * (1.0 - outline * 0.25);
+    } else {
+        combined = color + outline * 0.25 * fx.outlineColor;
+    }
+
+    textureStore(outImage, pix, vec4<f32>(saturate(combined), 1.0));
+}
+        )";
+
+        WGPUShaderModule sm = createShaderModule(gDevice, WEBGPU_STR(sobelShader));
+
+        WGPUBindGroupLayoutEntry entries[4] = {
+            { .binding = 0, .visibility = WGPUShaderStage_Compute,
+              .texture = { .sampleType = WGPUTextureSampleType_Float, .viewDimension = WGPUTextureViewDimension_2D } },
+            { .binding = 1, .visibility = WGPUShaderStage_Compute,
+              .texture = { .sampleType = WGPUTextureSampleType_Depth, .viewDimension = WGPUTextureViewDimension_2D } },
+            { .binding = 2, .visibility = WGPUShaderStage_Compute,
+              .storageTexture = { .access = WGPUStorageTextureAccess_WriteOnly, .format = kSceneColorFormat,
+                                  .viewDimension = WGPUTextureViewDimension_2D } },
+            { .binding = 3, .visibility = WGPUShaderStage_Compute,
+              .buffer = { .type = WGPUBufferBindingType_Uniform, .minBindingSize = sizeof(PostFxUniforms) } },
+        };
+        WGPUBindGroupLayoutDescriptor bgld{ .entryCount = 4, .entries = entries };
+        gSobelBGL = wgpuDeviceCreateBindGroupLayout(gDevice, &bgld);
+
+        WGPUPipelineLayoutDescriptor pld{ .bindGroupLayoutCount = 1, .bindGroupLayouts = &gSobelBGL };
+        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(gDevice, &pld);
+
+        WGPUComputePipelineDescriptor cpd{
+            .label   = WEBGPU_STR("sobel post pipeline"),
+            .layout  = pl,
+            .compute = { .module = sm, .entryPoint = WEBGPU_STR("cs_main") },
+        };
+        gSobelPipeline = wgpuDeviceCreateComputePipeline(gDevice, &cpd);
+        wgpuShaderModuleRelease(sm);
+        wgpuPipelineLayoutRelease(pl);
+    }
+
+    // ---- Final blit pass (post output -> surface) --------------------------
+    {
+        const char blitShader[] = R"(
+@group(0) @binding(0) var src : texture_2d<f32>;
+@group(0) @binding(1) var smp : sampler;
+
+struct VSOut {
+    @builtin(position) pos : vec4<f32>,
+    @location(0)       uv  : vec2<f32>,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
+    // Fullscreen triangle: covers (-1,-1)..(3,-1)..(-1,3)
+    var out : VSOut;
+    let x = f32((vi << 1u) & 2u);
+    let y = f32(vi & 2u);
+    out.uv  = vec2<f32>(x, 1.0 - y);
+    out.pos = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
+    return textureSample(src, smp, in.uv);
+}
+        )";
+
+        WGPUShaderModule sm = createShaderModule(gDevice, WEBGPU_STR(blitShader));
+
+        WGPUBindGroupLayoutEntry entries[2] = {
+            { .binding = 0, .visibility = WGPUShaderStage_Fragment,
+              .texture = { .sampleType = WGPUTextureSampleType_Float, .viewDimension = WGPUTextureViewDimension_2D } },
+            { .binding = 1, .visibility = WGPUShaderStage_Fragment,
+              .sampler = { .type = WGPUSamplerBindingType_Filtering } },
+        };
+        WGPUBindGroupLayoutDescriptor bgld{ .entryCount = 2, .entries = entries };
+        gBlitBGL = wgpuDeviceCreateBindGroupLayout(gDevice, &bgld);
+
+        WGPUPipelineLayoutDescriptor pld{ .bindGroupLayoutCount = 1, .bindGroupLayouts = &gBlitBGL };
+        WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(gDevice, &pld);
+
+        WGPUColorTargetState ct{ .format = gSurfaceFormat, .writeMask = WGPUColorWriteMask_All };
+        WGPUFragmentState frag{ .module = sm, .entryPoint = WEBGPU_STR("fs_main"), .targetCount = 1, .targets = &ct };
+        WGPURenderPipelineDescriptor pd{
+            .label    = WEBGPU_STR("blit pipeline"),
+            .layout   = pl,
+            .vertex   = { .module = sm, .entryPoint = WEBGPU_STR("vs_main") },
+            .primitive = { .topology = WGPUPrimitiveTopology_TriangleList },
+            .multisample  = { .count = 1, .mask = ~0u },
+            .fragment     = &frag,
+        };
+        gBlitPipeline = wgpuDeviceCreateRenderPipeline(gDevice, &pd);
+        wgpuShaderModuleRelease(sm);
+        wgpuPipelineLayoutRelease(pl);
+    }
+
+    rebuild_postfx_bindgroups();
+
     // Load mesh (falls back to triangle if file not found)
     loadMeshForRendering("assets/rsc.nanite");
 }
@@ -787,6 +1066,8 @@ void renderer_resize(uint32_t w, uint32_t h)
     gWidth = w; gHeight = h;
     reconfigure_surface(w, h);
     recreate_depth_texture(w, h);
+    recreate_scene_textures(w, h);
+    rebuild_postfx_bindgroups();
 }
 
 void renderer_frame()
@@ -895,9 +1176,9 @@ void renderer_frame()
         wgpuComputePassEncoderRelease(epass);
     }
 
-    // Render pass
+    // Scene render pass — into offscreen color, sampled by post-process below
     WGPURenderPassEncoder pass = RenderPassBuilder{}
-        .color(frameView, WGPULoadOp_Clear, WGPUStoreOp_Store, {0.95, 0.05, 0.95, 1.0})
+        .color(gSceneColorView, WGPULoadOp_Clear, WGPUStoreOp_Store, {0.05, 0.05, 0.05, 1.0})
         .depth_stencil(gDepthView)
         .begin(encoder);
 
@@ -917,6 +1198,44 @@ void renderer_frame()
 
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
+
+    // Sobel post-process compute pass
+    if (gSobelPipeline && gSobelBG)
+    {
+        PostFxUniforms fx{};
+        fx.outlineColor[0] = 1.f;
+        fx.outlineColor[1] = 1.f;
+        fx.outlineColor[2] = 1.f;
+        fx.darkOutline     = 0u;
+        fx.znear           = 0.01f;
+        fx.zfar            = 100000.f;
+        wgpuQueueWriteBuffer(gQueue, gPostFxUniforms, 0, &fx, sizeof(fx));
+
+        WGPUComputePassEncoder ppass = ComputePassBuilder{"sobel post"}.begin(encoder);
+        wgpuComputePassEncoderSetPipeline(ppass, gSobelPipeline);
+        wgpuComputePassEncoderSetBindGroup(ppass, 0, gSobelBG, 0, nullptr);
+        const uint32_t gx = (gWidth  + 7u) / 8u;
+        const uint32_t gy = (gHeight + 7u) / 8u;
+        wgpuComputePassEncoderDispatchWorkgroups(ppass, gx, gy, 1);
+        wgpuComputePassEncoderEnd(ppass);
+        wgpuComputePassEncoderRelease(ppass);
+    }
+
+    // Final blit: post output -> swapchain
+    {
+        WGPURenderPassEncoder bpass = RenderPassBuilder{}
+            .color(frameView, WGPULoadOp_Clear, WGPUStoreOp_Store, {0, 0, 0, 1})
+            .begin(encoder);
+
+        if (gBlitPipeline && gBlitBG) {
+            wgpuRenderPassEncoderSetPipeline(bpass, gBlitPipeline);
+            wgpuRenderPassEncoderSetBindGroup(bpass, 0, gBlitBG, 0, nullptr);
+            wgpuRenderPassEncoderDraw(bpass, 3, 1, 0, 0);
+        }
+
+        wgpuRenderPassEncoderEnd(bpass);
+        wgpuRenderPassEncoderRelease(bpass);
+    }
 
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, nullptr);
     wgpuQueueSubmit(gQueue, 1, &cmd);
