@@ -12,6 +12,7 @@ struct InputState {
     bool  btns[3]{};
     int   skip_mouse = 0;
     float joy_x = 0, joy_y = 0;
+    float move_joy_x = 0, move_joy_y = 0;
 };
 
 static InputState* s = nullptr;
@@ -56,6 +57,13 @@ static void on_adapter(wgpu::RequestAdapterStatus status, wgpu::Adapter adapter,
         [](const wgpu::Device&, wgpu::ErrorType t, wgpu::StringView m) {
             std::printf("GPU error (%d): %.*s\n", (int)t, (int)m.length, m.data);
         });
+
+    wgpu::FeatureName features[] = {
+        wgpu::FeatureName::PrimitiveIndex,
+    };
+
+    devDesc.requiredFeatures = features;
+    devDesc.requiredFeatureCount = 1;
 
     ctx->adapter.RequestDevice(&devDesc, wgpu::CallbackMode::AllowSpontaneous,
                                on_device, ctx);
@@ -121,3 +129,7 @@ void  input_skip_mouse(int n)    { if (s) s->skip_mouse = n; }
 void  input_set_look_joystick(float x, float y) { if (s) { s->joy_x = x; s->joy_y = y; } }
 float input_look_joystick_x()   { return s ? s->joy_x : 0.f; }
 float input_look_joystick_y()   { return s ? s->joy_y : 0.f; }
+
+void  input_set_move_joystick(float x, float y) { if (s) { s->move_joy_x = x; s->move_joy_y = y; } }
+float input_move_joystick_x()   { return s ? s->move_joy_x : 0.f; }
+float input_move_joystick_y()   { return s ? s->move_joy_y : 0.f; }

@@ -47,40 +47,29 @@
                 transform: translate(-50%, -50%);
             }
 
-            #touch-controls {
+            #move-joystick-base {
                 position: fixed;
                 bottom: 24px;
                 left: 24px;
-                display: grid;
-                grid-template-columns: repeat(3, 64px);
-                grid-template-rows: repeat(2, 64px);
-                gap: 6px;
+                width: 120px;
+                height: 120px;
+                border-radius: 50%;
+                background: rgba(255, 255, 255, 0.1);
+                border: 2px solid rgba(255, 255, 255, 0.35);
+                touch-action: none;
                 z-index: 100;
             }
-            .dpad-btn {
-                background: rgba(255, 255, 255, 0.2);
-                border: 2px solid rgba(255, 255, 255, 0.45);
-                border-radius: 10px;
-                color: #fff;
-                font-size: 22px;
-                font-weight: bold;
-                font-family: monospace;
-                touch-action: none;
-                user-select: none;
-                -webkit-user-select: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                outline: none;
-                transition: background 0.05s;
-            }
-            .dpad-btn:active,
-            .dpad-btn.pressed {
-                background: rgba(255, 255, 255, 0.45);
-            }
-            .dpad-empty {
+            #move-joystick-knob {
+                width: 50px;
+                height: 50px;
+                border-radius: 50%;
+                background: rgba(255, 255, 255, 0.4);
+                border: 2px solid rgba(255, 255, 255, 0.7);
                 pointer-events: none;
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
             }
         </style>
     </head>
@@ -92,14 +81,9 @@
             <div id="joystick-knob"></div>
         </div>
 
-        <!-- WASD d-pad overlay (bottom-left): row1=[_,W,_]  row2=[A,S,D] -->
-        <div id="touch-controls">
-            <div class="dpad-empty"></div>
-            <button id="btn-w" class="dpad-btn" tabindex="-1">W</button>
-            <div class="dpad-empty"></div>
-            <button id="btn-a" class="dpad-btn" tabindex="-1">A</button>
-            <button id="btn-s" class="dpad-btn" tabindex="-1">S</button>
-            <button id="btn-d" class="dpad-btn" tabindex="-1">D</button>
+        <!-- Move joystick (bottom-left) -->
+        <div id="move-joystick-base">
+            <div id="move-joystick-knob"></div>
         </div>
 
         <script>
@@ -192,61 +176,82 @@
                 });
             })();
 
-            // WASD buttons — dispatch synthetic KeyboardEvents so the existing C++ handlers pick them up
+            // Move joystick (bottom-left) — calls window.setMoveJoystick(nx, ny)
             (function () {
-                function fakeKey(code, type) {
-                    window.dispatchEvent(
-                        new KeyboardEvent(type, {
-                            code: code,
-                            bubbles: true,
-                            cancelable: true,
-                        }),
-                    );
+                var base = document.getElementById("move-joystick-base");
+                var knob = document.getElementById("move-joystick-knob");
+                var touchId = null;
+                var baseCX = 0,
+                    baseCY = 0;
+                var MAX_R = 35;
+
+                function setJoy(nx, ny) {
+                    knob.style.transform =
+                        "translate(calc(-50% + " +
+                        nx * MAX_R +
+                        "px), calc(-50% + " +
+                        ny * MAX_R +
+                        "px))";
+                    if (window.setMoveJoystick) window.setMoveJoystick(nx, ny);
                 }
-                function bindBtn(id, code) {
-                    var el = document.getElementById(id);
-                    el.addEventListener(
-                        "touchstart",
-                        function (e) {
+
+                base.addEventListener(
+                    "touchstart",
+                    function (e) {
+                        e.preventDefault();
+                        if (touchId !== null) return;
+                        var t = e.changedTouches[0];
+                        touchId = t.identifier;
+                        var r = base.getBoundingClientRect();
+                        baseCX = r.left + r.width * 0.5;
+                        baseCY = r.top + r.height * 0.5;
+                        knob.style.transition = "none";
+                    },
+                    { passive: false },
+                );
+
+                document.addEventListener(
+                    "touchmove",
+                    function (e) {
+                        if (touchId === null) return;
+                        for (var i = 0; i < e.changedTouches.length; i++) {
+                            var t = e.changedTouches[i];
+                            if (t.identifier !== touchId) continue;
+                            var dx = t.clientX - baseCX,
+                                dy = t.clientY - baseCY;
+                            var dist = Math.sqrt(dx * dx + dy * dy);
+                            var nx = 0,
+                                ny = 0;
+                            if (dist > 1) {
+                                var clamped = Math.min(dist, MAX_R);
+                                nx = (dx / dist) * (clamped / MAX_R);
+                                ny = (dy / dist) * (clamped / MAX_R);
+                            }
+                            setJoy(nx, ny);
                             e.preventDefault();
-                            el.classList.add("pressed");
-                            fakeKey(code, "keydown");
-                        },
-                        { passive: false },
-                    );
-                    el.addEventListener(
-                        "touchend",
-                        function (e) {
-                            e.preventDefault();
-                            el.classList.remove("pressed");
-                            fakeKey(code, "keyup");
-                        },
-                        { passive: false },
-                    );
-                    el.addEventListener(
-                        "touchcancel",
-                        function (e) {
-                            e.preventDefault();
-                            el.classList.remove("pressed");
-                            fakeKey(code, "keyup");
-                        },
-                        { passive: false },
-                    );
-                    // Also support mouse (desktop testing)
-                    el.addEventListener("mousedown", function () {
-                        fakeKey(code, "keydown");
-                    });
-                    el.addEventListener("mouseup", function () {
-                        fakeKey(code, "keyup");
-                    });
-                    el.addEventListener("mouseleave", function () {
-                        fakeKey(code, "keyup");
-                    });
+                            break;
+                        }
+                    },
+                    { passive: false },
+                );
+
+                function onEnd(e) {
+                    if (touchId === null) return;
+                    for (var i = 0; i < e.changedTouches.length; i++) {
+                        if (e.changedTouches[i].identifier !== touchId)
+                            continue;
+                        touchId = null;
+                        knob.style.transition = "transform 0.1s ease-out";
+                        setJoy(0, 0);
+                        break;
+                    }
                 }
-                bindBtn("btn-w", "KeyW");
-                bindBtn("btn-a", "KeyA");
-                bindBtn("btn-s", "KeyS");
-                bindBtn("btn-d", "KeyD");
+                document.addEventListener("touchend", onEnd, {
+                    passive: false,
+                });
+                document.addEventListener("touchcancel", onEnd, {
+                    passive: false,
+                });
             })();
 
             // prevent main from stating too early on mobile devices

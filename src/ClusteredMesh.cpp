@@ -1,4 +1,6 @@
 #include "ClusteredMesh.h"
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -13,78 +15,14 @@
 
 static bool loadPrimitive(const cgltf_primitive* primitive, std::vector<MeshVertex>& vertices, std::vector<uint32_t>& indices);
 
-bool loadGltfMeshToGPU(const std::string& path, WGPUDevice device, WGPUQueue queue, ClusteredMeshGPU& out)
+
+static ClusteredMeshGPU uploadClusteredMesh(
+    WGPUDevice device, WGPUQueue queue,
+    const std::vector<MeshVertex>& vertices,
+    const std::vector<ClusterN>&   clusters,
+    const std::vector<uint32_t>&   meshletVertices,
+    const std::vector<uint8_t>&    meshletTriangles)
 {
-    cgltf_options options{};
-    cgltf_data* gltf{};
-
-    const char* cPath = path.c_str();
-    cgltf_result result = cgltf_parse_file(&options, cPath, &gltf);
-    if (result != cgltf_result_success)
-    {
-        fprintf(stderr, "loadGltfMeshToGPU: failed to parse %s\n", cPath);
-        return false;
-    }
-    defer { cgltf_free(gltf); };
-
-    result = cgltf_load_buffers(&options, gltf, cPath);
-    if (result != cgltf_result_success)
-    {
-        fprintf(stderr, "loadGltfMeshToGPU: failed to load buffers for %s\n", cPath);
-        return false;
-    }
-    result = cgltf_validate(gltf);
-    if (result != cgltf_result_success)
-    {
-        fprintf(stderr, "loadGltfMeshToGPU: validation failed for %s\n", cPath);
-        return false;
-    }
-
-    std::vector<MeshVertex> allVertices;
-    std::vector<ClusterN>   allClusters;
-    std::vector<uint32_t>   allMeshletVertices;
-    std::vector<uint8_t>    allMeshletTriangles;
-
-    for (cgltf_size meshIdx = 0; meshIdx < gltf->meshes_count; meshIdx++)
-    {
-        const cgltf_mesh* mesh = &gltf->meshes[meshIdx];
-        for (cgltf_size primIdx = 0; primIdx < mesh->primitives_count; primIdx++)
-        {
-            std::vector<MeshVertex> vertices;
-            std::vector<uint32_t>   indices;
-            if (!loadPrimitive(&mesh->primitives[primIdx], vertices, indices))
-                continue;
-
-            const uint32_t vertexBase         = (uint32_t)allVertices.size();
-            const uint32_t meshletVertexBase   = (uint32_t)allMeshletVertices.size();
-            const uint32_t meshletTriangleBase = (uint32_t)allMeshletTriangles.size();
-
-            std::vector<ClusterN> clusters;
-            std::vector<uint32_t> meshletVertices;
-            std::vector<uint8_t>  meshletTriangles;
-            buildNanite(vertices, indices, clusters, meshletVertices, meshletTriangles);
-
-            for (ClusterN& c : clusters)
-            {
-                c.meshletVertexOffset   += meshletVertexBase;
-                c.meshletTriangleOffset += meshletTriangleBase;
-            }
-            for (uint32_t& vi : meshletVertices)
-                vi += vertexBase;
-
-            allVertices.insert(allVertices.end(), vertices.begin(), vertices.end());
-            allClusters.insert(allClusters.end(), clusters.begin(), clusters.end());
-            allMeshletVertices.insert(allMeshletVertices.end(), meshletVertices.begin(), meshletVertices.end());
-            allMeshletTriangles.insert(allMeshletTriangles.end(), meshletTriangles.begin(), meshletTriangles.end());
-        }
-    }
-
-    if (allVertices.empty() || allClusters.empty())
-    {
-        fprintf(stderr, "loadGltfMeshToGPU: no usable primitives in %s\n", cPath);
-        return false;
-    }
-
     auto makeBuffer = [&](const void* data, size_t byteSize, WGPUBufferUsage usage, const char* label) -> WGPUBuffer
     {
         const size_t aligned = (byteSize + 3) & ~size_t(3);
@@ -107,28 +45,208 @@ bool loadGltfMeshToGPU(const std::string& path, WGPUDevice device, WGPUQueue que
     constexpr WGPUBufferUsage kStorage = WGPUBufferUsage_Storage;
 
     ClusteredMeshGPU gpu{};
-    gpu.vertexBuffer = makeBuffer(allVertices.data(),
-        allVertices.size() * sizeof(MeshVertex),
+    gpu.vertexBuffer = makeBuffer(vertices.data(),
+        vertices.size() * sizeof(MeshVertex),
         WGPUBufferUsage_Vertex | kStorage, "clustered mesh vertices");
-    gpu.clusterBuffer = makeBuffer(allClusters.data(),
-        allClusters.size() * sizeof(ClusterN),
+    gpu.clusterBuffer = makeBuffer(clusters.data(),
+        clusters.size() * sizeof(ClusterN),
         kStorage, "clustered mesh clusters");
-    gpu.meshletVertexBuffer = makeBuffer(allMeshletVertices.data(),
-        allMeshletVertices.size() * sizeof(uint32_t),
+    gpu.meshletVertexBuffer = makeBuffer(meshletVertices.data(),
+        meshletVertices.size() * sizeof(uint32_t),
         kStorage, "clustered mesh meshlet vertices");
-    gpu.meshletTriangleBuffer = makeBuffer(allMeshletTriangles.data(),
-        allMeshletTriangles.size() * sizeof(uint8_t),
+    gpu.meshletTriangleBuffer = makeBuffer(meshletTriangles.data(),
+        meshletTriangles.size() * sizeof(uint8_t),
         kStorage, "clustered mesh meshlet triangles");
 
-    gpu.vertexCount              = (uint32_t)allVertices.size();
-    gpu.clusterCount             = (uint32_t)allClusters.size();
-    gpu.meshletVertexCount       = (uint32_t)allMeshletVertices.size();
-    gpu.meshletTriangleByteCount = (uint32_t)allMeshletTriangles.size();
+    gpu.vertexCount              = (uint32_t)vertices.size();
+    gpu.clusterCount             = (uint32_t)clusters.size();
+    gpu.meshletVertexCount       = (uint32_t)meshletVertices.size();
+    gpu.meshletTriangleByteCount = (uint32_t)meshletTriangles.size();
+    return gpu;
+}
+
+bool buildClusteredMeshFromGltf(
+    const std::string&       path,
+    std::vector<MeshVertex>& outVertices,
+    std::vector<ClusterN>&   outClusters,
+    std::vector<uint32_t>&   outMeshletVertices,
+    std::vector<uint8_t>&    outMeshletTriangles)
+{
+    cgltf_options options{};
+    cgltf_data* gltf{};
+
+    const char* cPath = path.c_str();
+    cgltf_result result = cgltf_parse_file(&options, cPath, &gltf);
+    if (result != cgltf_result_success)
+    {
+        fprintf(stderr, "buildClusteredMeshFromGltf: failed to parse %s\n", cPath);
+        return false;
+    }
+    defer { cgltf_free(gltf); };
+
+    result = cgltf_load_buffers(&options, gltf, cPath);
+    if (result != cgltf_result_success)
+    {
+        fprintf(stderr, "buildClusteredMeshFromGltf: failed to load buffers for %s\n", cPath);
+        return false;
+    }
+    result = cgltf_validate(gltf);
+    if (result != cgltf_result_success)
+    {
+        fprintf(stderr, "buildClusteredMeshFromGltf: validation failed for %s\n", cPath);
+        return false;
+    }
+
+    for (cgltf_size meshIdx = 0; meshIdx < gltf->meshes_count; meshIdx++)
+    {
+        const cgltf_mesh* mesh = &gltf->meshes[meshIdx];
+        for (cgltf_size primIdx = 0; primIdx < mesh->primitives_count; primIdx++)
+        {
+            std::vector<MeshVertex> vertices;
+            std::vector<uint32_t>   indices;
+            if (!loadPrimitive(&mesh->primitives[primIdx], vertices, indices))
+                continue;
+
+            const uint32_t vertexBase         = (uint32_t)outVertices.size();
+            const uint32_t meshletVertexBase   = (uint32_t)outMeshletVertices.size();
+            const uint32_t meshletTriangleBase = (uint32_t)outMeshletTriangles.size();
+
+            std::vector<ClusterN> clusters;
+            std::vector<uint32_t> meshletVertices;
+            std::vector<uint8_t>  meshletTriangles;
+            buildNanite(vertices, indices, clusters, meshletVertices, meshletTriangles);
+
+            for (ClusterN& c : clusters)
+            {
+                c.meshletVertexOffset   += meshletVertexBase;
+                c.meshletTriangleOffset += meshletTriangleBase;
+            }
+            for (uint32_t& vi : meshletVertices)
+                vi += vertexBase;
+
+            outVertices.insert(outVertices.end(), vertices.begin(), vertices.end());
+            outClusters.insert(outClusters.end(), clusters.begin(), clusters.end());
+            outMeshletVertices.insert(outMeshletVertices.end(), meshletVertices.begin(), meshletVertices.end());
+            outMeshletTriangles.insert(outMeshletTriangles.end(), meshletTriangles.begin(), meshletTriangles.end());
+        }
+    }
+
+    if (outVertices.empty() || outClusters.empty())
+    {
+        fprintf(stderr, "buildClusteredMeshFromGltf: no usable primitives in %s\n", cPath);
+        return false;
+    }
+    return true;
+}
+
+static constexpr uint32_t kClusteredMeshMagic   = 0x494E414E; // 'NANI'
+static constexpr uint32_t kClusteredMeshVersion = 1;
+
+struct ClusteredMeshFileHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t vertexCount;
+    uint32_t clusterCount;
+    uint32_t meshletVertexCount;
+    uint32_t meshletTriangleByteCount;
+};
+
+
+bool saveClusteredMesh(
+    const std::string&             path,
+    const std::vector<MeshVertex>& vertices,
+    const std::vector<ClusterN>&   clusters,
+    const std::vector<uint32_t>&   meshletVertices,
+    const std::vector<uint8_t>&    meshletTriangles)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "saveClusteredMesh: cannot open %s for writing\n", path.c_str());
+        return false;
+    }
+
+    ClusteredMeshFileHeader hdr{
+        .magic                   = kClusteredMeshMagic,
+        .version                 = kClusteredMeshVersion,
+        .vertexCount             = (uint32_t)vertices.size(),
+        .clusterCount            = (uint32_t)clusters.size(),
+        .meshletVertexCount      = (uint32_t)meshletVertices.size(),
+        .meshletTriangleByteCount= (uint32_t)meshletTriangles.size(),
+    };
+
+    bool ok =
+        fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
+        fwrite(vertices.data(),        sizeof(MeshVertex), vertices.size(),        f) == vertices.size() &&
+        fwrite(clusters.data(),        sizeof(ClusterN),   clusters.size(),        f) == clusters.size() &&
+        fwrite(meshletVertices.data(), sizeof(uint32_t),   meshletVertices.size(), f) == meshletVertices.size() &&
+        fwrite(meshletTriangles.data(),sizeof(uint8_t),    meshletTriangles.size(),f) == meshletTriangles.size();
+
+    fclose(f);
+    if (!ok)
+        fprintf(stderr, "saveClusteredMesh: write error on %s\n", path.c_str());
+    return ok;
+}
+
+bool loadClusteredMeshFromFile(
+    const std::string& path,
+    WGPUDevice device, WGPUQueue queue,
+    ClusteredMeshGPU& out)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "loadClusteredMeshFromFile: cannot open %s\n", path.c_str());
+        return false;
+    }
+
+    ClusteredMeshFileHeader hdr{};
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+        hdr.magic   != kClusteredMeshMagic ||
+        hdr.version != kClusteredMeshVersion)
+    {
+        fprintf(stderr, "loadClusteredMeshFromFile: invalid or unsupported file %s\n", path.c_str());
+        fclose(f);
+        return false;
+    }
+
+    std::vector<MeshVertex> vertices(hdr.vertexCount);
+    std::vector<ClusterN>   clusters(hdr.clusterCount);
+    std::vector<uint32_t>   meshletVertices(hdr.meshletVertexCount);
+    std::vector<uint8_t>    meshletTriangles(hdr.meshletTriangleByteCount);
+
+    bool ok =
+        fread(vertices.data(),        sizeof(MeshVertex), hdr.vertexCount,              f) == hdr.vertexCount &&
+        fread(clusters.data(),        sizeof(ClusterN),   hdr.clusterCount,             f) == hdr.clusterCount &&
+        fread(meshletVertices.data(), sizeof(uint32_t),   hdr.meshletVertexCount,       f) == hdr.meshletVertexCount &&
+        fread(meshletTriangles.data(),sizeof(uint8_t),    hdr.meshletTriangleByteCount, f) == hdr.meshletTriangleByteCount;
+
+    fclose(f);
+    if (!ok) {
+        fprintf(stderr, "loadClusteredMeshFromFile: read error on %s\n", path.c_str());
+        return false;
+    }
+
+    out = uploadClusteredMesh(device, queue, vertices, clusters, meshletVertices, meshletTriangles);
+
+    printf("loadClusteredMeshFromFile: %s — vertices: %u  clusters: %u  meshletVerts: %u  meshletTris(bytes): %u\n",
+        path.c_str(), out.vertexCount, out.clusterCount, out.meshletVertexCount, out.meshletTriangleByteCount);
+    return true;
+}
+
+
+
+bool loadGltfMeshToGPU(const std::string& path, WGPUDevice device, WGPUQueue queue, ClusteredMeshGPU& out)
+{
+    std::vector<MeshVertex> vertices;
+    std::vector<ClusterN>   clusters;
+    std::vector<uint32_t>   meshletVertices;
+    std::vector<uint8_t>    meshletTriangles;
+    if (!buildClusteredMeshFromGltf(path, vertices, clusters, meshletVertices, meshletTriangles))
+        return false;
+
+    out = uploadClusteredMesh(device, queue, vertices, clusters, meshletVertices, meshletTriangles);
 
     printf("loadGltfMeshToGPU: %s — vertices: %u  clusters: %u  meshletVerts: %u  meshletTris(bytes): %u\n",
-        cPath, gpu.vertexCount, gpu.clusterCount, gpu.meshletVertexCount, gpu.meshletTriangleByteCount);
-
-    out = gpu;
+        path.c_str(), out.vertexCount, out.clusterCount, out.meshletVertexCount, out.meshletTriangleByteCount);
     return true;
 }
 
@@ -175,9 +293,7 @@ void buildNanite(
             std::vector<uint32_t> localVerts(cluster.vertex_count);
             std::vector<uint8_t>  meshletTris(cluster.index_count);
 
-            size_t actualVertCount = clodLocalIndices(
-                localVerts.data(), meshletTris.data(),
-                cluster.indices, cluster.index_count);
+            size_t actualVertCount = clodLocalIndices(localVerts.data(), meshletTris.data(), cluster.indices, cluster.index_count);
 
             localVerts.resize(actualVertCount);
 
@@ -190,6 +306,7 @@ void buildNanite(
             c.groupRadius    = group.simplified.radius;
             c.groupError     = group.simplified.error;
 
+            // if cluster is not refined: skip
             if (cluster.refined >= 0 && cluster.refined < (int)groups.size())
             {
                 const clodBounds& ref = groups[cluster.refined];
@@ -202,8 +319,9 @@ void buildNanite(
 
             c.meshletVertexOffset   = (uint32_t)outMeshletVertices.size();
             c.meshletTriangleOffset = (uint32_t)outMeshletTriangles.size();
-            c.vertexCount           = (uint32_t)actualVertCount;
-            c.triangleCount         = (uint32_t)(cluster.index_count / 3);
+
+            c.vertexCount = (uint8_t)actualVertCount;
+            c.triangleCount = (uint8_t)(cluster.index_count / 3);
 
             outClusters.push_back(c);
             outMeshletVertices.insert(outMeshletVertices.end(), localVerts.begin(), localVerts.end());

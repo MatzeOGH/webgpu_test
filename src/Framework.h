@@ -37,6 +37,11 @@ void  input_set_look_joystick(float x, float y); // -1..1 per axis
 float input_look_joystick_x();
 float input_look_joystick_y();
 
+// Virtual thumbstick move axis — set by platform, consumed by renderer each frame
+void  input_set_move_joystick(float x, float y); // -1..1 per axis
+float input_move_joystick_x();
+float input_move_joystick_y();
+
 // Key constants — USB HID position codes, identical to SDL3 scancodes
 // and to the values produced by browser KeyboardEvent.code on web builds.
 namespace Key {
