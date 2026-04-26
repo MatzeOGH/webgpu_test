@@ -33,6 +33,7 @@
                 border: 2px solid rgba(255, 255, 255, 0.35);
                 touch-action: none;
                 z-index: 100;
+                display: none;
             }
             #joystick-knob {
                 width: 50px;
@@ -58,6 +59,14 @@
                 border: 2px solid rgba(255, 255, 255, 0.35);
                 touch-action: none;
                 z-index: 100;
+                display: none;
+            }
+
+            @media (pointer: coarse) and (hover: none) {
+                #joystick-base,
+                #move-joystick-base {
+                    display: block;
+                }
             }
             #move-joystick-knob {
                 width: 50px;
