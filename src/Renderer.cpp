@@ -497,7 +497,7 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     var out: VertexOut;
     out.pos    = camera.proj * camera.view * vec4<f32>(v.x, v.y, v.z, 1.0);
     //out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
-    // out.color  = intToColor(cluster_id);
+    out.color  = intToColor(cluster_id);
     out.normal = octDecodeNormal(v.normal);
     return out;
 }
