@@ -1,10 +1,81 @@
 #include "ClusteredMesh.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 #include "AlpUtils.h"
+
+static inline void octDecodeDir(int8_t ox, int8_t oy, float out[3])
+{
+    float nx = float(ox) / 127.0f;
+    float ny = float(oy) / 127.0f;
+    float nz = 1.0f - fabsf(nx) - fabsf(ny);
+    if (nz < 0.0f)
+    {
+        float tx = (1.0f - fabsf(ny)) * (nx >= 0.0f ? 1.0f : -1.0f);
+        float ty = (1.0f - fabsf(nx)) * (ny >= 0.0f ? 1.0f : -1.0f);
+        nx = tx;
+        ny = ty;
+    }
+    float len = sqrtf(nx * nx + ny * ny + nz * nz);
+    out[0] = nx / len;
+    out[1] = ny / len;
+    out[2] = nz / len;
+}
+
+static inline void octEncodeNormal(float nx, float ny, float nz, int8_t* ox, int8_t* oy)
+{
+    float len = sqrtf(nx * nx + ny * ny + nz * nz);
+    if (len > 0.0f) { nx /= len; ny /= len; nz /= len; }
+    else            { nx = 0.0f; ny = 0.0f; nz = 1.0f; }
+
+    float denom = fabsf(nx) + fabsf(ny) + fabsf(nz);
+    float ax = nx / denom;
+    float ay = ny / denom;
+    if (nz < 0.0f)
+    {
+        float tx = (1.0f - fabsf(ay)) * (ax >= 0.0f ? 1.0f : -1.0f);
+        float ty = (1.0f - fabsf(ax)) * (ay >= 0.0f ? 1.0f : -1.0f);
+        ax = tx;
+        ay = ty;
+    }
+
+    auto clamp127 = [](int32_t v) -> int8_t {
+        if (v >  127) v =  127;
+        if (v < -127) v = -127;
+        return (int8_t)v;
+    };
+
+    int32_t bx = (int32_t)floorf(ax * 127.0f + 0.5f);
+    int32_t by = (int32_t)floorf(ay * 127.0f + 0.5f);
+
+    float bestErr = 1e30f;
+    int8_t bestX = 0, bestY = 0;
+    for (int32_t dx = 0; dx <= 1; dx++)
+    {
+        for (int32_t dy = 0; dy <= 1; dy++)
+        {
+            int8_t cx = clamp127(bx + dx);
+            int8_t cy = clamp127(by + dy);
+            float d[3];
+            octDecodeDir(cx, cy, d);
+            float dot = d[0] * nx + d[1] * ny + d[2] * nz;
+            float err = 1.0f - dot;
+            if (err < bestErr) { bestErr = err; bestX = cx; bestY = cy; }
+        }
+    }
+    *ox = bestX;
+    *oy = bestY;
+}
+
+static inline uint32_t packOctNormal(float nx, float ny, float nz)
+{
+    int8_t ox, oy;
+    octEncodeNormal(nx, ny, nz, &ox, &oy);
+    return (uint32_t)(uint8_t)ox | ((uint32_t)(uint8_t)oy << 8);
+}
 
 #define CGLTF_IMPLEMENTATION
 #include "extern/cgltf/cgltf.h"
@@ -140,7 +211,7 @@ bool buildClusteredMeshFromGltf(
 }
 
 static constexpr uint32_t kClusteredMeshMagic   = 0x494E414E; // 'NANI'
-static constexpr uint32_t kClusteredMeshVersion = 1;
+static constexpr uint32_t kClusteredMeshVersion = 3;
 
 struct ClusteredMeshFileHeader {
     uint32_t magic;
@@ -262,14 +333,24 @@ void buildNanite(
 
     const float attributeWeights[3] = {0.5f, 0.5f, 0.5f};
 
+    // clusterlod consumes attributes as raw floats, but MeshVertex stores normals
+    // oct-encoded. Decode into a parallel float buffer just for the build.
+    std::vector<float> decodedNormals(vertices.size() * 3);
+    for (size_t i = 0; i < vertices.size(); i++)
+    {
+        int8_t ox = (int8_t)(vertices[i].normal       & 0xFFu);
+        int8_t oy = (int8_t)((vertices[i].normal >> 8) & 0xFFu);
+        octDecodeDir(ox, oy, &decodedNormals[i * 3]);
+    }
+
     clodMesh mesh{};
     mesh.indices                  = indices.data();
     mesh.index_count              = indices.size();
     mesh.vertex_count             = vertices.size();
     mesh.vertex_positions         = &vertices[0].x;
     mesh.vertex_positions_stride  = sizeof(MeshVertex);
-    mesh.vertex_attributes        = &vertices[0].nx;
-    mesh.vertex_attributes_stride = sizeof(MeshVertex);
+    mesh.vertex_attributes        = decodedNormals.data();
+    mesh.vertex_attributes_stride = sizeof(float) * 3;
     mesh.attribute_weights        = attributeWeights;
     mesh.attribute_count          = 3;
     mesh.attribute_protect_mask   = (1 << 3) | (1 << 4);
@@ -363,10 +444,17 @@ static bool loadPrimitive(
         cgltf_accessor_unpack_floats(n, scratch.data(), n->count * 3);
         for (size_t i = 0; i < pos->count; i++)
         {
-            vertices[i].nx = scratch[i * 3 + 0];
-            vertices[i].ny = scratch[i * 3 + 1];
-            vertices[i].nz = scratch[i * 3 + 2];
+            vertices[i].normal = packOctNormal(
+                scratch[i * 3 + 0],
+                scratch[i * 3 + 1],
+                scratch[i * 3 + 2]);
         }
+    }
+    else
+    {
+        // Default to +Z when normals are absent.
+        for (size_t i = 0; i < pos->count; i++)
+            vertices[i].normal = packOctNormal(0.0f, 0.0f, 1.0f);
     }
 
     if (auto uv = cgltf_find_accessor(primitive, cgltf_attribute_type_texcoord, 0))
@@ -374,8 +462,9 @@ static bool loadPrimitive(
         cgltf_accessor_unpack_floats(uv, scratch.data(), uv->count * 2);
         for (size_t i = 0; i < pos->count; i++)
         {
-            vertices[i].tu = scratch[i * 2 + 0];
-            vertices[i].tv = scratch[i * 2 + 1];
+            uint16_t hu = meshopt_quantizeHalf(scratch[i * 2 + 0]);
+            uint16_t hv = meshopt_quantizeHalf(scratch[i * 2 + 1]);
+            vertices[i].uv = (uint32_t(hv) << 16) | uint32_t(hu);
         }
     }
 

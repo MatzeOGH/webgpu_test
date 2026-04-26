@@ -404,8 +404,6 @@ static void initClusteredRenderPipeline(const ClusteredMeshGPU& mesh)
     if (gClusteredBGL) { wgpuBindGroupLayoutRelease(gClusteredBGL);  gClusteredBGL = {}; }
 
     const char clusteredShaderCode[] = R"(
-enable primitive_index;
-
 struct CameraUniforms {
     view : mat4x4<f32>,
     proj : mat4x4<f32>,
@@ -428,11 +426,30 @@ struct ClusterN {
     packedCounts         : u32,
 }
 
-// must match MeshVertex in C++ (8 x f32 = 32 bytes)
+// must match MeshVertex in C++ (3 x f32 + 2 x u32 = 20 bytes)
+//   normal: oct-encoded (low byte = ox i8, next byte = oy i8)
+//   uv    : packed half2 (unpack with unpack2x16float)
 struct MeshVertex {
     x:  f32, y:  f32, z:  f32,
-    nx: f32, ny: f32, nz: f32,
-    tu: f32, tv: f32,
+    normal: u32,
+    uv: u32,
+}
+
+fn octDecodeNormal(packed: u32) -> vec3<f32> {
+    // Sign-extend the two low bytes via arithmetic shift on i32.
+    let i = i32(packed);
+    let ox = f32((i << 24u) >> 24u) / 127.0;
+    let oy = f32((i << 16u) >> 24u) / 127.0;
+    var nx = ox;
+    var ny = oy;
+    var nz = 1.0 - abs(nx) - abs(ny);
+    if (nz < 0.0) {
+        let tx = (1.0 - abs(ny)) * select(-1.0, 1.0, nx >= 0.0);
+        let ty = (1.0 - abs(nx)) * select(-1.0, 1.0, ny >= 0.0);
+        nx = tx;
+        ny = ty;
+    }
+    return normalize(vec3<f32>(nx, ny, nz));
 }
 
 @group(0) @binding(0) var<uniform>        camera        : CameraUniforms;
@@ -479,18 +496,17 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     let v           = vertices[global_vtx];
     var out: VertexOut;
     out.pos    = camera.proj * camera.view * vec4<f32>(v.x, v.y, v.z, 1.0);
-    out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
-    out.normal = vec3<f32>(v.nx, v.ny, v.nz);
+    //out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
+    // out.color  = intToColor(cluster_id);
+    out.normal = octDecodeNormal(v.normal);
     return out;
 }
-
-
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
     let diffuse = max(dot(normalize(in.normal), light_dir), 0.08);
-    return vec4<f32>(in.normal, 1.0);
+    return vec4<f32>(in.color, 1.0);
 }
     )";
 
@@ -630,8 +646,6 @@ void renderer_init(wgpu::Device device, wgpu::Queue queue, wgpu::Surface surface
     // ---- Fallback pipeline (hardcoded triangle, CameraUniforms bind group) ----
     {
         const char fallbackShader[] = R"(
-enable primitive_index;
-
 struct Uniforms {
     view : mat4x4<f32>,
     proj : mat4x4<f32>,
@@ -647,34 +661,9 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
     return u.proj * u.view * vec4f(p, 0.0, 1.0);
 }
 
-// taken from unreal engine
-fn murmurMix(hash: u32) -> u32 {
-    var h = hash;
-
-    h = h ^ (h >> 16u);
-    h = h * 0x85ebca6bu;
-    h = h ^ (h >> 13u);
-    h = h * 0xc2b2ae35u;
-    h = h ^ (h >> 16u);
-
-    return h;
-}
-
-// taken from unreal engine
-fn intToColor(index: u32) -> vec3<f32> {
-    let hash = murmurMix(index);
-
-    let r = f32((hash >> 0u) & 255u);
-    let g = f32((hash >> 8u) & 255u);
-    let b = f32((hash >> 16u) & 255u);
-
-    return vec3<f32>(r, g, b) * (1.0 / 255.0);
-}
-
 @fragment
-fn fs_main( @builtin(primitive_index) prim_id: u32) -> @location(0) vec4f {
-    let color = intToColor(prim_id);
-    return vec4f(color, 1.0);
+fn fs_main() -> @location(0) vec4f {
+    return vec4f(1.0, 0.0, 0.0, 1.0);
 }
         )";
 
@@ -1058,7 +1047,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     rebuild_postfx_bindgroups();
 
     // Load mesh (falls back to triangle if file not found)
-    loadMeshForRendering("assets/rsc.nanite");
+    loadMeshForRendering("assets/rsc.mesh");
 }
 
 void renderer_resize(uint32_t w, uint32_t h)

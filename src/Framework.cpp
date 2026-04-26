@@ -62,8 +62,9 @@ static void on_adapter(wgpu::RequestAdapterStatus status, wgpu::Adapter adapter,
         wgpu::FeatureName::PrimitiveIndex,
     };
 
-    devDesc.requiredFeatures = features;
-    devDesc.requiredFeatureCount = 1;
+    // disabled for now because it is not needed
+    //devDesc.requiredFeatures = features;
+    //devDesc.requiredFeatureCount = 1;
 
     ctx->adapter.RequestDevice(&devDesc, wgpu::CallbackMode::AllowSpontaneous,
                                on_device, ctx);

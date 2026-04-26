@@ -6,9 +6,9 @@
 #include <webgpu/webgpu.h>
 
 struct MeshVertex {
-    float x, y, z;
-    float nx, ny, nz;
-    float tu, tv;
+    float    x, y, z;
+    uint32_t normal; // oct-encoded: low byte = ox (i8), next byte = oy (i8); upper 16 bits unused
+    uint32_t uv;     // packed half2 (tu, tv) — unpack with unpack2x16float in WGSL
 };
 
 struct ClusterN {
