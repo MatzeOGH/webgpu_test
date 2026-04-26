@@ -1047,7 +1047,7 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     rebuild_postfx_bindgroups();
 
     // Load mesh (falls back to triangle if file not found)
-    loadMeshForRendering("assets/rsc.mesh");
+    loadMeshForRendering("assets/n.mesh");
 }
 
 void renderer_resize(uint32_t w, uint32_t h)
