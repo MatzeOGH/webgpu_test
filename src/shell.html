@@ -62,10 +62,39 @@
                 display: none;
             }
 
+            #fullscreen-btn {
+                position: fixed;
+                top: 16px;
+                right: 16px;
+                width: 44px;
+                height: 44px;
+                border-radius: 8px;
+                background: rgba(255, 255, 255, 0.1);
+                border: 2px solid rgba(255, 255, 255, 0.35);
+                color: rgba(255, 255, 255, 0.85);
+                font: 20px/1 sans-serif;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                touch-action: manipulation;
+                z-index: 100;
+                padding: 0;
+            }
+            #fullscreen-btn:active {
+                background: rgba(255, 255, 255, 0.25);
+            }
+
             @media (pointer: coarse) {
                 #joystick-base,
                 #move-joystick-base {
                     display: block;
+                }
+                #fullscreen-btn {
+                    display: flex;
                 }
             }
             #move-joystick-knob {
@@ -94,6 +123,9 @@
         <div id="move-joystick-base">
             <div id="move-joystick-knob"></div>
         </div>
+
+        <!-- Fullscreen toggle (mobile only, top-right) -->
+        <button id="fullscreen-btn" type="button" aria-label="Toggle fullscreen">⛶</button>
 
         <script>
             // Canvas resize
@@ -266,6 +298,98 @@
                 document.addEventListener("touchcancel", onEnd, {
                     passive: false,
                 });
+            })();
+
+            // Fullscreen toggle (mobile)
+            (function () {
+                var btn = document.getElementById("fullscreen-btn");
+                if (!btn) return;
+
+                var docEl = document.documentElement;
+                var canRequest =
+                    docEl.requestFullscreen ||
+                    docEl.webkitRequestFullscreen ||
+                    docEl.webkitRequestFullScreen ||
+                    docEl.msRequestFullscreen;
+
+                // iOS iPhone Safari lacks Fullscreen API entirely — hide button there.
+                if (!canRequest) {
+                    btn.style.display = "none";
+                    return;
+                }
+
+                function isFs() {
+                    return !!(
+                        document.fullscreenElement ||
+                        document.webkitFullscreenElement ||
+                        document.webkitCurrentFullScreenElement ||
+                        document.msFullscreenElement
+                    );
+                }
+
+                function enter() {
+                    var fn =
+                        docEl.requestFullscreen ||
+                        docEl.webkitRequestFullscreen ||
+                        docEl.webkitRequestFullScreen ||
+                        docEl.msRequestFullscreen;
+                    try {
+                        var p = fn.call(docEl, { navigationUI: "hide" });
+                        if (p && p.catch) p.catch(function () {});
+                    } catch (_) {
+                        try {
+                            fn.call(docEl);
+                        } catch (_) {}
+                    }
+                }
+
+                function exit() {
+                    var fn =
+                        document.exitFullscreen ||
+                        document.webkitExitFullscreen ||
+                        document.webkitCancelFullScreen ||
+                        document.msExitFullscreen;
+                    if (fn) {
+                        try {
+                            var p = fn.call(document);
+                            if (p && p.catch) p.catch(function () {});
+                        } catch (_) {}
+                    }
+                }
+
+                function toggle(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (isFs()) exit();
+                    else enter();
+                }
+
+                // Use both touchend (fast on mobile) and click (desktop fallback /
+                // accessibility). Guard against double-fire via a small lockout.
+                var lock = 0;
+                btn.addEventListener(
+                    "touchend",
+                    function (e) {
+                        lock = Date.now();
+                        toggle(e);
+                    },
+                    { passive: false },
+                );
+                btn.addEventListener("click", function (e) {
+                    if (Date.now() - lock < 500) {
+                        e.preventDefault();
+                        return;
+                    }
+                    toggle(e);
+                });
+
+                // Update icon on state change.
+                function syncIcon() {
+                    btn.textContent = isFs() ? "✕" : "⛶";
+                }
+                document.addEventListener("fullscreenchange", syncIcon);
+                document.addEventListener("webkitfullscreenchange", syncIcon);
+                document.addEventListener("msfullscreenchange", syncIcon);
             })();
 
             // prevent main from stating too early on mobile devices
