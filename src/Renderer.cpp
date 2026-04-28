@@ -470,10 +470,18 @@ fn octDecodeNormal(packed: u32) -> vec3<f32> {
     return normalize(vec3<f32>(nx, ny, nz));
 }
 
+
 @group(0) @binding(0) var<uniform>       camera          : CameraUniforms;
 @group(0) @binding(1) var<storage, read> clusters        : array<ClusterN>;
 @group(0) @binding(2) var<storage, read> vertices        : array<MeshVertex>;
 @group(0) @binding(3) var<storage, read> meshlet_vertices: array<u32>;
+@group(0) @binding(4) var<storage, read> meshlet_tris    : array<u32>;
+
+fn read_u8(byte_offset: u32) -> u32 {
+    let word = meshlet_tris[byte_offset / 4u];
+    let shift = (byte_offset % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
 
 struct VertexOut {
     @builtin(position) pos   : vec4<f32>,
@@ -507,15 +515,24 @@ fn intToColor(index: u32) -> vec3<f32> {
 
 @vertex
 fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
-    let cluster_id  = packed >> 8u;
-    let local_idx   = packed & 0xFFu;
+    // reconstruct the cluster id, triangle id and corner
+    let cluster_id = packed >> 9u;
+    let tri_idx    = (packed >> 2u) & 0x7Fu;
+    let corner     = packed & 0x3u;
+
     let cluster     = clusters[cluster_id];
-    let global_vi   = meshlet_vertices[cluster.meshletVertexOffset + local_idx];
+
+    let tri_byte = cluster.meshletTriangleOffset + tri_idx * 3u;
+    let i0 = read_u8(tri_byte + corner);
+
+    let global_vi   = meshlet_vertices[cluster.meshletVertexOffset + i0];
     let v           = vertices[global_vi];
+
+    let global_tri_id = cluster_id + tri_idx;
+
     var out: VertexOut;
     out.pos    = camera.proj * camera.view * vec4<f32>(decode_position(v), 1.0);
-    out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
-    //out.color  = intToColor(cluster_id);
+    out.color  = intToColor(global_tri_id);
     out.normal = octDecodeNormal(v.normal);
     return out;
 }
@@ -531,7 +548,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     WGPUShaderModule shader = createShaderModule(gDevice, WEBGPU_STR(clusteredShaderCode));
     // shader released after pipeline creation via defer-like cleanup below
 
-    WGPUBindGroupLayoutEntry bglEntries[4] = {
+    WGPUBindGroupLayoutEntry bglEntries[5] = {
         { .binding = 0, .visibility = WGPUShaderStage_Vertex,
           .buffer = { .type = WGPUBufferBindingType_Uniform, .minBindingSize = sizeof(CameraUniforms) } },
         { .binding = 1, .visibility = WGPUShaderStage_Vertex,
@@ -540,8 +557,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
           .buffer = { .type = WGPUBufferBindingType_ReadOnlyStorage } },
         { .binding = 3, .visibility = WGPUShaderStage_Vertex,
           .buffer = { .type = WGPUBufferBindingType_ReadOnlyStorage } },
+        { .binding = 4, .visibility = WGPUShaderStage_Vertex,
+          .buffer = { .type = WGPUBufferBindingType_ReadOnlyStorage } },
     };
-    WGPUBindGroupLayoutDescriptor bglDesc{ .entryCount = 4, .entries = bglEntries };
+    WGPUBindGroupLayoutDescriptor bglDesc{ .entryCount = 5, .entries = bglEntries };
     gClusteredBGL = wgpuDeviceCreateBindGroupLayout(gDevice, &bglDesc);
 
     WGPUPipelineLayoutDescriptor plDesc{ .bindGroupLayoutCount = 1, .bindGroupLayouts = &gClusteredBGL };
@@ -580,13 +599,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     wgpuShaderModuleRelease(shader);
     wgpuPipelineLayoutRelease(layout);
 
-    WGPUBindGroupEntry bgEntries[4] = {
+    WGPUBindGroupEntry bgEntries[5] = {
         { .binding = 0, .buffer = viewUniforms,              .offset = 0, .size = sizeof(CameraUniforms) },
         { .binding = 1, .buffer = mesh.clusterBuffer,        .offset = 0, .size = (uint64_t)mesh.clusterCount      * sizeof(ClusterN)   },
         { .binding = 2, .buffer = mesh.vertexBuffer,         .offset = 0, .size = (uint64_t)mesh.vertexCount       * sizeof(MeshVertex)  },
         { .binding = 3, .buffer = mesh.meshletVertexBuffer,  .offset = 0, .size = (uint64_t)mesh.meshletVertexCount * sizeof(uint32_t)   },
+        { .binding = 4, .buffer = mesh.meshletTriangleBuffer, .offset = 0, .size = ((uint64_t)mesh.meshletTriangleByteCount + 3u) & ~3ull },
     };
-    WGPUBindGroupDescriptor bgDesc{ .layout = gClusteredBGL, .entryCount = 4, .entries = bgEntries };
+    WGPUBindGroupDescriptor bgDesc{ .layout = gClusteredBGL, .entryCount = 5, .entries = bgEntries };
     gClusteredBG = wgpuDeviceCreateBindGroup(gDevice, &bgDesc);
 }
 
@@ -839,11 +859,7 @@ struct DrawArgs {
 var<workgroup> ws_base    : u32;
 var<workgroup> ws_cluster : ClusterN;
 
-fn read_u8(byte_offset: u32) -> u32 {
-    let word = meshlet_tris[byte_offset / 4u];
-    let shift = (byte_offset % 4u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
+
 
 @compute @workgroup_size(128)
 fn cs_main(
@@ -861,14 +877,11 @@ fn cs_main(
     let tri_idx = lid.x;
     let tri_count = (ws_cluster.packedCounts >> 8u) & 0xFFu;
     if (tri_idx >= tri_count) { return; }
-    let tri_byte = ws_cluster.meshletTriangleOffset + tri_idx * 3u;
-    let i0 = read_u8(tri_byte + 0u);
-    let i1 = read_u8(tri_byte + 1u);
-    let i2 = read_u8(tri_byte + 2u);
+
     let out_base = ws_base + tri_idx * 3u;
-    out_indices[out_base + 0u] = (cluster_id << 8u) | i0;
-    out_indices[out_base + 1u] = (cluster_id << 8u) | i1;
-    out_indices[out_base + 2u] = (cluster_id << 8u) | i2;
+    out_indices[out_base + 0u] = (cluster_id << 9u) | (tri_idx << 2u) | 0;
+    out_indices[out_base + 1u] = (cluster_id << 9u) | (tri_idx << 2u) | 1;
+    out_indices[out_base + 2u] = (cluster_id << 9u) | (tri_idx << 2u) | 2;
 }
         )";
 
