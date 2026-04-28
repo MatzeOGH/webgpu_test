@@ -1,5 +1,6 @@
 #include "ClusteredMesh.h"
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,9 +32,12 @@ static inline void octEncodeNormal(float nx, float ny, float nz, int8_t* ox, int
     if (len > 0.0f) { nx /= len; ny /= len; nz /= len; }
     else            { nx = 0.0f; ny = 0.0f; nz = 1.0f; }
 
+    // L1 normalization projection
     float denom = fabsf(nx) + fabsf(ny) + fabsf(nz);
     float ax = nx / denom;
     float ay = ny / denom;
+
+    // lower hemisphere fold
     if (nz < 0.0f)
     {
         float tx = (1.0f - fabsf(ay)) * (ax >= 0.0f ? 1.0f : -1.0f);
@@ -42,6 +46,7 @@ static inline void octEncodeNormal(float nx, float ny, float nz, int8_t* ox, int
         ay = ty;
     }
 
+    // clamp to snorm
     auto clamp127 = [](int32_t v) -> int8_t {
         if (v >  127) v =  127;
         if (v < -127) v = -127;
@@ -51,6 +56,7 @@ static inline void octEncodeNormal(float nx, float ny, float nz, int8_t* ox, int
     int32_t bx = (int32_t)floorf(ax * 127.0f + 0.5f);
     int32_t by = (int32_t)floorf(ay * 127.0f + 0.5f);
 
+    // neighbor search to find lowest error candidate
     float bestErr = 1e30f;
     int8_t bestX = 0, bestY = 0;
     for (int32_t dx = 0; dx <= 1; dx++)
@@ -70,11 +76,46 @@ static inline void octEncodeNormal(float nx, float ny, float nz, int8_t* ox, int
     *oy = bestY;
 }
 
-static inline uint32_t packOctNormal(float nx, float ny, float nz)
+static inline uint16_t packOctNormal(float nx, float ny, float nz)
 {
     int8_t ox, oy;
     octEncodeNormal(nx, ny, nz, &ox, &oy);
-    return (uint32_t)(uint8_t)ox | ((uint32_t)(uint8_t)oy << 8);
+    return (uint16_t)((uint8_t)ox | ((uint16_t)(uint8_t)oy << 8));
+}
+
+static constexpr uint32_t kPos21Max = (1u << 21) - 1u; // 2097151
+
+static void computeBounds(const std::vector<MeshVertexRaw>& verts,
+                          float summand[3], float factor[3], float inv_range[3])
+{
+    float mn[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
+    float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (const auto& v : verts)
+        for (int i = 0; i < 3; i++) {
+            mn[i] = std::min(mn[i], v.pos[i]);
+            mx[i] = std::max(mx[i], v.pos[i]);
+        }
+    for (int i = 0; i < 3; i++) {
+        summand[i]   = mn[i];
+        float range  = mx[i] - mn[i];
+        factor[i]    = range > 0.f ? range / (float)kPos21Max : 1.f;
+        inv_range[i] = range > 0.f ? (float)kPos21Max / range  : 0.f;
+    }
+}
+
+static void packPosition(float px, float py, float pz,
+                         const float summand[3], const float inv_range[3],
+                         uint32_t out[2])
+{
+    auto quantize = [&](float v, int axis) -> uint32_t {
+        int32_t q = (int32_t)((v - summand[axis]) * inv_range[axis] + 0.5f);
+        if (q < 0) q = 0;
+        if (q > (int32_t)kPos21Max) q = (int32_t)kPos21Max;
+        return (uint32_t)q;
+    };
+    uint32_t x = quantize(px, 0), y = quantize(py, 1), z = quantize(pz, 2);
+    out[0] = x | ((y & 0x7FFu) << 21);
+    out[1] = (y >> 11u) | (z << 10u);
 }
 
 #define CGLTF_IMPLEMENTATION
@@ -84,7 +125,19 @@ static inline uint32_t packOctNormal(float nx, float ny, float nz)
 #include "extern/meshoptimizer/src/meshoptimizer.h"
 #include "extern/meshoptimizer/demo/clusterlod.h"
 
-static bool loadPrimitive(const cgltf_primitive* primitive, std::vector<MeshVertex>& vertices, std::vector<uint32_t>& indices);
+static bool loadPrimitive(const cgltf_primitive* primitive, std::vector<MeshVertexRaw>& vertices, std::vector<uint32_t>& indices);
+
+static MeshVertex encodeMeshVertex(const MeshVertexRaw& v,
+                                   const float summand[3], const float inv_range[3])
+{
+    MeshVertex out{};
+    packPosition(v.pos[0], v.pos[1], v.pos[2], summand, inv_range, out.pos);
+    out.normal = packOctNormal(v.normal[0], v.normal[1], v.normal[2]);
+    uint16_t hu = meshopt_quantizeHalf(v.uv[0]);
+    uint16_t hv = meshopt_quantizeHalf(v.uv[1]);
+    out.uv = (uint32_t(hv) << 16) | uint32_t(hu);
+    return out;
+}
 
 
 static ClusteredMeshGPU uploadClusteredMesh(
@@ -137,11 +190,11 @@ static ClusteredMeshGPU uploadClusteredMesh(
 }
 
 bool buildClusteredMeshFromGltf(
-    const std::string&       path,
-    std::vector<MeshVertex>& outVertices,
-    std::vector<ClusterN>&   outClusters,
-    std::vector<uint32_t>&   outMeshletVertices,
-    std::vector<uint8_t>&    outMeshletTriangles)
+    const std::string&          path,
+    std::vector<MeshVertexRaw>& outVertices,
+    std::vector<ClusterN>&      outClusters,
+    std::vector<uint32_t>&      outMeshletVertices,
+    std::vector<uint8_t>&       outMeshletTriangles)
 {
     cgltf_options options{};
     cgltf_data* gltf{};
@@ -173,31 +226,32 @@ bool buildClusteredMeshFromGltf(
         const cgltf_mesh* mesh = &gltf->meshes[meshIdx];
         for (cgltf_size primIdx = 0; primIdx < mesh->primitives_count; primIdx++)
         {
-            std::vector<MeshVertex> vertices;
-            std::vector<uint32_t>   indices;
+            std::vector<MeshVertexRaw> vertices;
+            std::vector<uint32_t>      indices;
             if (!loadPrimitive(&mesh->primitives[primIdx], vertices, indices))
                 continue;
 
-            const uint32_t vertexBase         = (uint32_t)outVertices.size();
+            const uint32_t clusterVertexBase   = (uint32_t)outVertices.size();
             const uint32_t meshletVertexBase   = (uint32_t)outMeshletVertices.size();
             const uint32_t meshletTriangleBase = (uint32_t)outMeshletTriangles.size();
 
-            std::vector<ClusterN> clusters;
-            std::vector<uint32_t> meshletVertices;
-            std::vector<uint8_t>  meshletTriangles;
-            buildNanite(vertices, indices, clusters, meshletVertices, meshletTriangles);
+            std::vector<ClusterN>  clusters;
+            std::vector<uint32_t>  meshletVerts;
+            std::vector<uint8_t>   meshletTriangles;
+            buildNanite(vertices, indices, clusters, meshletVerts, meshletTriangles);
 
             for (ClusterN& c : clusters)
             {
                 c.meshletVertexOffset   += meshletVertexBase;
                 c.meshletTriangleOffset += meshletTriangleBase;
             }
-            for (uint32_t& vi : meshletVertices)
-                vi += vertexBase;
+            // offset global vertex indices from primitive-local to file-global
+            for (uint32_t& vi : meshletVerts)
+                vi += clusterVertexBase;
 
             outVertices.insert(outVertices.end(), vertices.begin(), vertices.end());
             outClusters.insert(outClusters.end(), clusters.begin(), clusters.end());
-            outMeshletVertices.insert(outMeshletVertices.end(), meshletVertices.begin(), meshletVertices.end());
+            outMeshletVertices.insert(outMeshletVertices.end(), meshletVerts.begin(), meshletVerts.end());
             outMeshletTriangles.insert(outMeshletTriangles.end(), meshletTriangles.begin(), meshletTriangles.end());
         }
     }
@@ -211,24 +265,26 @@ bool buildClusteredMeshFromGltf(
 }
 
 static constexpr uint32_t kClusteredMeshMagic   = 0x494E414E; // 'NANI'
-static constexpr uint32_t kClusteredMeshVersion = 3;
+static constexpr uint32_t kClusteredMeshVersion = 7;
 
 struct ClusteredMeshFileHeader {
     uint32_t magic;
     uint32_t version;
-    uint32_t vertexCount;
+    uint32_t vertexCount;           // unique global vertices
     uint32_t clusterCount;
-    uint32_t meshletVertexCount;
+    uint32_t meshletVertexCount;    // uint32_t entries in meshlet vertex index buffer
     uint32_t meshletTriangleByteCount;
+    float    dequant_summand[3];
+    float    dequant_factor[3];
 };
 
 
 bool saveClusteredMesh(
-    const std::string&             path,
-    const std::vector<MeshVertex>& vertices,
-    const std::vector<ClusterN>&   clusters,
-    const std::vector<uint32_t>&   meshletVertices,
-    const std::vector<uint8_t>&    meshletTriangles)
+    const std::string&                path,
+    const std::vector<MeshVertexRaw>& vertices,
+    const std::vector<ClusterN>&      clusters,
+    const std::vector<uint32_t>&      meshletVertices,
+    const std::vector<uint8_t>&       meshletTriangles)
 {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) {
@@ -236,21 +292,30 @@ bool saveClusteredMesh(
         return false;
     }
 
+    float summand[3], factor[3], inv_range[3];
+    computeBounds(vertices, summand, factor, inv_range);
+
     ClusteredMeshFileHeader hdr{
-        .magic                   = kClusteredMeshMagic,
-        .version                 = kClusteredMeshVersion,
-        .vertexCount             = (uint32_t)vertices.size(),
-        .clusterCount            = (uint32_t)clusters.size(),
-        .meshletVertexCount      = (uint32_t)meshletVertices.size(),
-        .meshletTriangleByteCount= (uint32_t)meshletTriangles.size(),
+        .magic                    = kClusteredMeshMagic,
+        .version                  = kClusteredMeshVersion,
+        .vertexCount              = (uint32_t)vertices.size(),
+        .clusterCount             = (uint32_t)clusters.size(),
+        .meshletVertexCount       = (uint32_t)meshletVertices.size(),
+        .meshletTriangleByteCount = (uint32_t)meshletTriangles.size(),
     };
+    std::copy(summand, summand + 3, hdr.dequant_summand);
+    std::copy(factor,  factor  + 3, hdr.dequant_factor);
+
+    std::vector<MeshVertex> encodedVerts(vertices.size());
+    for (size_t i = 0; i < vertices.size(); i++)
+        encodedVerts[i] = encodeMeshVertex(vertices[i], summand, inv_range);
 
     bool ok =
         fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
-        fwrite(vertices.data(),        sizeof(MeshVertex), vertices.size(),        f) == vertices.size() &&
-        fwrite(clusters.data(),        sizeof(ClusterN),   clusters.size(),        f) == clusters.size() &&
-        fwrite(meshletVertices.data(), sizeof(uint32_t),   meshletVertices.size(), f) == meshletVertices.size() &&
-        fwrite(meshletTriangles.data(),sizeof(uint8_t),    meshletTriangles.size(),f) == meshletTriangles.size();
+        fwrite(encodedVerts.data(),    sizeof(MeshVertex), encodedVerts.size(),      f) == encodedVerts.size() &&
+        fwrite(clusters.data(),        sizeof(ClusterN),   clusters.size(),          f) == clusters.size() &&
+        fwrite(meshletVertices.data(), sizeof(uint32_t),   meshletVertices.size(),   f) == meshletVertices.size() &&
+        fwrite(meshletTriangles.data(),sizeof(uint8_t),    meshletTriangles.size(),  f) == meshletTriangles.size();
 
     fclose(f);
     if (!ok)
@@ -297,9 +362,11 @@ bool loadClusteredMeshFromFile(
     }
 
     out = uploadClusteredMesh(device, queue, vertices, clusters, meshletVertices, meshletTriangles);
+    std::copy(hdr.dequant_summand, hdr.dequant_summand + 3, out.dequant_summand);
+    std::copy(hdr.dequant_factor,  hdr.dequant_factor  + 3, out.dequant_factor);
 
-    printf("loadClusteredMeshFromFile: %s — vertices: %u  clusters: %u  meshletVerts: %u  meshletTris(bytes): %u\n",
-        path.c_str(), out.vertexCount, out.clusterCount, out.meshletVertexCount, out.meshletTriangleByteCount);
+    printf("loadClusteredMeshFromFile: %s — vertices: %u  clusters: %u  meshletTris(bytes): %u\n",
+        path.c_str(), out.vertexCount, out.clusterCount, out.meshletTriangleByteCount);
     return true;
 }
 
@@ -307,56 +374,55 @@ bool loadClusteredMeshFromFile(
 
 bool loadGltfMeshToGPU(const std::string& path, WGPUDevice device, WGPUQueue queue, ClusteredMeshGPU& out)
 {
-    std::vector<MeshVertex> vertices;
-    std::vector<ClusterN>   clusters;
-    std::vector<uint32_t>   meshletVertices;
-    std::vector<uint8_t>    meshletTriangles;
+    std::vector<MeshVertexRaw> vertices;
+    std::vector<ClusterN>      clusters;
+    std::vector<uint32_t>      meshletVertices;
+    std::vector<uint8_t>       meshletTriangles;
     if (!buildClusteredMeshFromGltf(path, vertices, clusters, meshletVertices, meshletTriangles))
         return false;
 
-    out = uploadClusteredMesh(device, queue, vertices, clusters, meshletVertices, meshletTriangles);
+    float summand[3], factor[3], inv_range[3];
+    computeBounds(vertices, summand, factor, inv_range);
 
-    printf("loadGltfMeshToGPU: %s — vertices: %u  clusters: %u  meshletVerts: %u  meshletTris(bytes): %u\n",
-        path.c_str(), out.vertexCount, out.clusterCount, out.meshletVertexCount, out.meshletTriangleByteCount);
+    std::vector<MeshVertex> encodedVerts(vertices.size());
+    for (size_t i = 0; i < vertices.size(); i++)
+        encodedVerts[i] = encodeMeshVertex(vertices[i], summand, inv_range);
+
+    out = uploadClusteredMesh(device, queue, encodedVerts, clusters, meshletVertices, meshletTriangles);
+    std::copy(summand, summand + 3, out.dequant_summand);
+    std::copy(factor,  factor  + 3, out.dequant_factor);
+
+    printf("loadGltfMeshToGPU: %s — vertices: %u  clusters: %u  meshletTris(bytes): %u\n",
+        path.c_str(), out.vertexCount, out.clusterCount, out.meshletTriangleByteCount);
     return true;
 }
 
 void buildNanite(
-    const std::vector<MeshVertex>& vertices,
-    const std::vector<uint32_t>&   indices,
-    std::vector<ClusterN>&         outClusters,
-    std::vector<uint32_t>&         outMeshletVertices,
-    std::vector<uint8_t>&          outMeshletTriangles)
+    const std::vector<MeshVertexRaw>& vertices,
+    const std::vector<uint32_t>&      indices,
+    std::vector<ClusterN>&            outClusters,
+    std::vector<uint32_t>&            outMeshletVertices,
+    std::vector<uint8_t>&             outMeshletTriangles)
 {
     clodConfig config = clodDefaultConfig(126);
     config.max_vertices = 64;
 
     const float attributeWeights[3] = {0.5f, 0.5f, 0.5f};
 
-    // clusterlod consumes attributes as raw floats, but MeshVertex stores normals
-    // oct-encoded. Decode into a parallel float buffer just for the build.
-    std::vector<float> decodedNormals(vertices.size() * 3);
-    for (size_t i = 0; i < vertices.size(); i++)
-    {
-        int8_t ox = (int8_t)(vertices[i].normal       & 0xFFu);
-        int8_t oy = (int8_t)((vertices[i].normal >> 8) & 0xFFu);
-        octDecodeDir(ox, oy, &decodedNormals[i * 3]);
-    }
-
     clodMesh mesh{};
     mesh.indices                  = indices.data();
     mesh.index_count              = indices.size();
     mesh.vertex_count             = vertices.size();
-    mesh.vertex_positions         = &vertices[0].x;
-    mesh.vertex_positions_stride  = sizeof(MeshVertex);
-    mesh.vertex_attributes        = decodedNormals.data();
-    mesh.vertex_attributes_stride = sizeof(float) * 3;
+    mesh.vertex_positions         = &vertices[0].pos[0];
+    mesh.vertex_positions_stride  = sizeof(MeshVertexRaw);
+    mesh.vertex_attributes        = &vertices[0].normal[0];
+    mesh.vertex_attributes_stride = sizeof(MeshVertexRaw);
     mesh.attribute_weights        = attributeWeights;
     mesh.attribute_count          = 3;
     mesh.attribute_protect_mask   = (1 << 3) | (1 << 4);
 
     size_t reservedClusters = ((indices.size() / 3) + 127) / 128 * 3;
-    outClusters.reserve(reservedClusters);
+    outClusters.reserve(outClusters.size() + reservedClusters);
 
     std::vector<clodBounds> groups;
     groups.reserve((reservedClusters + 15) / 16);
@@ -374,35 +440,32 @@ void buildNanite(
             std::vector<uint32_t> localVerts(cluster.vertex_count);
             std::vector<uint8_t>  meshletTris(cluster.index_count);
 
-            size_t actualVertCount = clodLocalIndices(localVerts.data(), meshletTris.data(), cluster.indices, cluster.index_count);
-
+            size_t actualVertCount = clodLocalIndices(localVerts.data(), meshletTris.data(),
+                                                      cluster.indices, cluster.index_count);
             localVerts.resize(actualVertCount);
 
             ClusterN c{};
-            c.refined = cluster.refined;
+            c.refined      = cluster.refined;
+            c.groupCenterX = group.simplified.center[0];
+            c.groupCenterY = group.simplified.center[1];
+            c.groupCenterZ = group.simplified.center[2];
+            c.groupRadius  = group.simplified.radius;
+            c.groupError   = group.simplified.error;
 
-            c.groupCenter[0] = group.simplified.center[0];
-            c.groupCenter[1] = group.simplified.center[1];
-            c.groupCenter[2] = group.simplified.center[2];
-            c.groupRadius    = group.simplified.radius;
-            c.groupError     = group.simplified.error;
-
-            // if cluster is not refined: skip
             if (cluster.refined >= 0 && cluster.refined < (int)groups.size())
             {
                 const clodBounds& ref = groups[cluster.refined];
-                c.refinedCenter[0] = ref.center[0];
-                c.refinedCenter[1] = ref.center[1];
-                c.refinedCenter[2] = ref.center[2];
-                c.refinedRadius    = ref.radius;
-                c.refinedError     = ref.error;
+                c.refinedCenterX = ref.center[0];
+                c.refinedCenterY = ref.center[1];
+                c.refinedCenterZ = ref.center[2];
+                c.refinedRadius  = ref.radius;
+                c.refinedError   = ref.error;
             }
 
             c.meshletVertexOffset   = (uint32_t)outMeshletVertices.size();
             c.meshletTriangleOffset = (uint32_t)outMeshletTriangles.size();
-
-            c.vertexCount = (uint8_t)actualVertCount;
-            c.triangleCount = (uint8_t)(cluster.index_count / 3);
+            c.vertexCount           = (uint8_t)actualVertCount;
+            c.triangleCount         = (uint8_t)(cluster.index_count / 3);
 
             outClusters.push_back(c);
             outMeshletVertices.insert(outMeshletVertices.end(), localVerts.begin(), localVerts.end());
@@ -415,7 +478,7 @@ void buildNanite(
 
 static bool loadPrimitive(
     const cgltf_primitive* primitive,
-    std::vector<MeshVertex>& vertices,
+    std::vector<MeshVertexRaw>& vertices,
     std::vector<uint32_t>& indices)
 {
     if (primitive->type != cgltf_primitive_type_triangles ||
@@ -427,16 +490,16 @@ static bool loadPrimitive(
     if (!pos)
         return false;
 
-    vertices.resize(pos->count);
+    vertices.assign(pos->count, MeshVertexRaw{});
 
     std::vector<float> scratch(pos->count * 4);
 
     cgltf_accessor_unpack_floats(pos, scratch.data(), pos->count * 3);
     for (size_t i = 0; i < pos->count; i++)
     {
-        vertices[i].x = scratch[i * 3 + 0];
-        vertices[i].y = scratch[i * 3 + 1];
-        vertices[i].z = scratch[i * 3 + 2];
+        vertices[i].pos[0] = scratch[i * 3 + 0];
+        vertices[i].pos[1] = scratch[i * 3 + 1];
+        vertices[i].pos[2] = scratch[i * 3 + 2];
     }
 
     if (auto n = cgltf_find_accessor(primitive, cgltf_attribute_type_normal, 0))
@@ -444,17 +507,20 @@ static bool loadPrimitive(
         cgltf_accessor_unpack_floats(n, scratch.data(), n->count * 3);
         for (size_t i = 0; i < pos->count; i++)
         {
-            vertices[i].normal = packOctNormal(
-                scratch[i * 3 + 0],
-                scratch[i * 3 + 1],
-                scratch[i * 3 + 2]);
+            vertices[i].normal[0] = scratch[i * 3 + 0];
+            vertices[i].normal[1] = scratch[i * 3 + 1];
+            vertices[i].normal[2] = scratch[i * 3 + 2];
         }
     }
     else
     {
         // Default to +Z when normals are absent.
         for (size_t i = 0; i < pos->count; i++)
-            vertices[i].normal = packOctNormal(0.0f, 0.0f, 1.0f);
+        {
+            vertices[i].normal[0] = 0.0f;
+            vertices[i].normal[1] = 0.0f;
+            vertices[i].normal[2] = 1.0f;
+        }
     }
 
     if (auto uv = cgltf_find_accessor(primitive, cgltf_attribute_type_texcoord, 0))
@@ -462,9 +528,8 @@ static bool loadPrimitive(
         cgltf_accessor_unpack_floats(uv, scratch.data(), uv->count * 2);
         for (size_t i = 0; i < pos->count; i++)
         {
-            uint16_t hu = meshopt_quantizeHalf(scratch[i * 2 + 0]);
-            uint16_t hv = meshopt_quantizeHalf(scratch[i * 2 + 1]);
-            vertices[i].uv = (uint32_t(hv) << 16) | uint32_t(hu);
+            vertices[i].uv[0] = scratch[i * 2 + 0];
+            vertices[i].uv[1] = scratch[i * 2 + 1];
         }
     }
 
@@ -475,12 +540,12 @@ static bool loadPrimitive(
     std::vector<uint32_t> remap(pos->count);
     size_t uniqueVertices = meshopt_generateVertexRemap(
         remap.data(), indices.data(), indexCount,
-        vertices.data(), vertices.size(), sizeof(MeshVertex));
+        vertices.data(), vertices.size(), sizeof(MeshVertexRaw));
 
-    meshopt_remapVertexBuffer(vertices.data(), vertices.data(), vertices.size(), sizeof(MeshVertex), remap.data());
+    meshopt_remapVertexBuffer(vertices.data(), vertices.data(), vertices.size(), sizeof(MeshVertexRaw), remap.data());
     meshopt_remapIndexBuffer(indices.data(), indices.data(), indexCount, remap.data());
     meshopt_optimizeVertexCache(indices.data(), indices.data(), indexCount, uniqueVertices);
-    meshopt_optimizeVertexFetch(vertices.data(), indices.data(), indexCount, vertices.data(), uniqueVertices, sizeof(MeshVertex));
+    meshopt_optimizeVertexFetch(vertices.data(), indices.data(), indexCount, vertices.data(), uniqueVertices, sizeof(MeshVertexRaw));
 
     vertices.resize(uniqueVertices);
     return true;

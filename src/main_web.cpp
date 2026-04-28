@@ -165,8 +165,9 @@ int main() {
 
     int cw, ch;
     emscripten_get_canvas_element_size("#canvas", &cw, &ch);
-    if (cw > 0 && ch > 0)
+    if (cw > 0 && ch > 0) { //TODO: what happens if this is 0?
         renderer_set_initial_size((uint32_t)cw, (uint32_t)ch);
+    }
 
     wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvas{};
     canvas.selector = "#canvas";
@@ -179,12 +180,12 @@ int main() {
     emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW,   nullptr, true, on_keyup);
     emscripten_set_mousemove_callback("#canvas", nullptr, true, on_mousemove);
     emscripten_set_mousedown_callback("#canvas", nullptr, true, on_mousedown);
-    emscripten_set_mouseup_callback(  "#canvas", nullptr, true, on_mouseup);
-    emscripten_set_wheel_callback(    "#canvas", nullptr, true, on_wheel);
+    emscripten_set_mouseup_callback( "#canvas", nullptr, true, on_mouseup);
+    emscripten_set_wheel_callback( "#canvas", nullptr, true, on_wheel);
     emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, on_resize);
     emscripten_set_touchstart_callback( "#canvas", nullptr, true, on_touchstart);
-    emscripten_set_touchmove_callback(  "#canvas", nullptr, true, on_touchmove);
-    emscripten_set_touchend_callback(   "#canvas", nullptr, true, on_touchend);
+    emscripten_set_touchmove_callback( "#canvas", nullptr, true, on_touchmove);
+    emscripten_set_touchend_callback( "#canvas", nullptr, true, on_touchend);
     emscripten_set_touchcancel_callback("#canvas", nullptr, true, on_touchend);
 
     // Expose window.setJoystick and window.setMoveJoystick that write directly into

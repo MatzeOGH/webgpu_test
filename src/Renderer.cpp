@@ -11,6 +11,8 @@
 #include <vector>
 
 // ---- Math ------------------------------------------------------------------
+// right-handed column major
+//
 
 using Mat4 = std::array<float, 16>;  // column-major
 
@@ -22,7 +24,6 @@ static Vec3  v3_norm (Vec3 a)          { float inv = 1.f/std::sqrt(v3_dot(a,a));
 static Vec3  v3_add  (Vec3 a, Vec3 b)  { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
 static Vec3  v3_scale(Vec3 a, float s) { return {a.x*s, a.y*s, a.z*s}; }
 
-// right-handed look-at, column-major
 static Mat4 mat4_look_at(Vec3 eye, Vec3 fwd, Vec3 world_up) {
     Vec3 r = v3_norm(v3_cross(fwd, world_up));
     Vec3 u = v3_cross(r, fwd);
@@ -34,11 +35,10 @@ static Mat4 mat4_look_at(Vec3 eye, Vec3 fwd, Vec3 world_up) {
     return m;
 }
 
-// depth [0..1], right-handed, column-major
 static Mat4 mat4_perspective(float fov_y, float aspect, float near_z, float far_z) {
     float f = 1.f / std::tan(fov_y * .5f);
     float d = near_z - far_z;
-    Mat4 m{};
+    Mat4 m{}; // zero init
     m[0]=f/aspect; m[5]=f;
     m[10]=far_z/d; m[11]=-1.f;
     m[14]=(near_z*far_z)/d;
@@ -47,18 +47,22 @@ static Mat4 mat4_perspective(float fov_y, float aspect, float near_z, float far_
 
 // ---- Uniform structs -------------------------------------------------------
 
-// Must match the CameraUniforms WGSL struct exactly (160 bytes total)
+// Must match the CameraUniforms WGSL struct exactly (192 bytes total)
 struct CameraUniforms {
-    float view[16];           // 64 bytes
-    float proj[16];           // 64 bytes
-    float cameraPos[3];       // 12 bytes
-    float _pad0       = 0.f;  //  4 bytes
-    float clusterThreshold;   //  4 bytes
-    float cameraProj;         //  4 bytes (proj[1][1] = 1/tan(fov/2))
-    float znear;              //  4 bytes
-    float _pad1       = 0.f;  //  4 bytes
+    float view[16];              // 64 bytes
+    float proj[16];              // 64 bytes
+    float cameraPos[3];          // 12 bytes
+    float _pad0       = 0.f;     //  4 bytes
+    float clusterThreshold;      //  4 bytes
+    float cameraProj;            //  4 bytes (proj[1][1] = 1/tan(fov/2))
+    float znear;                 //  4 bytes
+    float _pad1       = 0.f;     //  4 bytes
+    float dequant_factor[3];     // 12 bytes — (max-min)/(2^21-1) per axis
+    float _pad2       = 0.f;     //  4 bytes
+    float dequant_summand[3];    // 12 bytes — bounding box min per axis
+    float _pad3       = 0.f;     //  4 bytes
 };
-static_assert(sizeof(CameraUniforms) == 160);
+static_assert(sizeof(CameraUniforms) == 192);
 
 struct DrawIndexedIndirectParams {
     uint32_t indexCount;
@@ -223,6 +227,8 @@ static constexpr WGPUTextureFormat kDepthFormat      = WGPUTextureFormat_Depth32
 static Vec3  gCamPos   = {0.f, 0.f, 3.f};
 static float gCamYaw   = 0.f;
 static float gCamPitch = 0.f;
+static float gDequantFactor[3]  = {1.f, 1.f, 1.f};
+static float gDequantSummand[3] = {0.f, 0.f, 0.f};
 static auto  gLastTime = std::chrono::steady_clock::now();
 
 // ---- Surface/depth helpers -------------------------------------------------
@@ -405,34 +411,46 @@ static void initClusteredRenderPipeline(const ClusteredMeshGPU& mesh)
 
     const char clusteredShaderCode[] = R"(
 struct CameraUniforms {
-    view : mat4x4<f32>,
-    proj : mat4x4<f32>,
+    view             : mat4x4<f32>,
+    proj             : mat4x4<f32>,
+    cameraPos        : vec3<f32>,
+    _pad0            : f32,
+    clusterThreshold : f32,
+    cameraProj       : f32,
+    znear            : f32,
+    _pad1            : f32,
+    dequant_factor   : vec3<f32>,
+    _pad2            : f32,
+    dequant_summand  : vec3<f32>,
+    _pad3            : f32,
 }
 
 struct ClusterN {
     refined              : i32,
-    groupCenterX         : f32,
-    groupCenterY         : f32,
-    groupCenterZ         : f32,
-    groupRadius          : f32,
-    groupError           : f32,
-    refinedCenterX       : f32,
-    refinedCenterY       : f32,
-    refinedCenterZ       : f32,
-    refinedRadius        : f32,
-    refinedError         : f32,
-    meshletVertexOffset  : u32,
-    meshletTriangleOffset: u32,
+    groupCenterX         : f32, groupCenterY         : f32, groupCenterZ  : f32,
+    groupRadius          : f32, groupError            : f32,
+    refinedCenterX       : f32, refinedCenterY        : f32, refinedCenterZ: f32,
+    refinedRadius        : f32, refinedError          : f32,
+    meshletVertexOffset  : u32, meshletTriangleOffset : u32,
     packedCounts         : u32,
 }
 
-// must match MeshVertex in C++ (3 x f32 + 2 x u32 = 20 bytes)
-//   normal: oct-encoded (low byte = ox i8, next byte = oy i8)
+// must match MeshVertex in C++ (2 x u32 pos + u32 uv + u16 normal + 2 pad = 16 bytes)
+//   pos   : 21 bits per axis; x[0..20]|y[0..10] in pos0, y[11..20]|z[0..20] in pos1
 //   uv    : packed half2 (unpack with unpack2x16float)
+//   normal: oct-encoded (byte 0 = ox i8, byte 1 = oy i8); read as u32, low 16 bits used
 struct MeshVertex {
-    x:  f32, y:  f32, z:  f32,
+    pos0:   u32,
+    pos1:   u32,
+    uv:     u32,
     normal: u32,
-    uv: u32,
+}
+
+fn decode_position(v: MeshVertex) -> vec3<f32> {
+    let x = v.pos0 & 0x1FFFFFu;
+    let y = ((v.pos0 >> 21u) & 0x7FFu) | ((v.pos1 & 0x3FFu) << 11u);
+    let z = (v.pos1 >> 10u) & 0x1FFFFFu;
+    return vec3<f32>(f32(x), f32(y), f32(z)) * camera.dequant_factor + camera.dequant_summand;
 }
 
 fn octDecodeNormal(packed: u32) -> vec3<f32> {
@@ -452,10 +470,10 @@ fn octDecodeNormal(packed: u32) -> vec3<f32> {
     return normalize(vec3<f32>(nx, ny, nz));
 }
 
-@group(0) @binding(0) var<uniform>        camera        : CameraUniforms;
-@group(0) @binding(1) var<storage, read>  clusters      : array<ClusterN>;
-@group(0) @binding(2) var<storage, read>  meshlet_verts : array<u32>;
-@group(0) @binding(3) var<storage, read>  vertices      : array<MeshVertex>;
+@group(0) @binding(0) var<uniform>       camera          : CameraUniforms;
+@group(0) @binding(1) var<storage, read> clusters        : array<ClusterN>;
+@group(0) @binding(2) var<storage, read> vertices        : array<MeshVertex>;
+@group(0) @binding(3) var<storage, read> meshlet_vertices: array<u32>;
 
 struct VertexOut {
     @builtin(position) pos   : vec4<f32>,
@@ -492,12 +510,12 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     let cluster_id  = packed >> 8u;
     let local_idx   = packed & 0xFFu;
     let cluster     = clusters[cluster_id];
-    let global_vtx  = meshlet_verts[cluster.meshletVertexOffset + local_idx];
-    let v           = vertices[global_vtx];
+    let global_vi   = meshlet_vertices[cluster.meshletVertexOffset + local_idx];
+    let v           = vertices[global_vi];
     var out: VertexOut;
-    out.pos    = camera.proj * camera.view * vec4<f32>(v.x, v.y, v.z, 1.0);
-    //out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
-    out.color  = intToColor(cluster_id);
+    out.pos    = camera.proj * camera.view * vec4<f32>(decode_position(v), 1.0);
+    out.color  = intToColor(cluster.meshletVertexOffset + local_idx);
+    //out.color  = intToColor(cluster_id);
     out.normal = octDecodeNormal(v.normal);
     return out;
 }
@@ -563,10 +581,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     wgpuPipelineLayoutRelease(layout);
 
     WGPUBindGroupEntry bgEntries[4] = {
-        { .binding = 0, .buffer = viewUniforms,             .offset = 0, .size = sizeof(CameraUniforms) },
-        { .binding = 1, .buffer = mesh.clusterBuffer,       .offset = 0, .size = (uint64_t)mesh.clusterCount      * sizeof(ClusterN)   },
-        { .binding = 2, .buffer = mesh.meshletVertexBuffer, .offset = 0, .size = (uint64_t)mesh.meshletVertexCount * sizeof(uint32_t)   },
-        { .binding = 3, .buffer = mesh.vertexBuffer,        .offset = 0, .size = (uint64_t)mesh.vertexCount        * sizeof(MeshVertex) },
+        { .binding = 0, .buffer = viewUniforms,              .offset = 0, .size = sizeof(CameraUniforms) },
+        { .binding = 1, .buffer = mesh.clusterBuffer,        .offset = 0, .size = (uint64_t)mesh.clusterCount      * sizeof(ClusterN)   },
+        { .binding = 2, .buffer = mesh.vertexBuffer,         .offset = 0, .size = (uint64_t)mesh.vertexCount       * sizeof(MeshVertex)  },
+        { .binding = 3, .buffer = mesh.meshletVertexBuffer,  .offset = 0, .size = (uint64_t)mesh.meshletVertexCount * sizeof(uint32_t)   },
     };
     WGPUBindGroupDescriptor bgDesc{ .layout = gClusteredBGL, .entryCount = 4, .entries = bgEntries };
     gClusteredBG = wgpuDeviceCreateBindGroup(gDevice, &bgDesc);
@@ -580,6 +598,8 @@ static void loadMeshForRendering(const char* path)
         fprintf(stderr, "loadMeshForRendering: failed to load %s — falling back to triangle\n", path);
         return;
     }
+    std::copy(sMesh.dequant_factor,  sMesh.dequant_factor  + 3, gDequantFactor);
+    std::copy(sMesh.dequant_summand, sMesh.dequant_summand + 3, gDequantSummand);
     initClusterCullPass(sMesh);
     initClusterExpandPass(sMesh);
     initClusteredRenderPipeline(sMesh);
@@ -717,14 +737,18 @@ struct CameraUniforms {
     cameraProj       : f32,
     znear            : f32,
     _pad1            : f32,
+    dequant_factor   : vec3<f32>,
+    _pad2            : f32,
+    dequant_summand  : vec3<f32>,
+    _pad3            : f32,
 }
 struct ClusterN {
     refined              : i32,
-    groupCenterX         : f32, groupCenterY  : f32, groupCenterZ  : f32,
-    groupRadius          : f32, groupError    : f32,
-    refinedCenterX       : f32, refinedCenterY: f32, refinedCenterZ: f32,
-    refinedRadius        : f32, refinedError  : f32,
-    meshletVertexOffset  : u32, meshletTriangleOffset: u32,
+    groupCenterX         : f32, groupCenterY         : f32, groupCenterZ  : f32,
+    groupRadius          : f32, groupError            : f32,
+    refinedCenterX       : f32, refinedCenterY        : f32, refinedCenterZ: f32,
+    refinedRadius        : f32, refinedError          : f32,
+    meshletVertexOffset  : u32, meshletTriangleOffset : u32,
     packedCounts         : u32,
 }
 struct VisibleClusters { count : atomic<u32>, ids : array<u32>, }
@@ -790,11 +814,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const char expandShader[] = R"(
 struct ClusterN {
     refined              : i32,
-    groupCenterX         : f32, groupCenterY  : f32, groupCenterZ  : f32,
-    groupRadius          : f32, groupError    : f32,
-    refinedCenterX       : f32, refinedCenterY: f32, refinedCenterZ: f32,
-    refinedRadius        : f32, refinedError  : f32,
-    meshletVertexOffset  : u32, meshletTriangleOffset: u32,
+    groupCenterX         : f32, groupCenterY         : f32, groupCenterZ  : f32,
+    groupRadius          : f32, groupError            : f32,
+    refinedCenterX       : f32, refinedCenterY        : f32, refinedCenterZ: f32,
+    refinedRadius        : f32, refinedError          : f32,
+    meshletVertexOffset  : u32, meshletTriangleOffset : u32,
     packedCounts         : u32,
 }
 struct VisibleClusters { count : u32, ids : array<u32>, }
@@ -1107,9 +1131,11 @@ void renderer_frame()
         cu.cameraPos[0]      = gCamPos.x;
         cu.cameraPos[1]      = gCamPos.y;
         cu.cameraPos[2]      = gCamPos.z;
-        cu.clusterThreshold  = 0.002f;
+        cu.clusterThreshold  = 0.02f;
         cu.cameraProj        = proj[5]; // 1/tan(fov/2)
         cu.znear             = 0.01f;
+        std::copy(gDequantFactor,  gDequantFactor  + 3, cu.dequant_factor);
+        std::copy(gDequantSummand, gDequantSummand + 3, cu.dequant_summand);
         wgpuQueueWriteBuffer(gQueue, viewUniforms, 0, &cu, sizeof(cu));
     }
 
