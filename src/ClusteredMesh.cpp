@@ -265,15 +265,18 @@ bool buildClusteredMeshFromGltf(
 }
 
 static constexpr uint32_t kClusteredMeshMagic   = 0x494E414E; // 'NANI'
-static constexpr uint32_t kClusteredMeshVersion = 7;
+static constexpr uint32_t kClusteredMeshVersion = 10;
 
 struct ClusteredMeshFileHeader {
     uint32_t magic;
     uint32_t version;
-    uint32_t vertexCount;           // unique global vertices
+    uint32_t vertexCount;                  // unique global vertices
     uint32_t clusterCount;
-    uint32_t meshletVertexCount;    // uint32_t entries in meshlet vertex index buffer
+    uint32_t meshletVertexCount;           // uint32_t entries in meshlet vertex index buffer
     uint32_t meshletTriangleByteCount;
+    uint32_t encodedVertexByteCount;       // compressed vertex blob size
+    uint32_t encodedClusterByteCount;      // compressed ClusterN blob size
+    uint32_t encodedMeshletTotalBytes;     // total bytes of all per-cluster encoded meshlet blobs
     float    dequant_summand[3];
     float    dequant_factor[3];
 };
@@ -310,12 +313,43 @@ bool saveClusteredMesh(
     for (size_t i = 0; i < vertices.size(); i++)
         encodedVerts[i] = encodeMeshVertex(vertices[i], summand, inv_range);
 
+    size_t bound = meshopt_encodeVertexBufferBound(encodedVerts.size(), sizeof(MeshVertex));
+    std::vector<uint8_t> compressed(bound);
+    size_t compressedSize = meshopt_encodeVertexBuffer(
+        compressed.data(), compressed.size(),
+        encodedVerts.data(), encodedVerts.size(), sizeof(MeshVertex));
+    hdr.encodedVertexByteCount = (uint32_t)compressedSize;
+
+    size_t clusterBound = meshopt_encodeVertexBufferBound(clusters.size(), sizeof(ClusterN));
+    std::vector<uint8_t> compressedClusters(clusterBound);
+    size_t compressedClusterSize = meshopt_encodeVertexBuffer(
+        compressedClusters.data(), compressedClusters.size(),
+        clusters.data(), clusters.size(), sizeof(ClusterN));
+    hdr.encodedClusterByteCount = (uint32_t)compressedClusterSize;
+
+    std::vector<uint32_t> meshletEncodedSizes(clusters.size());
+    std::vector<uint8_t>  meshletBlob;
+    {
+        size_t maxBound = meshopt_encodeMeshletBound(64, 126);
+        std::vector<uint8_t> tmp(maxBound);
+        for (size_t ci = 0; ci < clusters.size(); ci++) {
+            const ClusterN& c = clusters[ci];
+            size_t n = meshopt_encodeMeshlet(
+                tmp.data(), tmp.size(),
+                &meshletVertices[c.meshletVertexOffset], c.vertexCount,
+                &meshletTriangles[c.meshletTriangleOffset], c.triangleCount);
+            meshletEncodedSizes[ci] = (uint32_t)n;
+            meshletBlob.insert(meshletBlob.end(), tmp.begin(), tmp.begin() + n);
+        }
+    }
+    hdr.encodedMeshletTotalBytes = (uint32_t)meshletBlob.size();
+
     bool ok =
-        fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
-        fwrite(encodedVerts.data(),    sizeof(MeshVertex), encodedVerts.size(),      f) == encodedVerts.size() &&
-        fwrite(clusters.data(),        sizeof(ClusterN),   clusters.size(),          f) == clusters.size() &&
-        fwrite(meshletVertices.data(), sizeof(uint32_t),   meshletVertices.size(),   f) == meshletVertices.size() &&
-        fwrite(meshletTriangles.data(),sizeof(uint8_t),    meshletTriangles.size(),  f) == meshletTriangles.size();
+        fwrite(&hdr,                        sizeof(hdr),      1,                             f) == 1 &&
+        fwrite(compressed.data(),           1,                compressedSize,                f) == compressedSize &&
+        fwrite(compressedClusters.data(),   1,                compressedClusterSize,         f) == compressedClusterSize &&
+        fwrite(meshletEncodedSizes.data(),  sizeof(uint32_t), meshletEncodedSizes.size(),    f) == meshletEncodedSizes.size() &&
+        fwrite(meshletBlob.data(),          1,                meshletBlob.size(),            f) == meshletBlob.size();
 
     fclose(f);
     if (!ok)
@@ -344,21 +378,59 @@ bool loadClusteredMeshFromFile(
         return false;
     }
 
+    std::vector<uint8_t>    compressed(hdr.encodedVertexByteCount);
     std::vector<MeshVertex> vertices(hdr.vertexCount);
+    std::vector<uint8_t>    compressedClusters(hdr.encodedClusterByteCount);
     std::vector<ClusterN>   clusters(hdr.clusterCount);
-    std::vector<uint32_t>   meshletVertices(hdr.meshletVertexCount);
-    std::vector<uint8_t>    meshletTriangles(hdr.meshletTriangleByteCount);
+    std::vector<uint32_t>   meshletEncodedSizes(hdr.clusterCount);
+    std::vector<uint8_t>    meshletBlob(hdr.encodedMeshletTotalBytes);
 
     bool ok =
-        fread(vertices.data(),        sizeof(MeshVertex), hdr.vertexCount,              f) == hdr.vertexCount &&
-        fread(clusters.data(),        sizeof(ClusterN),   hdr.clusterCount,             f) == hdr.clusterCount &&
-        fread(meshletVertices.data(), sizeof(uint32_t),   hdr.meshletVertexCount,       f) == hdr.meshletVertexCount &&
-        fread(meshletTriangles.data(),sizeof(uint8_t),    hdr.meshletTriangleByteCount, f) == hdr.meshletTriangleByteCount;
+        fread(compressed.data(),          1,                hdr.encodedVertexByteCount,    f) == hdr.encodedVertexByteCount &&
+        fread(compressedClusters.data(),  1,                hdr.encodedClusterByteCount,   f) == hdr.encodedClusterByteCount &&
+        fread(meshletEncodedSizes.data(), sizeof(uint32_t), hdr.clusterCount,              f) == hdr.clusterCount &&
+        fread(meshletBlob.data(),         1,                hdr.encodedMeshletTotalBytes,  f) == hdr.encodedMeshletTotalBytes;
 
     fclose(f);
     if (!ok) {
         fprintf(stderr, "loadClusteredMeshFromFile: read error on %s\n", path.c_str());
         return false;
+    }
+
+    if (meshopt_decodeVertexBuffer(vertices.data(), hdr.vertexCount, sizeof(MeshVertex),
+                                   compressed.data(), hdr.encodedVertexByteCount) != 0)
+    {
+        fprintf(stderr, "loadClusteredMeshFromFile: vertex decode failed on %s\n", path.c_str());
+        return false;
+    }
+
+    if (meshopt_decodeVertexBuffer(clusters.data(), hdr.clusterCount, sizeof(ClusterN),
+                                   compressedClusters.data(), hdr.encodedClusterByteCount) != 0)
+    {
+        fprintf(stderr, "loadClusteredMeshFromFile: cluster decode failed on %s\n", path.c_str());
+        return false;
+    }
+
+    std::vector<uint32_t> meshletVertices(hdr.meshletVertexCount);
+    std::vector<uint8_t>  meshletTriangles(hdr.meshletTriangleByteCount);
+    {
+        uint32_t vertOff = 0, triOff = 0, blobOff = 0;
+        for (size_t ci = 0; ci < clusters.size(); ci++) {
+            ClusterN& c = clusters[ci];
+            int rc = meshopt_decodeMeshlet(
+                &meshletVertices[vertOff],   c.vertexCount,   sizeof(uint32_t),
+                &meshletTriangles[triOff],   c.triangleCount, 3,
+                &meshletBlob[blobOff], meshletEncodedSizes[ci]);
+            if (rc != 0) {
+                fprintf(stderr, "loadClusteredMeshFromFile: meshlet decode failed at cluster %zu in %s\n", ci, path.c_str());
+                return false;
+            }
+            c.meshletVertexOffset   = vertOff;
+            c.meshletTriangleOffset = triOff;
+            vertOff  += c.vertexCount;
+            triOff   += (uint32_t)c.triangleCount * 3;
+            blobOff  += meshletEncodedSizes[ci];
+        }
     }
 
     out = uploadClusteredMesh(device, queue, vertices, clusters, meshletVertices, meshletTriangles);
