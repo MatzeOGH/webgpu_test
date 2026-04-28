@@ -109,10 +109,44 @@
                 left: 50%;
                 transform: translate(-50%, -50%);
             }
+
+            #loading-screen {
+                position: fixed;
+                inset: 0;
+                background: #000;
+                color: #fff;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                z-index: 999;
+                font-family: sans-serif;
+            }
+
+            #loading-bar {
+                width: 200px;
+                height: 10px;
+                border: 1px solid rgba(255, 255, 255, 0.4);
+                margin-top: 10px;
+            }
+
+            #loading-progress {
+                height: 100%;
+                width: 0%;
+                background: white;
+            }
         </style>
     </head>
     <body>
         <canvas id="canvas"></canvas>
+
+        <!-- Loading widget -->
+        <div id="loading-screen">
+            <div id="loading-text">Loading…</div>
+            <div id="loading-bar">
+                <div id="loading-progress"></div>
+            </div>
+        </div>
 
         <!-- Thumbstick (bottom-right) -->
         <div id="joystick-base">
@@ -125,7 +159,13 @@
         </div>
 
         <!-- Fullscreen toggle (mobile only, top-right) -->
-        <button id="fullscreen-btn" type="button" aria-label="Toggle fullscreen">⛶</button>
+        <button
+            id="fullscreen-btn"
+            type="button"
+            aria-label="Toggle fullscreen"
+        >
+            ⛶
+        </button>
 
         <script>
             // Canvas resize
@@ -392,15 +432,62 @@
                 document.addEventListener("msfullscreenchange", syncIcon);
             })();
 
+            var lastProgress = 0;
+
             // prevent main from stating too early on mobile devices
             var Module = {
-                // Ensure correct file loading (important on GitHub Pages + mobile)
                 locateFile: function (path) {
                     return new URL(path, window.location.href).toString();
                 },
 
-                // Prevent main() from running too early
+                setStatus: function (text) {
+                    var el = document.getElementById("loading-text");
+                    var bar = document.getElementById("loading-progress");
+
+                    if (!text) return;
+
+                    var percentText = text;
+
+                    // Extract (loaded/total)
+                    var match = text.match(/\((\d+)\/(\d+)\)/);
+                    if (match) {
+                        var loaded = parseInt(match[1], 10);
+                        var total = parseInt(match[2], 10);
+
+                        if (total > 0) {
+                            var progress = loaded / total;
+
+                            // prevent going backwards
+                            progress = Math.max(progress, lastProgress);
+                            lastProgress = progress;
+
+                            var percent = Math.round(progress * 100);
+
+                            // Update bar
+                            if (bar) bar.style.width = percent + "%";
+
+                            // Replace text with clean percentage
+                            percentText = "Loading " + percent + "%";
+                        }
+                    }
+
+                    if (el) el.textContent = percentText;
+                },
+
+                monitorRunDependencies: function (left) {
+                    Module.totalDependencies = Math.max(
+                        Module.totalDependencies || 0,
+                        left,
+                    );
+                },
+
                 onRuntimeInitialized: function () {
+                    var screen = document.getElementById("loading-screen");
+                    if (screen) {
+                        screen.style.opacity = "0";
+                        setTimeout(() => screen.remove(), 300);
+                    }
+
                     Module._main();
                 },
             };
