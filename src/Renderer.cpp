@@ -839,8 +839,8 @@ struct DrawArgs {
 var<workgroup> ws_base    : u32;
 var<workgroup> ws_cluster : ClusterN;
 
-fn read_u8(buf: ptr<storage, array<u32>, read>, byte_offset: u32) -> u32 {
-    let word  = (*buf)[byte_offset / 4u];
+fn read_u8(byte_offset: u32) -> u32 {
+    let word = meshlet_tris[byte_offset / 4u];
     let shift = (byte_offset % 4u) * 8u;
     return (word >> shift) & 0xFFu;
 }
@@ -862,9 +862,9 @@ fn cs_main(
     let tri_count = (ws_cluster.packedCounts >> 8u) & 0xFFu;
     if (tri_idx >= tri_count) { return; }
     let tri_byte = ws_cluster.meshletTriangleOffset + tri_idx * 3u;
-    let i0 = read_u8(&meshlet_tris, tri_byte + 0u);
-    let i1 = read_u8(&meshlet_tris, tri_byte + 1u);
-    let i2 = read_u8(&meshlet_tris, tri_byte + 2u);
+    let i0 = read_u8(tri_byte + 0u);
+    let i1 = read_u8(tri_byte + 1u);
+    let i2 = read_u8(tri_byte + 2u);
     let out_base = ws_base + tri_idx * 3u;
     out_indices[out_base + 0u] = (cluster_id << 8u) | i0;
     out_indices[out_base + 1u] = (cluster_id << 8u) | i1;
