@@ -469,6 +469,7 @@ bool loadGltfMeshToGPU(const std::string& path, WGPUDevice device, WGPUQueue que
     return true;
 }
 
+// Takes the raw vertex and index buffer and computes the clustered lod
 void buildNanite(
     const std::vector<MeshVertexRaw>& vertices,
     const std::vector<uint32_t>&      indices,
@@ -512,8 +513,7 @@ void buildNanite(
             std::vector<uint32_t> localVerts(cluster.vertex_count);
             std::vector<uint8_t>  meshletTris(cluster.index_count);
 
-            size_t actualVertCount = clodLocalIndices(localVerts.data(), meshletTris.data(),
-                                                      cluster.indices, cluster.index_count);
+            size_t actualVertCount = clodLocalIndices(localVerts.data(), meshletTris.data(), cluster.indices, cluster.index_count);
             localVerts.resize(actualVertCount);
 
             ClusterN c{};
@@ -546,6 +546,12 @@ void buildNanite(
 
         return groupIndex;
     });
+}
+
+// takes the group and
+void buildBvh()
+{
+
 }
 
 static bool loadPrimitive(

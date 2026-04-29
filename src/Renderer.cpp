@@ -484,9 +484,10 @@ fn read_u8(byte_offset: u32) -> u32 {
 }
 
 struct VertexOut {
-    @builtin(position) pos   : vec4<f32>,
-    @location(0)  @interpolate(flat)     color : vec3<f32>,
-    @location(1)       normal: vec3<f32>,
+    @builtin(position) pos : vec4<f32>,
+    @location(0) @interpolate(flat) color : vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>
 }
 
 // taken from unreal engine
@@ -534,6 +535,7 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
     out.pos    = camera.proj * camera.view * vec4<f32>(decode_position(v), 1.0);
     out.color  = intToColor(global_tri_id);
     out.normal = octDecodeNormal(v.normal);
+    out.uv = unpack2x16float(v.uv);
     return out;
 }
 
@@ -541,7 +543,48 @@ fn vs_main(@builtin(vertex_index) packed: u32) -> VertexOut {
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.4, 1.0, 0.6));
     let diffuse = max(dot(normalize(in.normal), light_dir), 0.08);
-    return vec4<f32>(in.color, 1.0);
+    //return vec4<f32>(in.uv, 0.0, 1.0);
+
+    let texture_resolution = 8192.0; // total VT size
+    let tile_size = 128.0;
+
+    // derive number of tiles at mip 0
+    let base_tiles = texture_resolution / tile_size;
+
+    // approximate mip from derivatives (screen-space)
+    let dx = dpdx(in.uv * texture_resolution);
+    let dy = dpdy(in.uv * texture_resolution);
+    let rho = max(dot(dx, dx), dot(dy, dy));
+    let mip = 0.5 * log2(rho);
+
+    // clamp mip to valid range
+    let mip_level = clamp(floor(mip), 0.0, log2(base_tiles));
+
+    // tiles at this mip
+    let tiles = base_tiles / pow(2.0, mip_level);
+
+    // build grid
+    let tiled_uv = in.uv * tiles;
+    let local = fract(tiled_uv);
+    let line_width = 0.01;
+
+    let line = step(local.x, line_width) +
+               step(local.y, line_width) +
+               step(1.0 - local.x, line_width) +
+               step(1.0 - local.y, line_width);
+
+    let grid = clamp(line, 0.0, 1.0);
+
+    // color per tile (helps visualize mip transitions)
+    let tile_id = floor(tiled_uv);
+    let tile_coord = vec2<u32>(tile_id);
+    let tiles_u = u32(tiles);
+    let tile_index = tile_coord.x + tile_coord.y * tiles_u;
+    let tile_color = intToColor(tile_index);
+
+    let color = mix(tile_color, vec3<f32>(1.0, 1.0, 1.0), grid);
+
+    return vec4<f32>(color, 1.0);
 }
     )";
 
