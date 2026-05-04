@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static void printStats(
@@ -90,8 +91,36 @@ static void printStats(
 
 int main(int argc, char* argv[])
 {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <input.gltf> <output.nanite>\n", argv[0]);
+    const char* inputPath  = nullptr;
+    const char* outputPath = nullptr;
+    const char* dotPath    = nullptr;
+
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--dot") == 0 && i + 1 < argc)
+        {
+            dotPath = argv[++i];
+        }
+        else if (!inputPath)
+        {
+            inputPath = argv[i];
+        }
+        else if (!outputPath)
+        {
+            outputPath = argv[i];
+        }
+        else
+        {
+            fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (!inputPath || !outputPath) {
+        fprintf(stderr,
+                "Usage: %s <input.gltf> <output.nanite> [--dot <bvh.dot>]\n"
+                "  --dot <path>  Write BVH as Graphviz dot. Use '-' for stdout.\n",
+                argv[0]);
         return 1;
     }
 
@@ -99,13 +128,38 @@ int main(int argc, char* argv[])
     std::vector<ClusterN>      clusters;
     std::vector<uint32_t>      meshletVertices;
     std::vector<uint8_t>       meshletTriangles;
+    std::vector<LodGroup>      groups;
 
     auto t0 = std::chrono::steady_clock::now();
-    if (!buildClusteredMeshFromGltf(argv[1], vertices, clusters, meshletVertices, meshletTriangles))
+    if (!buildClusteredMeshFromGltf(inputPath, vertices, clusters, meshletVertices, meshletTriangles, groups))
         return 1;
 
     auto t1 = std::chrono::steady_clock::now();
-    if (!saveClusteredMesh(argv[2], vertices, clusters, meshletVertices, meshletTriangles))
+
+    std::vector<BvhNode> bvhNodes;
+    buildBvh(groups, bvhNodes);
+
+    if (dotPath)
+    {
+        if (strcmp(dotPath, "-") == 0)
+        {
+            writeBvhDotGraph(bvhNodes, stdout);
+        }
+        else
+        {
+            FILE* f = std::fopen(dotPath, "w");
+            if (!f)
+            {
+                fprintf(stderr, "Failed to open dot output: %s\n", dotPath);
+                return 1;
+            }
+            writeBvhDotGraph(bvhNodes, f);
+            std::fclose(f);
+            printf("BVH dot graph written to %s (%zu nodes)\n", dotPath, bvhNodes.size());
+        }
+    }
+
+    if (!saveClusteredMesh(outputPath, vertices, clusters, meshletVertices, meshletTriangles))
         return 1;
 
     auto t2 = std::chrono::steady_clock::now();
@@ -113,7 +167,7 @@ int main(int argc, char* argv[])
     double buildMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     double saveMs  = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
-    printStats(argv[2], vertices, clusters, meshletVertices, meshletTriangles, buildMs, saveMs);
+    printStats(outputPath, vertices, clusters, meshletVertices, meshletTriangles, buildMs, saveMs);
 
     return 0;
 }

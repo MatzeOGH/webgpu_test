@@ -194,7 +194,8 @@ bool buildClusteredMeshFromGltf(
     std::vector<MeshVertexRaw>& outVertices,
     std::vector<ClusterN>&      outClusters,
     std::vector<uint32_t>&      outMeshletVertices,
-    std::vector<uint8_t>&       outMeshletTriangles)
+    std::vector<uint8_t>&       outMeshletTriangles,
+    std::vector<LodGroup>&  outGroups)
 {
     cgltf_options options{};
     cgltf_data* gltf{};
@@ -232,14 +233,17 @@ bool buildClusteredMeshFromGltf(
                 continue;
 
             const uint32_t clusterVertexBase   = (uint32_t)outVertices.size();
+            const uint32_t clusterBase         = (uint32_t)outClusters.size();
             const uint32_t meshletVertexBase   = (uint32_t)outMeshletVertices.size();
             const uint32_t meshletTriangleBase = (uint32_t)outMeshletTriangles.size();
 
-            std::vector<ClusterN>  clusters;
-            std::vector<uint32_t>  meshletVerts;
-            std::vector<uint8_t>   meshletTriangles;
-            buildNanite(vertices, indices, clusters, meshletVerts, meshletTriangles);
+            std::vector<ClusterN>     clusters;
+            std::vector<uint32_t>     meshletVerts;
+            std::vector<uint8_t>      meshletTriangles;
+            std::vector<LodGroup> groups;
+            buildNanite(vertices, indices, clusters, meshletVerts, meshletTriangles, groups);
 
+            // fixup local to global indices
             for (ClusterN& c : clusters)
             {
                 c.meshletVertexOffset   += meshletVertexBase;
@@ -248,11 +252,15 @@ bool buildClusteredMeshFromGltf(
             // offset global vertex indices from primitive-local to file-global
             for (uint32_t& vi : meshletVerts)
                 vi += clusterVertexBase;
+            // adjust group cluster offsets from primitive-local to file-global
+            for (LodGroup& g : groups)
+                g.clusterOffset += clusterBase;
 
             outVertices.insert(outVertices.end(), vertices.begin(), vertices.end());
             outClusters.insert(outClusters.end(), clusters.begin(), clusters.end());
             outMeshletVertices.insert(outMeshletVertices.end(), meshletVerts.begin(), meshletVerts.end());
             outMeshletTriangles.insert(outMeshletTriangles.end(), meshletTriangles.begin(), meshletTriangles.end());
+            outGroups.insert(outGroups.end(), groups.begin(), groups.end());
         }
     }
 
@@ -450,7 +458,8 @@ bool loadGltfMeshToGPU(const std::string& path, WGPUDevice device, WGPUQueue que
     std::vector<ClusterN>      clusters;
     std::vector<uint32_t>      meshletVertices;
     std::vector<uint8_t>       meshletTriangles;
-    if (!buildClusteredMeshFromGltf(path, vertices, clusters, meshletVertices, meshletTriangles))
+    std::vector<LodGroup>      groups;
+    if (!buildClusteredMeshFromGltf(path, vertices, clusters, meshletVertices, meshletTriangles, groups))
         return false;
 
     float summand[3], factor[3], inv_range[3];
@@ -475,7 +484,8 @@ void buildNanite(
     const std::vector<uint32_t>&      indices,
     std::vector<ClusterN>&            outClusters,
     std::vector<uint32_t>&            outMeshletVertices,
-    std::vector<uint8_t>&             outMeshletTriangles)
+    std::vector<uint8_t>&             outMeshletTriangles,
+    std::vector<LodGroup>&        outGroups)
 {
     clodConfig config = clodDefaultConfig(126);
     config.max_vertices = 64;
@@ -497,14 +507,24 @@ void buildNanite(
     size_t reservedClusters = ((indices.size() / 3) + 127) / 128 * 3;
     outClusters.reserve(outClusters.size() + reservedClusters);
 
-    std::vector<clodBounds> groups;
-    groups.reserve((reservedClusters + 15) / 16);
+    const size_t groupBase = outGroups.size();
 
     clodBuild(config, mesh,
         [&](clodGroup group, const clodCluster* clusters, size_t count) -> int
     {
-        int groupIndex = (int)groups.size();
-        groups.push_back(group.simplified);
+        int      localGroupIndex = (int)(outGroups.size() - groupBase);
+        uint32_t clusterOffset   = (uint32_t)outClusters.size();
+
+        LodGroup cg{};
+        cg.center[0]     = group.simplified.center[0];
+        cg.center[1]     = group.simplified.center[1];
+        cg.center[2]     = group.simplified.center[2];
+        cg.radius        = group.simplified.radius;
+        cg.error         = group.simplified.error;
+        cg.clusterOffset = clusterOffset;
+        cg.clusterCount  = count;
+        cg.depth         = (uint32_t)group.depth;
+        outGroups.push_back(cg);
 
         for (size_t i = 0; i < count; i++)
         {
@@ -524,9 +544,9 @@ void buildNanite(
             c.groupRadius  = group.simplified.radius;
             c.groupError   = group.simplified.error;
 
-            if (cluster.refined >= 0 && cluster.refined < (int)groups.size())
+            if (cluster.refined >= 0 && cluster.refined < localGroupIndex)
             {
-                const clodBounds& ref = groups[cluster.refined];
+                const LodGroup& ref = outGroups[groupBase + cluster.refined];
                 c.refinedCenterX = ref.center[0];
                 c.refinedCenterY = ref.center[1];
                 c.refinedCenterZ = ref.center[2];
@@ -544,14 +564,231 @@ void buildNanite(
             outMeshletTriangles.insert(outMeshletTriangles.end(), meshletTris.begin(), meshletTris.end());
         }
 
-        return groupIndex;
+        return localGroupIndex;
     });
 }
 
-// takes the group and
-void buildBvh()
+// Mirrors Nanite's WriteDotGraph but adapted for our 1-record-per-node layout.
+void writeBvhDotGraph(const std::vector<BvhNode>& nodes, std::FILE* out)
 {
+    if (!out || nodes.empty())
+        return;
 
+    auto fmtErr = [](float e) -> const char* {
+        static char buf[32];
+        if (e >= FLT_MAX * 0.5f)
+            return "INF";
+        std::snprintf(buf, sizeof(buf), "%.2f", e);
+        return buf;
+    };
+
+    std::fprintf(out, "digraph BVH {\n");
+    std::fprintf(out, "  node [shape=record style=filled fillcolor=white]\n");
+
+    // Edges: every internal node -> its children (children are contiguous).
+    for (uint32_t i = 0; i < nodes.size(); i++)
+    {
+        const BvhNode& n = nodes[i];
+        if (n.childOffset & kBvhLeafBit)
+            continue;
+        for (uint32_t c = 0; c < n.childCount; c++)
+            std::fprintf(out, "  n%u -> n%u\n", i, n.childOffset + c);
+    }
+
+    // Node labels.
+    for (uint32_t i = 0; i < nodes.size(); i++)
+    {
+        const BvhNode& n = nodes[i];
+        bool leaf = (n.childOffset & kBvhLeafBit) != 0;
+        bool root = (i == 0) && !leaf;
+
+        char emin[32], emax[32], depth[16];
+        std::snprintf(emin,  sizeof(emin),  "%s", fmtErr(n.minError));
+        std::snprintf(emax,  sizeof(emax),  "%s", fmtErr(n.maxError));
+        if (n.depth == UINT32_MAX)
+            std::snprintf(depth, sizeof(depth), "ROOT");
+        else
+            std::snprintf(depth, sizeof(depth), "%u", n.depth);
+
+        if (leaf)
+        {
+            uint32_t gi = n.childOffset & ~kBvhLeafBit;
+            std::fprintf(out, "  n%u [label=\"{leaf %u|d=%s|r=%.2f|e=%s}\"]\n",
+                         i, gi, depth, n.sphere[3], emax);
+        }
+        else if (root)
+        {
+            std::fprintf(out, "  n%u [label=\"{ROOT|d=%s|c=%u|r=%.2f|e=[%s,%s]}\" fillcolor=gold color=darkorange penwidth=3 style=\"filled,bold\"]\n",
+                         i, depth, n.childCount, n.sphere[3], emin, emax);
+        }
+        else
+        {
+            std::fprintf(out, "  n%u [label=\"{node %u|d=%s|c=%u|r=%.2f|e=[%s,%s]}\"]\n",
+                         i, i, depth, n.childCount, n.sphere[3], emin, emax);
+        }
+    }
+
+    std::fprintf(out, "}\n");
+}
+
+// Builds a BvhNode tree. Per-LOD-level subtree (binned by LodGroup::depth),
+// then a single global root tying the level roots together.
+// Pattern follows nv_cluster_lod's buildGeometryLodHierarchy.
+void buildBvh(const std::vector<LodGroup>& groups, std::vector<BvhNode>& outNodes)
+{
+    outNodes.clear();
+    if (groups.empty())
+        return;
+
+    constexpr uint32_t kFanout = 8;
+    outNodes.reserve(2 * groups.size() + 16);
+
+    // 1. Bin group indices by depth.
+    uint32_t maxDepth = 0;
+    for (const LodGroup& g : groups)
+        maxDepth = std::max(maxDepth, g.depth);
+
+    std::vector<std::vector<uint32_t>> levelGroups(maxDepth + 1);
+    for (uint32_t i = 0; i < groups.size(); i++)
+        levelGroups[groups[i].depth].push_back(i);
+
+    // 2. Build a sub-BVH for each non-empty level. Collect each level's root.
+    std::vector<BvhNode> levelRoots;
+    levelRoots.reserve(maxDepth + 1);
+
+    std::vector<BvhNode> work;
+    std::vector<BvhNode> scratch;
+    std::vector<unsigned int> perm;
+
+    for (uint32_t L = 0; L <= maxDepth; L++)
+    {
+        const std::vector<uint32_t>& levelIdx = levelGroups[L];
+        if (levelIdx.empty())
+            continue;
+
+        // Seed the working list with one leaf per group at this level.
+        work.clear();
+        work.reserve(levelIdx.size());
+        for (uint32_t gi : levelIdx)
+        {
+            const LodGroup& g = groups[gi];
+            BvhNode             leaf{};
+            leaf.sphere[0]  = g.center[0];
+            leaf.sphere[1]  = g.center[1];
+            leaf.sphere[2]  = g.center[2];
+            leaf.sphere[3]  = g.radius;
+            leaf.minError   = g.error;
+            leaf.maxError   = g.error;
+            leaf.childOffset = gi | kBvhLeafBit;
+            leaf.childCount  = 1;
+            leaf.depth       = L;
+            work.push_back(leaf);
+        }
+
+        // Iteratively collapse the working list into kFanout-wide parents.
+        while (work.size() > 1)
+        {
+            uint32_t N = (uint32_t)work.size();
+
+            // Spatially partition `work` into runs of ~kFanout elements.
+            perm.resize(N);
+            meshopt_spatialClusterPoints(perm.data(),
+                                         &work[0].sphere[0],
+                                         N, sizeof(BvhNode),
+                                         kFanout);
+
+            // Reorder work[] by perm[].
+            scratch.assign(work.begin(), work.end());
+            for (uint32_t i = 0; i < N; i++)
+                work[i] = scratch[perm[i]];
+
+            // Append reordered children into outNodes contiguously.
+            uint32_t childBase = (uint32_t)outNodes.size();
+            outNodes.insert(outNodes.end(), work.begin(), work.end());
+
+            // Build one parent per chunk of up to kFanout children.
+            std::vector<BvhNode> parents;
+            parents.reserve((N + kFanout - 1) / kFanout);
+            for (uint32_t start = 0; start < N; start += kFanout)
+            {
+                uint32_t end   = std::min(start + kFanout, N);
+                uint32_t count = end - start;
+
+                meshopt_Bounds b = meshopt_computeSphereBounds(
+                    &outNodes[childBase + start].sphere[0], count, sizeof(BvhNode),
+                    &outNodes[childBase + start].sphere[3], sizeof(BvhNode));
+
+                BvhNode parent{};
+                parent.sphere[0]  = b.center[0];
+                parent.sphere[1]  = b.center[1];
+                parent.sphere[2]  = b.center[2];
+                parent.sphere[3]  = b.radius;
+                parent.minError   = work[start].minError;
+                parent.maxError   = work[start].maxError;
+                for (uint32_t k = start + 1; k < end; k++)
+                {
+                    parent.minError = std::min(parent.minError, work[k].minError);
+                    parent.maxError = std::max(parent.maxError, work[k].maxError);
+                }
+                parent.childOffset = childBase + start; // MSB clear = internal
+                parent.childCount  = count;
+                parent.depth       = L;
+                parents.push_back(parent);
+            }
+
+            work = std::move(parents);
+        }
+
+        // work[0] is the level root; defer appending until we know whether
+        // we'll need a global root above it.
+        levelRoots.push_back(work[0]);
+    }
+
+    // 3. Sort level roots finest (smallest minError) first.
+    std::sort(levelRoots.begin(), levelRoots.end(),
+        [](const BvhNode& a, const BvhNode& b){ return a.minError < b.minError; });
+
+    if (levelRoots.size() == 1)
+    {
+        // Single level: the one level root is the root.
+        levelRoots[0].depth = UINT32_MAX;
+        outNodes.push_back(levelRoots[0]);
+    }
+    else
+    {
+        // Global root over the level roots. Append the sorted level roots as a
+        // contiguous block, then the root pointing at them.
+        uint32_t childBase = (uint32_t)outNodes.size();
+        outNodes.insert(outNodes.end(), levelRoots.begin(), levelRoots.end());
+
+        meshopt_Bounds b = meshopt_computeSphereBounds(
+            &outNodes[childBase].sphere[0], (size_t)levelRoots.size(), sizeof(BvhNode),
+            &outNodes[childBase].sphere[3], sizeof(BvhNode));
+
+        BvhNode root{};
+        root.sphere[0]  = b.center[0];
+        root.sphere[1]  = b.center[1];
+        root.sphere[2]  = b.center[2];
+        root.sphere[3]  = b.radius;
+        root.minError   = levelRoots[0].minError;
+        root.maxError   = levelRoots[0].maxError;
+        for (size_t i = 1; i < levelRoots.size(); i++)
+        {
+            root.minError = std::min(root.minError, levelRoots[i].minError);
+            root.maxError = std::max(root.maxError, levelRoots[i].maxError);
+        }
+        root.childOffset = childBase;
+        root.childCount  = (uint32_t)levelRoots.size();
+        root.depth       = UINT32_MAX;
+        outNodes.push_back(root);
+    }
+
+    // Move root from back to front so outNodes[0] is the root.
+    std::rotate(outNodes.begin(), std::prev(outNodes.end()), outNodes.end());
+    // All internal childOffsets pointed at index i, which is now i+1 after the rotate.
+    for (auto& node : outNodes)
+        if (!(node.childOffset & kBvhLeafBit))
+            node.childOffset += 1;
 }
 
 static bool loadPrimitive(

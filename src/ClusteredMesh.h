@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <cstdio>
 #include <webgpu/webgpu.h>
 
 // Packed runtime/on-disk/GPU layout. Must match the WGSL `struct MeshVertex`.
@@ -52,6 +53,32 @@ struct ClusteredMeshGPU {
     float dequant_factor[3];  // (max - min) / (2^21 - 1) per axis
 };
 
+struct LodGroup {
+    float    center[3];
+    float    radius;
+    float    error;
+    uint32_t clusterOffset;   // first index into outClusters produced by this group
+    uint32_t clusterCount;    // number of clusters produced by this group
+    uint32_t depth;           // DAG level from clodGroup::depth (0 = finest)
+};
+
+static constexpr uint32_t kBvhLeafBit = 0x80000000u;
+
+// 40-byte N-ary BVH node. sphere.xyz=center, sphere.w=radius.
+// Internal: childOffset = first child node index (MSB clear), childCount = # children.
+// Leaf:     childOffset = group index | kBvhLeafBit, childCount = 1.
+// depth:    LOD level this node belongs to (0 = finest); UINT32_MAX for the global root.
+struct BvhNode {
+    float    sphere[4];
+    float    minError;
+    float    maxError;
+    uint32_t childOffset;
+    uint32_t childCount;
+    uint32_t depth;
+    uint32_t _pad;
+};
+static_assert(sizeof(BvhNode) == 40, "BvhNode must be 40 bytes");
+
 // Loads and clusters the glTF. outVertices is the unique global vertex pool;
 // outMeshletVertices holds per-cluster global vertex indices (no duplication).
 bool buildClusteredMeshFromGltf(
@@ -59,7 +86,8 @@ bool buildClusteredMeshFromGltf(
     std::vector<MeshVertexRaw>&  outVertices,
     std::vector<ClusterN>&       outClusters,
     std::vector<uint32_t>&       outMeshletVertices,
-    std::vector<uint8_t>&        outMeshletTriangles);
+    std::vector<uint8_t>&        outMeshletTriangles,
+    std::vector<LodGroup>&       outGroups);
 
 // Encodes and writes the mesh file. Quantizes vertex positions only.
 bool saveClusteredMesh(
@@ -83,4 +111,13 @@ void buildNanite(
     const std::vector<uint32_t>&      indices,
     std::vector<ClusterN>&            outClusters,
     std::vector<uint32_t>&            outMeshletVertices,
-    std::vector<uint8_t>&             outMeshletTriangles);
+    std::vector<uint8_t>&             outMeshletTriangles,
+    std::vector<LodGroup>&            outGroups);
+
+// Builds a per-LOD-level BVH over the cluster groups. First node (index 0) is the root.
+void buildBvh(const std::vector<LodGroup>& groups,
+              std::vector<BvhNode>&        outNodes);
+
+// Writes the BVH as a Graphviz dot graph. Pass stdout, stderr, or any opened FILE*.
+// Pipe to `dot -Tsvg` or paste into https://dreampuf.github.io/GraphvizOnline.
+void writeBvhDotGraph(const std::vector<BvhNode>& nodes, std::FILE* out);
