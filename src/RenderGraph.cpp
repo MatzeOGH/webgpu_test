@@ -1,7 +1,10 @@
 #include "RenderGraph.h"
-#include <malloc.h>
-#include <memory>
+#include <cstddef>
+#include <cassert>
+#include <cstdint>
 #include <new>
+#include <utility>
+#include <vector>
 #include <webgpu/webgpu.h>
 #include <cstdio>
 #include <cstdlib>
@@ -10,33 +13,91 @@
 
 namespace RG{
 
+
+
 // arena allocator to not fragment the heap during graph construction
 // TODO: implement scratch arena for all resouces that life inside of the rendergraph
 struct GraphAllocator
 {
+    // Pointer to the base memory block
+    uint8_t* base{};
+    // Offset to the next free byte
+    size_t used{};
+    // Total capacity in bytes
+    size_t capacity{};
+
+    // alignment must be a power of two
+    static constexpr size_t align_up(size_t value, size_t alignment)
+    {
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    // Raw aligned allocation for type-erased payloads.
+    void* alloc_raw(size_t size, size_t align)
+    {
+        const size_t offset = align_up(used, align);
+
+        if (offset + size > capacity)
+        {
+            assert(false && "GraphAllocator OOM");
+            return nullptr;
+        }
+
+        void* p = base + offset;
+        used = offset + size;
+        return p;
+    }
+
+    // Allocate + construct
+    template<typename T, typename... Args>
+    T* make(Args&&... args)
+    {
+        void* m = alloc_raw(sizeof(T), alignof(T));
+        return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr;
+    }
+
+    // Allocate zeroed POD storage
     template<typename T>
-    inline T* make(){
-        return new T;
+    T* alloc(size_t count = 1)
+    {
+        void* m = alloc_raw(sizeof(T) * count, alignof(T));
+
+        if (m)
+            std::memset(m, 0, sizeof(T) * count);
+
+        return static_cast<T*>(m);
     }
 
-    // copies a (possibly non-owning) view into allocator-owned storage and returns a view
-    // onto the copy. kept null-terminated so .data also works as a plain C string.
-    WGPUStringView copy_string(WGPUStringView s){
-        size_t len = (s.length == WGPU_STRLEN) ? (s.data ? std::strlen(s.data) : 0) : s.length;
-        char* buf = new char[len + 1];
-        if (len) std::memcpy(buf, s.data, len);
+    // Copy a string view into allocator-owned storage.
+    // Result is always null-terminated.
+    WGPUStringView copy_string(WGPUStringView s)
+    {
+        const size_t len = (s.length == WGPU_STRLEN)
+                ? (s.data ? std::strlen(s.data) : 0)
+                : s.length;
+
+        char* buf = alloc<char>(len + 1);
+        if (!buf)
+            return {};
+
+        if (len)
+            std::memcpy(buf, s.data, len);
+
         buf[len] = '\0';
+
         return WGPUStringView{ buf, len };
-        // ponytail: per-string new[]; swap for a bump arena when make<T> stops being new T
     }
 
-    // raw aligned alloc seam for type-erased payloads (the execute callbacks). same arena
-    // story as make<T>/copy_string: per-alloc operator new today, bump pointer later.
-    void* alloc_raw(size_t size, size_t align){
-        return ::operator new(size, std::align_val_t(align));
+    void reset()
+    {
+        used = 0;
     }
 };
 
+struct GraphResourceCache
+{
+    std::vector<ResourceNode> cachedResources;
+};
 
 // internal resouceNode of an image or buffer
 // structured as a intrusive linked list for memory resouce
@@ -63,6 +124,7 @@ struct ResourceNode
     uint64_t bufferSize{};
 
     // realized / registered GPU handles
+    WGPUTexture      texture{};                       // created: the texture object backing `view`
     WGPUTextureView  view{};                         // imported: the registered swapchain view
     WGPUBuffer       buffer{};                        // imported: the registered buffer
     WGPUExtent3D     resolved = WGPU_EXTENT_3D_INIT;  // imported: registered size (base for future Relative resolution)
@@ -88,7 +150,7 @@ struct PassNode
     // ponytail: fixed inline array, no alloc; bump N or add a spill list if a pass needs more
     static constexpr uint32_t kMaxAccess = 16;
     ResourceAccess accesses[kMaxAccess];
-    uint32_t       accessCount{};
+    uint32_t accessCount{};
 
     // inline adjacency list
     NodeAdjacency* adjacency{};
@@ -105,14 +167,26 @@ struct NodeAdjacency
 };
 
 GraphAllocator* create_allocator(){
-    return new GraphAllocator;
+    GraphAllocator* allocator = new GraphAllocator;
+    size_t capacity = 1u << 20;// alloc 1 MB
+    allocator->base = (uint8_t*)malloc(capacity);
+    allocator->used = 0u;
+    allocator->capacity = capacity;
+    return allocator;
 }
 
-
-RenderGraph* create_render_graph(GraphAllocator* allocator)
+GraphResourceCache* create_cache()
 {
+    GraphResourceCache* cache = new GraphResourceCache;
+    return cache;
+}
+
+RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* cache)
+{
+    allocator->reset();
     RenderGraph* rg = allocator->make<RenderGraph>();
     rg->m_allocator = allocator;
+    rg->cache = cache;
     return rg;
 }
 
@@ -133,6 +207,15 @@ static void list_append(T** head, T* newNode)
     }
 
     current->next = newNode;
+}
+
+
+static bool access_is_write(AccessType t)
+{
+    return t == AccessType::ColorAttachment
+        || t == AccessType::DepthStencilAttachment
+        || t == AccessType::StorageWrite
+        || t == AccessType::CopyDst;
 }
 
 
@@ -366,13 +449,17 @@ void RenderGraph::compile()
                 switch (p->accesses[i].type) {
                   case AccessType::ColorAttachment:
                   case AccessType::DepthStencilAttachment: r->texUsage |= WGPUTextureUsage_RenderAttachment; break;
-                  case AccessType::Sampled:                r->texUsage |= WGPUTextureUsage_TextureBinding;   break;
+                  case AccessType::Sampled:                r->texUsage |= WGPUTextureUsage_TextureBinding;  break;
                   case AccessType::StorageRead:
                   case AccessType::StorageWrite:
                       // texture vs buffer go to different usage fields (distinct types -> if/else, not ?:)
                       if (r->kind == ResourceNode::Kind::Texture) r->texUsage |= WGPUTextureUsage_StorageBinding;
                       else                                        r->bufUsage |= WGPUBufferUsage_Storage;
                       break;
+                  case AccessType::Uniform: r->bufUsage |= WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; break;
+                  // ponytail: copy accesses map to texture usage only; buffer copy not needed yet
+                  case AccessType::CopySrc: r->texUsage |= WGPUTextureUsage_CopySrc; break;
+                  case AccessType::CopyDst: r->texUsage |= WGPUTextureUsage_CopyDst; break;
                 }
             }
 
@@ -388,22 +475,223 @@ void RenderGraph::compile()
 
 }
 
-// records one access on the pass currently being built
-static void push_access(PassNode* p, ResourceHandle h, AccessType t)
+// debug-only: position of `target` in the pass list = its Mermaid node id. O(n) per call.
+static uint32_t pass_index(PassNode* head, PassNode* target)
+{
+    uint32_t i = 0;
+    for (PassNode* p = head; p; p = p->next, ++i)
+        if (p == target) return i;
+    return 0;
+}
+
+// dump the graph as a Mermaid flowchart on stdout. passes are nodes; an edge P -->|res| Q means
+// pass P writes a resource that pass Q reads. edges are recomputed from the access lists (same
+// producer->reader rule as compile() phase 1), so this works before or after compile(). resources
+// read-but-unwritten (imported inputs) and written-but-unread (sinks like the swapchain) carry no
+// pass->pass edge and don't appear.
+void RenderGraph::debug_print_mermaid()
+{
+    std::printf("flowchart LR\n");
+
+    // node decl: stable id Pi -> pass name, indexed by list position.
+    uint32_t idx = 0;
+    for (PassNode* p = m_passes; p; p = p->next, ++idx)
+        std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->name.length, p->name.data ? p->name.data : "");
+
+    // producer[id] = pass writing resource id (last writer wins, matches compile()'s single-producer model)
+    PassNode** producer = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
+    for (PassNode* p = m_passes; p; p = p->next)
+        for (uint32_t i = 0; i < p->accessCount; ++i)
+            if (access_is_write(p->accesses[i].type))
+                producer[p->accesses[i].handle.id] = p;
+
+    // one edge per read: link the reader back to the resource's producer, labelled with the resource name
+    for (PassNode* p = m_passes; p; p = p->next)
+        for (uint32_t i = 0; i < p->accessCount; ++i) {
+            const ResourceAccess& a = p->accesses[i];
+            if (access_is_write(a.type)) continue;
+            PassNode* w = producer[a.handle.id];
+            if (!w || w == p) continue;                 // unproduced input / self-read
+            ResourceNode* r = node(a.handle);
+            WGPUStringView nm = r ? r->name : WGPUStringView{};
+            std::printf("  P%u -->|\"%.*s\"| P%u\n",
+                        pass_index(m_passes, w), (int)nm.length, nm.data ? nm.data : "",
+                        pass_index(m_passes, p));
+        }
+
+    std::free(producer);
+    std::fflush(stdout);
+    // ponytail: pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a
+    // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.
+}
+
+// resolve a handle to its node by linear walk of the resource list.
+// ponytail: O(n) per lookup; build an id->node table on the graph if pass bodies do many lookups.
+ResourceNode* RenderGraph::node(ResourceHandle h)
+{
+    for (ResourceNode* r = m_resouces; r; r = r->next)
+        if (r->handle.id == h.id) return r;
+    return nullptr;
+}
+
+void RenderGraph::update_imported_view(ResourceHandle h, WGPUTextureView view, WGPUExtent3D size, WGPUTexture texture)
+{
+    if (ResourceNode* r = node(h)) { r->view = view; r->resolved = size; r->texture = texture; }
+    // texture stays caller-owned: release_resources() skips imported nodes, so no double-free.
+}
+
+WGPUTextureView PassContext::view(ResourceHandle h) const
+{
+    ResourceNode* r = graph ? graph->node(h) : nullptr;
+    return r ? r->view : nullptr;
+}
+
+WGPUTexture PassContext::texture(ResourceHandle h) const
+{
+    ResourceNode* r = graph ? graph->node(h) : nullptr;
+    return r ? r->texture : nullptr;
+}
+
+WGPUBuffer PassContext::buffer(ResourceHandle h) const
+{
+    ResourceNode* r = graph ? graph->node(h) : nullptr;
+    return r ? r->buffer : nullptr;
+}
+
+// create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
+// imported resources are caller-owned and skipped; a resource with no accumulated usage was
+// untouched by a live pass -> skipped too (the free dead-resource cull compile() phase 3 set up).
+void RenderGraph::realize(WGPUDevice device)
+{
+    m_device = device;
+    for (ResourceNode* r = m_resouces; r; r = r->next) {
+        if (r->imported) continue;
+        if (r->kind == ResourceNode::Kind::Texture) {
+            if (!r->texUsage) continue;
+            WGPUTextureDescriptor d{
+                .label         = r->name,
+                .usage         = r->texUsage,
+                .dimension     = r->dimension,
+                .size          = r->resolved,
+                .format        = r->format,
+                .mipLevelCount = 1,
+                .sampleCount   = 1,
+            };
+            r->texture = wgpuDeviceCreateTexture(device, &d);
+            r->view    = wgpuTextureCreateView(r->texture, nullptr);
+        } else {
+            if (!r->bufUsage) continue;
+            WGPUBufferDescriptor d{
+                .label = r->name,
+                .usage = r->bufUsage,
+                .size  = r->bufferSize,
+            };
+            r->buffer = wgpuDeviceCreateBuffer(device, &d);
+        }
+    }
+    // ponytail: recreated on every realize(); no caching/aliasing. add a transient pool if
+    // per-frame churn ever shows up in a profile.
+}
+
+// record the compiled passes (already in execution order) into a caller-owned encoder: open the
+// right pass kind, wire the attachments declared in setup, invoke the stored body against a live
+// PassContext. caller owns submit + present.
+// ponytail: mirrors RenderPassBuilder/ComputePassBuilder in Renderer.cpp; reimplemented inline
+// rather than shared because those live in Renderer.cpp (not a header) and this TU is standalone.
+void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
+{
+    for (PassNode* p = m_passes; p; p = p->next) {
+        PassContext ctx{};
+        ctx.encoder = encoder;
+        ctx.graph = this;
+        ctx.queue = queue;
+
+        if (p->kind == PassKind::Compute) {
+            WGPUComputePassDescriptor cd{ .label = p->name };
+            ctx.compute = wgpuCommandEncoderBeginComputePass(encoder, &cd);
+            if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
+            wgpuComputePassEncoderEnd(ctx.compute);
+            wgpuComputePassEncoderRelease(ctx.compute);
+        }
+        else if (p->kind == PassKind::Graphics) {
+            // gather declared attachments from the access list -> WebGPU render pass descriptor
+            WGPURenderPassColorAttachment color[8]{};
+            uint32_t nc = 0;
+            WGPURenderPassDepthStencilAttachment depth{};
+            bool hasDepth = false;
+
+            for (uint32_t i = 0; i < p->accessCount; ++i) {
+                const ResourceAccess& a = p->accesses[i];
+                ResourceNode* r = node(a.handle);
+                if (!r) continue;
+                if (a.type == AccessType::ColorAttachment && nc < 8) {
+                    color[nc++] = WGPURenderPassColorAttachment{
+                        .view       = r->view,
+                        .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
+                        .loadOp     = a.loadOp,
+                        .storeOp    = a.storeOp,
+                        .clearValue = a.clearColor,
+                    };
+                } else if (a.type == AccessType::DepthStencilAttachment) {
+                    depth = WGPURenderPassDepthStencilAttachment{
+                        .view            = r->view,
+                        .depthLoadOp     = a.loadOp,
+                        .depthStoreOp    = a.storeOp,
+                        .depthClearValue = a.clearDepth,
+                        // stencil ops left Undefined -> depth-only formats (e.g. Depth32Float)
+                    };
+                    hasDepth = true;
+                }
+            }
+
+            WGPURenderPassDescriptor rd{
+                .label                  = p->name,
+                .colorAttachmentCount   = nc,
+                .colorAttachments       = color,
+                .depthStencilAttachment = hasDepth ? &depth : nullptr,
+            };
+            ctx.render = wgpuCommandEncoderBeginRenderPass(encoder, &rd);
+            if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
+            wgpuRenderPassEncoderEnd(ctx.render);
+            wgpuRenderPassEncoderRelease(ctx.render);
+        }
+        else { // Transfer / None: body records straight onto the encoder
+            if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
+        }
+    }
+}
+
+// release graph-created GPU handles (imported ones are caller-owned -> left alone). pairs with
+// realize(); call once the frame's commands have been submitted.
+void RenderGraph::release_resources()
+{
+    for (ResourceNode* r = m_resouces; r; r = r->next) {
+        if (r->imported) continue;
+        if (r->view)    { wgpuTextureViewRelease(r->view); r->view    = nullptr; }
+        if (r->texture) { wgpuTextureRelease(r->texture);  r->texture = nullptr; }
+        if (r->buffer)  { wgpuBufferRelease(r->buffer);    r->buffer  = nullptr; }
+    }
+}
+
+// records one access on the pass currently being built. load/store/clear are only meaningful for
+// attachment accesses; the read/storage helpers below leave them at their (ignored) defaults.
+static void push_access(PassNode* p, ResourceHandle h, AccessType t,
+                        WGPULoadOp load = {}, WGPUStoreOp store = {},
+                        WGPUColor clearColor = {}, float clearDepth = {})
 {
     if (p && p->accessCount < PassNode::kMaxAccess)
-        p->accesses[p->accessCount++] = { h, t };
+        p->accesses[p->accessCount++] = { h, t, load, store, clearColor, clearDepth };
     // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it
 }
 
-void GraphBuilder::color(ResourceHandle handle)
+void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear)
 {
-    push_access(m_new_pass, handle, AccessType::ColorAttachment);
+    push_access(m_new_pass, handle, AccessType::ColorAttachment, load, store, clear);
 }
 
-void GraphBuilder::depth_stencil(ResourceHandle handle)
+void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth)
 {
-    push_access(m_new_pass, handle, AccessType::DepthStencilAttachment);
+    push_access(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth);
 }
 
 void GraphBuilder::sampled(ResourceHandle handle)
@@ -419,6 +707,21 @@ void GraphBuilder::storage_read(ResourceHandle handle)
 void GraphBuilder::storage_write(ResourceHandle handle)
 {
     push_access(m_new_pass, handle, AccessType::StorageWrite);
+}
+
+void GraphBuilder::uniform(ResourceHandle handle)
+{
+    push_access(m_new_pass, handle, AccessType::Uniform);
+}
+
+void GraphBuilder::copy_src(ResourceHandle handle)
+{
+    push_access(m_new_pass, handle, AccessType::CopySrc);
+}
+
+void GraphBuilder::copy_dst(ResourceHandle handle)
+{
+    push_access(m_new_pass, handle, AccessType::CopyDst);
 }
 
 } // RG

@@ -49,41 +49,62 @@ enum struct AccessType : uint8_t
     Sampled,                 // read
     StorageRead,             // read
     StorageWrite,            // write
+    Uniform,
+    CopySrc,                 // read  (transfer source)
+    CopyDst,                 // write (transfer destination)
 };
-
-inline bool access_is_write(AccessType t) {
-    return t == AccessType::ColorAttachment
-        || t == AccessType::DepthStencilAttachment
-        || t == AccessType::StorageWrite;
-}
 
 struct ResourceAccess
 {
     ResourceHandle handle{};
     AccessType     type{};
+
+    // attachment-only (ColorAttachment / DepthStencilAttachment); ignored for other access types.
+    WGPULoadOp  loadOp{};
+    WGPUStoreOp storeOp{};
+    WGPUColor   clearColor{};
+    float       clearDepth{};
 };
 
 struct ResourceNode;
 struct PassNode;
-struct PassContext; // defined in the execute phase; named here only for the stored fn-pointer type
+struct RenderGraph; // PassContext holds a back-pointer for resource lookup
+
+// live during execute(): the encoder a pass body records into + resolved-resource lookup.
+// the real thing that replaces the old forward-declared stub.
+struct PassContext
+{
+    WGPUCommandEncoder encoder{};  // always set
+    WGPURenderPassEncoder render{};   // set for Graphics passes
+    WGPUComputePassEncoder compute{};  // set for Compute passes
+    WGPUQueue queue{};
+    RenderGraph* graph{};
+
+    WGPUTextureView view(ResourceHandle h) const;   // resolved view
+    WGPUTexture texture(ResourceHandle h) const;    // resolved texture (copies need the texture, not a view)
+    WGPUBuffer buffer(ResourceHandle h) const;  // resolved buffer
+};
+
 struct GraphBuilder
 {
-
     // color attachment
-    void color(ResourceHandle handle);
+    void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1});
     // depth stencil attachment
-    void depth_stencil(ResourceHandle handle);
+    void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f);
     // sampled resouces
     void sampled(ResourceHandle handle);
     void storage_read(ResourceHandle handle);
     void storage_write(ResourceHandle handle);
-
+    // uniform
+    void uniform(ResourceHandle handle);
+    // transfer (copy) source / destination
+    void copy_src(ResourceHandle handle);
+    void copy_dst(ResourceHandle handle);
 
     PassNode* m_new_pass{};
-
 };
 struct GraphAllocator; // internal allocator
-
+struct GraphResourceCache; // holds the graphs resources over multiple frames.
 
 struct TextureDesc
 {
@@ -122,6 +143,21 @@ struct RenderGraph
 
     void compile();
 
+    // create GPU resources from the usage + size that compile() worked out
+    void realize(WGPUDevice device);
+    // record the compiled passes into a caller-owned encoder (caller submits + presents)
+    void execute(WGPUCommandEncoder encoder, WGPUQueue queue);
+    // release graph-created textures/views/buffers (imported resources left alone)
+    void release_resources();
+    // re-point an imported resource at this frame's GPU handle (e.g. the swapchain view, which the
+    // surface hands out fresh every frame) so a graph can be built/compiled once and re-executed.
+    void update_imported_view(ResourceHandle h, WGPUTextureView view, WGPUExtent3D size, WGPUTexture texture = nullptr);
+    // resolve a handle to its node (linear walk; see ceiling note in .cpp)
+    ResourceNode* node(ResourceHandle h);
+
+    // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
+    void debug_print_mermaid();
+
     // Marks the beginning of the declaration of a render pass
     GraphBuilder begin_pass(WGPUStringView name, PassKind kind);
 
@@ -129,8 +165,10 @@ struct RenderGraph
     void end_pass(GraphBuilder& builder);
 
     GraphAllocator* m_allocator{};
+    GraphResourceCache* cache{};
     ResourceNode* m_resouces{};
     PassNode* m_passes{};       // after compile(): in execution order (toposorted)
+    WGPUDevice m_device{};      // set by realize(); resources are created against it
     uint32_t next_id = 1; // 0 = invalid handle
 
 private:
@@ -149,7 +187,8 @@ private:
 };
 
 GraphAllocator* create_allocator();
-RenderGraph* create_render_graph(GraphAllocator* allocator);
+GraphResourceCache* create_cache();
+RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* cache);
 
 
 }// RG
