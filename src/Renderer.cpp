@@ -249,7 +249,7 @@ static void reconfigure_surface(uint32_t w, uint32_t h)
 
 static void recreate_depth_texture(uint32_t w, uint32_t h)
 {
-    if (gDepthView)    { wgpuTextureViewRelease(gDepthView);    gDepthView    = nullptr; }
+        if (gDepthView)    { wgpuTextureViewRelease(gDepthView);    gDepthView    = nullptr; }
     if (gDepthTexture) { wgpuTextureRelease(gDepthTexture);     gDepthTexture = nullptr; }
     WGPUTextureDescriptor desc{
         .usage         = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding,

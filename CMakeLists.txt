@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 
+set(SHARED_SOURCES
+    src/Framework.cpp
+    src/Renderer.cpp
+    src/ClusteredMesh.cpp
+)
+
 # ---------------------------------------------------------------------------
 # Emscripten (WebAssembly / WebGPU via emdawnwebgpu port)
 # ---------------------------------------------------------------------------
@@ -18,45 +24,7 @@ if(EMSCRIPTEN)
     )
     FetchContent_MakeAvailable(emdawnwebgpu)
 
-    add_executable(app src/main_web.cpp src/Framework.cpp src/Renderer.cpp src/ClusteredMesh.cpp)
-
-    set(DAWN_PORT "${emdawnwebgpu_SOURCE_DIR}/emdawnwebgpu.port.py")
-
-    target_compile_options(app PRIVATE "--use-port=${DAWN_PORT}" "-Oz")
-    target_link_options(app PRIVATE
-        "--use-port=${DAWN_PORT}"
-        "-sASYNCIFY=0"
-        "-sALLOW_MEMORY_GROWTH=1"
-"--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
-        "-Oz"
-        "--preload-file=${CMAKE_SOURCE_DIR}/assets@/assets"
-        "-sINVOKE_RUN=0"
-    )
-
-    set_target_properties(app PROPERTIES SUFFIX ".html")
-
-    add_custom_command(TARGET app POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E rename
-            "$<TARGET_FILE_DIR:app>/app.html"
-            "$<TARGET_FILE_DIR:app>/index.html"
-        COMMENT "Renaming app.html to index.html for GitHub Pages"
-    )
-
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        target_compile_options(app PRIVATE "-flto")
-        target_link_options(app PRIVATE
-            "--closure=1"
-            "-flto"
-            "-sWASM=2"
-            "-sENVIRONMENT=web"
-            "-sMALLOC=emmalloc"
-            "-sASSERTIONS=0"
-            "-sSAFE_HEAP=0"
-            "-sSTACK_OVERFLOW_CHECK=0"
-            "-sDEMANGLE_SUPPORT=0"
-            "-sGL_ASSERTIONS=0"
-        )
-    endif()
+    set(APP_MAIN src/main_web.cpp)
 
 # ---------------------------------------------------------------------------
 # Native Windows — prebuilt Dawn binaries from Dawn v20260420.230544
@@ -93,7 +61,57 @@ elseif(WIN32)
     find_package(Dawn  REQUIRED)
     find_package(SDL3  REQUIRED CONFIG)
 
-    add_executable(app src/main_SDL.cpp src/Framework.cpp src/Renderer.cpp src/ClusteredMesh.cpp)
+    set(APP_MAIN src/main_SDL.cpp)
+
+else()
+    message(FATAL_ERROR "Only Emscripten and Windows are supported by this project.")
+endif()
+
+# ---------------------------------------------------------------------------
+# Shared app target
+# ---------------------------------------------------------------------------
+add_executable(app ${APP_MAIN} ${SHARED_SOURCES})
+
+if(EMSCRIPTEN)
+    set(DAWN_PORT "${emdawnwebgpu_SOURCE_DIR}/emdawnwebgpu.port.py")
+
+    target_compile_options(app PRIVATE "--use-port=${DAWN_PORT}" "-Oz")
+    target_link_options(app PRIVATE
+        "--use-port=${DAWN_PORT}"
+        "-sASYNCIFY=0"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "--shell-file=${CMAKE_SOURCE_DIR}/src/shell.html"
+        "-Oz"
+        "--preload-file=${CMAKE_SOURCE_DIR}/assets@/assets"
+        "-sINVOKE_RUN=0"
+    )
+
+    set_target_properties(app PROPERTIES SUFFIX ".html")
+
+    add_custom_command(TARGET app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rename
+            "$<TARGET_FILE_DIR:app>/app.html"
+            "$<TARGET_FILE_DIR:app>/index.html"
+        COMMENT "Renaming app.html to index.html for GitHub Pages"
+    )
+
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(app PRIVATE "-flto")
+        target_link_options(app PRIVATE
+            "--closure=1"
+            "-flto"
+            "-sWASM=2"
+            "-sENVIRONMENT=web"
+            "-sMALLOC=emmalloc"
+            "-sASSERTIONS=0"
+            "-sSAFE_HEAP=0"
+            "-sSTACK_OVERFLOW_CHECK=0"
+            "-sDEMANGLE_SUPPORT=0"
+            "-sGL_ASSERTIONS=0"
+        )
+    endif()
+
+elseif(WIN32)
     target_link_libraries(app PRIVATE dawn::webgpu_dawn SDL3::SDL3)
 
     add_executable(nanite_builder src/mainNaniteBuilder.cpp src/ClusteredMesh.cpp)
@@ -121,7 +139,4 @@ elseif(WIN32)
             "$<TARGET_FILE_DIR:app>/SDL3.dll"
         COMMENT "Copying SDL3.dll"
     )
-
-else()
-    message(FATAL_ERROR "Only Emscripten and Windows are supported by this project.")
 endif()

@@ -643,7 +643,8 @@ void buildBvh(const std::vector<LodGroup>& groups, std::vector<BvhNode>& outNode
     constexpr uint32_t kFanout = 8;
     outNodes.reserve(2 * groups.size() + 16);
 
-    // 1. Bin group indices by depth.
+    // Bin group indices by depth.
+    // Both Unreal Engine and vk_cluster_lod to the same.
     uint32_t maxDepth = 0;
     for (const LodGroup& g : groups)
         maxDepth = std::max(maxDepth, g.depth);
@@ -658,7 +659,7 @@ void buildBvh(const std::vector<LodGroup>& groups, std::vector<BvhNode>& outNode
 
     std::vector<BvhNode> work;
     std::vector<BvhNode> scratch;
-    std::vector<unsigned int> perm;
+    std::vector<unsigned int> indexBuffer;
 
     for (uint32_t L = 0; L <= maxDepth; L++)
     {
@@ -691,8 +692,8 @@ void buildBvh(const std::vector<LodGroup>& groups, std::vector<BvhNode>& outNode
             uint32_t N = (uint32_t)work.size();
 
             // Spatially partition `work` into runs of ~kFanout elements.
-            perm.resize(N);
-            meshopt_spatialClusterPoints(perm.data(),
+            indexBuffer.resize(N);
+            meshopt_spatialClusterPoints(indexBuffer.data(),
                                          &work[0].sphere[0],
                                          N, sizeof(BvhNode),
                                          kFanout);
@@ -700,7 +701,7 @@ void buildBvh(const std::vector<LodGroup>& groups, std::vector<BvhNode>& outNode
             // Reorder work[] by perm[].
             scratch.assign(work.begin(), work.end());
             for (uint32_t i = 0; i < N; i++)
-                work[i] = scratch[perm[i]];
+                work[i] = scratch[indexBuffer[i]];
 
             // Append reordered children into outNodes contiguously.
             uint32_t childBase = (uint32_t)outNodes.size();
@@ -782,13 +783,6 @@ void buildBvh(const std::vector<LodGroup>& groups, std::vector<BvhNode>& outNode
         root.depth       = UINT32_MAX;
         outNodes.push_back(root);
     }
-
-    // Move root from back to front so outNodes[0] is the root.
-    std::rotate(outNodes.begin(), std::prev(outNodes.end()), outNodes.end());
-    // All internal childOffsets pointed at index i, which is now i+1 after the rotate.
-    for (auto& node : outNodes)
-        if (!(node.childOffset & kBvhLeafBit))
-            node.childOffset += 1;
 }
 
 static bool loadPrimitive(
