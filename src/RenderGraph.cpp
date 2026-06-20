@@ -393,19 +393,17 @@ enum struct HazardKind : uint8_t { RAW, WAW, WAR };
 // drift from the real graph. Each write to a resource starts a new "version" (the writing pass IS the
 // version identity); each read binds to the current one. Calls onEdge(dependent, dep, id, kind) per
 // discovered hazard -- RAW (read -> producer), WAW (write -> prev writer), WAR (write -> readers of
-// the version being clobbered); `dependent` is always later in the walk than `dep`. Calls
-// onEarlyRead(reader, id) once per resource read before its first writer yet written later -- the
-// caller resolves id->name and decides whether to warn (compile() does; the dump passes a no-op).
-template<typename OnEdge, typename OnEarlyRead>
+// the version being clobbered); `dependent` is always later in the walk than `dep`. A read seen before
+// any writer of its resource simply binds to "no producer" (no edge) -- detecting that authoring error
+// is left to compile()'s post-cull pass, which sees the final schedule; the sweep stays edge-only.
+template<typename OnEdge>
 static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_id,
-                                    OnEdge&& onEdge, OnEarlyRead&& onEarlyRead)
+                                    OnEdge&& onEdge)
 {
-    // per resource id (1..next_id-1): the pass holding the current version, the readers of that
-    // version not yet retired by a newer write, and the first pass (if any) that read it before any
-    // writer existed.
+    // per resource id (1..next_id-1): the pass holding the current version, and the readers of that
+    // version not yet retired by a newer write.
     PassNode**      currentProducer = alloc->scratch_alloc<PassNode*>(next_id);
     NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_id);
-    PassNode**      earlyReader     = alloc->scratch_alloc<PassNode*>(next_id);
     defer { alloc->reset_scratch(); };
 
     for (PassNode* p = head; p; p = p->next)
@@ -422,22 +420,15 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
                 currentProducer[id] = p;        // new version born
                 pendingReaders[id]  = nullptr;  // its readers retired (old nodes are arena garbage)
             } else {
-                // RAW: this read depends on the producer of the version it sees.
-                if (!currentProducer[id]) { if (!earlyReader[id]) earlyReader[id] = p; }  // read before any writer
-                else if (currentProducer[id] != p) onEdge(p, currentProducer[id], id, HazardKind::RAW);
+                // RAW: this read depends on the producer of the version it sees. a read before any
+                // writer binds to "no producer" (no edge) -- compile()'s post-cull pass flags it.
+                if (currentProducer[id] && currentProducer[id] != p)
+                    onEdge(p, currentProducer[id], id, HazardKind::RAW);
                 // register as a pending reader of the current version (for a future write's WAR).
                 NodeAdjacency* link = alloc->scratch_make<NodeAdjacency>();   // transient: dead at function return
                 link->pass = p; link->next = pendingReaders[id]; pendingReaders[id] = link;
             }
         }
-
-    // declaration order is load-bearing: a read seen before its resource's first writer got no edge
-    // (it bound to "no producer"). if that resource is written later the read can't see that result --
-    // almost certainly the writer was declared after the reader. report it; reading an unproduced
-    // resource (imported input) is legal and stays silent (currentProducer[id] is null at the end).
-    for (uint32_t id = 1; id < next_id; ++id)
-        if (earlyReader[id] && currentProducer[id])
-            onEarlyRead(earlyReader[id], id);
 
     // both self-guards above are load-bearing: read-then-write of one handle in a single pass would
     // WAR-self-edge; write-then-write would WAW-self-edge. every edge points from a later- to an
@@ -487,23 +478,16 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
     return r->resolved = { (uint32_t)(b.width * r->scaleX), (uint32_t)(b.height * r->scaleY), 1 };
 }
 
-void RenderGraph::compile()
+bool RenderGraph::compile()
 {
     // phase 1: build adjacency (pass dependency DAG, "depends-on" direction). The versioning sweep
     // (see sweep_resource_versions) discovers every RAW/WAW/WAR hazard in declaration order; here all
     // three collapse to add_dependency -- its dedup folds multiple hazards between one pass pair into
-    // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored.
+    // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
+    // before any writer get no edge here; the post-cull pass below turns them into errors.
     sweep_resource_versions(m_allocator, m_passes, next_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t /*id*/, HazardKind /*kind*/) {
             add_dependency(m_allocator, dependent, dep);
-        },
-        [&](PassNode* reader, uint32_t id) {
-            ResourceNode* r = node({ id });   // node() lives here, so the diagnostic can name the resource
-            WGPUStringView rn = r ? r->name : WGPUStringView{};
-            std::printf("[RenderGraph] warning: pass \"%.*s\" reads resource \"%.*s\" before any pass "
-                        "writes it -- declare the writer first.\n",
-                        (int)reader->name.length, reader->name.data ? reader->name.data : "",
-                        (int)rn.length, rn.data ? rn.data : "");
         });
 
     // phase 2: dead-node removal + topo sort, fused into one DFS seeded from sinks.
@@ -539,6 +523,41 @@ void RenderGraph::compile()
         // disconnected nodes). recursive DFS, no cycle detection: graph is author-acyclic; add an
         // `onstack` flag (+2 lines) only if a cyclic graph ever needs catching.
     }
+
+    // post-cull validation: over the FINAL schedule (m_passes is now culled + in execution order), a
+    // read of a TRANSIENT resource that no earlier pass has produced is an authoring error -- the reader
+    // would sample uninitialized contents (its writer was declared after it, or culled). walking the
+    // surviving passes makes this culling-correct and catches every surviving reader, not just the first.
+    //   imported resources                        -> exempt (their value comes from outside the graph).
+    //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
+    // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
+    bool hadError = false;
+    {
+        bool* hasWriter = m_allocator->scratch_alloc<bool>(next_id);   // some surviving pass writes id
+        bool* produced  = m_allocator->scratch_alloc<bool>(next_id);   // ...has written it so far, in order
+        bool* imported  = m_allocator->scratch_alloc<bool>(next_id);
+        defer { m_allocator->reset_scratch(); };
+        for (ResourceNode* r = m_resouces; r; r = r->next) imported[r->handle.id] = r->imported;
+        for (PassNode* p = m_passes; p; p = p->next)
+            for (uint32_t i = 0; i < p->accessCount; ++i)
+                if (access_is_write(p->accesses[i].type)) hasWriter[p->accesses[i].handle.id] = true;
+
+        for (PassNode* p = m_passes; p; p = p->next)
+            for (uint32_t i = 0; i < p->accessCount; ++i) {
+                uint32_t id = p->accesses[i].handle.id;
+                if (access_is_write(p->accesses[i].type)) { produced[id] = true; continue; }
+                if (id == 0 || imported[id] || produced[id] || !hasWriter[id]) continue;
+                ResourceNode* r = node(p->accesses[i].handle);
+                WGPUStringView rn = r ? r->name : WGPUStringView{};
+                std::printf("[RenderGraph] error: pass \"%.*s\" reads resource \"%.*s\" before any pass "
+                            "writes it -- declare a writer of \"%.*s\" first.\n",
+                            (int)p->name.length, p->name.data ? p->name.data : "",
+                            (int)rn.length, rn.data ? rn.data : "",
+                            (int)rn.length, rn.data ? rn.data : "");
+                hadError = true;
+            }
+    }
+    if (hadError) return false;
 
     // phase 3: frame-independent CPU analysis -> accumulate WGPU usage + resolve concrete sizes.
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
@@ -590,6 +609,7 @@ void RenderGraph::compile()
         // dead-resource culling. no separate resource liveness list needed.
     }
 
+    return true;
 }
 
 // debug-only: position of `target` in the pass list = its Mermaid node id. O(n) per call.
@@ -626,8 +646,7 @@ void RenderGraph::debug_print_mermaid()
             std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
                         pass_index(m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
                         pass_index(m_passes, dependent));
-        },
-        [](PassNode*, uint32_t){});   // a debug dump doesn't diagnose authoring bugs -- stay quiet
+        });
 
     std::fflush(stdout);
     // ponytail: pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a

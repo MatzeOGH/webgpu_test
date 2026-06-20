@@ -153,10 +153,12 @@ struct RenderGraph
     // CAVEAT -- pass declaration order matters (implicit SSA versioning, def-before-use): declare a
     // resource's WRITER before any pass that reads it. Each write starts a new version; each read
     // binds to the latest version declared so far. Passes that share no resource may be declared in
-    // any order. Reading a resource before any pass writes it does NOT get reordered for you --
-    // compile() emits a "read before its writer" warning and schedules the reader first, sampling
-    // uninitialized contents (e.g. a depth prepass writing depth must be added before a scene pass
-    // that samples it). Order-independent declaration would need multi-pass analysis; out of scope.
+    // any order. Reading a TRANSIENT resource before any pass writes it is an authoring error:
+    // compile() prints the offending pass/resource and returns false (do NOT realize()/execute() that
+    // frame) instead of silently scheduling the reader first against uninitialized contents (e.g. a
+    // depth prepass writing depth must be added before a scene pass that samples it). Reading an
+    // IMPORTED resource's pre-supplied value before an in-graph write is legal (a normal WAR).
+    // Order-independent declaration would need multi-pass analysis or explicit versions; out of scope.
     template<typename BuilderFn, typename ExecuteFn>
     void add_pass(WGPUStringView name, PassKind kind, BuilderFn&& setup, ExecuteFn&& executeFn)
     {
@@ -166,7 +168,9 @@ struct RenderGraph
         end_pass(builder);
     }
 
-    void compile();
+    // returns false if the graph has an ordering error (see the add_pass CAVEAT above): a pass reads a
+    // transient resource before any pass writes it. messages are printed; on false skip this frame.
+    bool compile();
 
     // create GPU resources from the usage + size that compile() worked out
     void realize(WGPUDevice device);
