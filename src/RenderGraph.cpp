@@ -680,20 +680,17 @@ ResourceNode* RenderGraph::node(ResourceHandle h)
 
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
-    ResourceNode* r = graph ? graph->node(h) : nullptr;
-    return r ? r->view : nullptr;
+    return graph->node(h)->view;
 }
 
 WGPUTexture PassContext::texture(ResourceHandle h) const
 {
-    ResourceNode* r = graph ? graph->node(h) : nullptr;
-    return r ? r->texture : nullptr;
+    return graph->node(h)->texture;
 }
 
 WGPUBuffer PassContext::buffer(ResourceHandle h) const
 {
-    ResourceNode* r = graph ? graph->node(h) : nullptr;
-    return r ? r->buffer : nullptr;
+    return graph->node(h)->buffer;
 }
 
 // create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
