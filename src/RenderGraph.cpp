@@ -151,7 +151,7 @@ struct GraphAllocator
     void reset()
     {
         used = 0;
-        scratchUsed = 0;   // backstop if a scratch_alloc's paired reset_scratch() defer was ever missed
+        scratchUsed = 0;
     }
 
     void reset_scratch()
@@ -414,7 +414,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
 {
     // per resource id (1..next_id-1): the pass holding the current version, and the readers of that
     // version not yet retired by a newer write.
-    PassNode**      currentProducer = alloc->scratch_alloc<PassNode*>(next_id);
+    PassNode** currentProducer = alloc->scratch_alloc<PassNode*>(next_id);
     NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_id);
     defer { alloc->reset_scratch(); };
 

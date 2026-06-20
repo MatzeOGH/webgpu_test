@@ -8,14 +8,16 @@
 // Pass order is derived from the accesses each frame; toggling SSAO with SPACE adds/drops the ssao pass
 // (and swaps compose<->present) -- the graph reshapes itself, the point of an immediate-mode graph.
 //
+// Camera: WASD to fly, hold left mouse to look around.
 // Keys: SPACE toggles SSAO. 1/2/3/4/5 = debug-blit a single buffer (albedo/normal/roughness/depth/ssao)
 // straight to the swapchain, 0 = back to the lit image. The debug pass writes the swapchain itself and
 // becomes the only sink, so the graph culls every pass not needed for that one image: views 1-4 leave
 // only gbuffer; view 5 leaves gbuffer+ssao; shadow/lighting/compose drop out.
 //
-// Matrix-free on purpose: camera + light are defined by a ray function in WGSL, so the gbuffer stores
-// LINEAR depth (t / FAR) and the lighting/ssao passes reconstruct the exact world hit as
-// CAM_POS + camera_ray(uv) * depth * FAR -- no projection/inverse matrices, no CPU math lib.
+// Matrix-free on purpose: the camera is a position + basis in the UBO (CPU drives it from WASD +
+// mouse-look) fed to a ray function in WGSL, so the gbuffer stores LINEAR depth (t / FAR) and the
+// lighting/ssao passes reconstruct the exact world hit as camPos + camera_ray(uv) * depth * FAR --
+// no projection/inverse matrices, no CPU math lib.
 //
 // Not a standalone TU: #included at the end of RenderGraph.cpp so it sees the internal node structs.
 
@@ -52,13 +54,17 @@ struct SceneUBO {
     float    spheres[kMaxSpheres][4];   // xyz = center, w = radius          (offset 0)
     float    lightDir[4];               // xyz = light TRAVEL direction      (offset 128)
     float    lightColor[4];             // rgb                               (offset 144)
-    float    resolution[2];             // gbuffer pixel size (for aspect)   (offset 160)
-    uint32_t count;                     // live sphere count                 (offset 168)
-    float    time;                      //                                   (offset 172)
-    uint32_t debugMode;                 // 0 = lit, 1..4 = blit a gbuffer img (offset 176)
-    uint32_t _pad[3];                   // round up to a 16-byte multiple    (offset 180)
+    float    camPos[4];                 // xyz = camera position             (offset 160)
+    float    camFwd[4];                 // xyz = camera forward (unit)       (offset 176)
+    float    camRight[4];               // xyz = camera right (unit)         (offset 192)
+    float    camUp[4];                  // xyz = camera up (unit)            (offset 208)
+    float    resolution[2];             // gbuffer pixel size (for aspect)   (offset 224)
+    uint32_t count;                     // live sphere count                 (offset 232)
+    float    time;                      //                                   (offset 236)
+    uint32_t debugMode;                 // 0 = lit, 1..5 = blit a debug image (offset 240)
+    uint32_t _pad[3];                   // round up to a 16-byte multiple    (offset 244)
 };
-static_assert(sizeof(SceneUBO) == 192, "SceneUBO must match the std140 WGSL Scene layout");
+static_assert(sizeof(SceneUBO) == 256, "SceneUBO must match the std140 WGSL Scene layout");
 
 // same shape as Renderer.cpp::createShaderModule
 WGPUShaderModule make_shader(WGPUDevice dev, WGPUStringView code)
@@ -96,6 +102,10 @@ struct Scene {
     spheres    : array<vec4f, 8>,
     lightDir   : vec4f,
     lightColor : vec4f,
+    camPos     : vec4f,
+    camFwd     : vec4f,
+    camRight   : vec4f,
+    camUp      : vec4f,
     resolution : vec2f,
     count      : u32,
     time       : f32,
@@ -108,22 +118,19 @@ struct Scene {
 const char* kCameraDefs = R"(
 const FAR         : f32 = 24.0;
 const FOV         : f32 = 1.0;                  // vertical, radians
-const CAM_POS     : vec3f = vec3f(0.0, 1.9, 5.5);
 const SCENE_CENTER: vec3f = vec3f(0.0, 0.0, 0.0);
 const LIGHT_ORTHO : f32 = 5.0;                  // half-extent of the shadow ortho frustum
 const LIGHT_DIST  : f32 = 12.0;                 // light "camera" distance from scene center
 
-// per-pixel primary ray for a camera at CAM_POS, looking -Z with a slight downward pitch.
+// per-pixel primary ray from the UBO camera basis (CPU drives pos/fwd/right/up from WASD + mouse).
 fn camera_ray(ndc : vec2f, aspect : f32) -> vec3f {
-    let t     = tan(0.5 * FOV);
-    let fwd   = normalize(vec3f(0.0, -0.38, -1.0));
-    let right = normalize(cross(fwd, vec3f(0.0, 1.0, 0.0)));
-    let up    = cross(right, fwd);
-    return normalize(fwd + right * (ndc.x * aspect * t) + up * (ndc.y * t));
+    let t = tan(0.5 * FOV);
+    return normalize(scene.camFwd.xyz + scene.camRight.xyz * (ndc.x * aspect * t)
+                                      + scene.camUp.xyz    * (ndc.y * t));
 }
 // exact world hit from the LINEAR depth (t / FAR) the gbuffer stored -- the deferred passes' anchor.
 fn world_from_depth(ndc : vec2f, aspect : f32, lin : f32) -> vec3f {
-    return CAM_POS + camera_ray(ndc, aspect) * (lin * FAR);
+    return scene.camPos.xyz + camera_ray(ndc, aspect) * (lin * FAR);
 }
 // orthonormal basis for the directional light's ortho "camera": columns right, up, forward(=travel).
 fn light_basis(dir : vec3f) -> mat3x3f {
@@ -187,10 +194,11 @@ struct GOut {
 };
 @fragment fn fs(in : VsOut) -> GOut {
     let aspect = scene.resolution.x / scene.resolution.y;
+    let ro = scene.camPos.xyz;
     let rd = camera_ray(in.ndc, aspect);
-    let t  = raymarch(CAM_POS, rd, FAR);
+    let t  = raymarch(ro, rd, FAR);
     if (t < 0.0) { discard; }                          // background: leave cleared, write no depth
-    let p = CAM_POS + rd * t;
+    let p = ro + rd * t;
     let n = estimate_normal(p);
     var albedo = vec3f(0.85, 0.30, 0.20);
     var rough  = 0.35;
@@ -250,7 +258,7 @@ fn sample_shadow(wp : vec3f) -> f32 {
     let albedo = textureLoad(gAlbedo, px, 0).rgb;
     let rough  = textureLoad(gRough,  px, 0).r;
     let L = normalize(-scene.lightDir.xyz);
-    let V = normalize(CAM_POS - wp);
+    let V = normalize(scene.camPos.xyz - wp);
     let H = normalize(L + V);
     let ndl  = max(dot(n, L), 0.0);
     let sh   = sample_shadow(wp);
@@ -263,9 +271,9 @@ fn sample_shadow(wp : vec3f) -> f32 {
 
 // ssao compute: hemisphere AO from reconstructed positions (matrix-free, screen-space spiral taps).
 const char* kSsaoBody = R"(
-@group(0) @binding(0) var gDepth  : texture_depth_2d;
-@group(0) @binding(1) var gNormal : texture_2d<f32>;
-@group(0) @binding(2) var aoOut   : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var gDepth  : texture_depth_2d;
+@group(0) @binding(2) var gNormal : texture_2d<f32>;
+@group(0) @binding(3) var aoOut   : texture_storage_2d<rgba8unorm, write>;
 
 fn hash12(p : vec2f) -> f32 {
     var p3 = fract(vec3f(p.xyx) * 0.1031);
@@ -596,8 +604,8 @@ int main()
     WGPURenderPipeline lightingPipe = wgpuDeviceCreateRenderPipeline(dev, &lightPD);
     wgpuShaderModuleRelease(lightSM);
 
-    // ssao: compute, reconstructs world positions from gbuffer depth + normal.
-    WGPUShaderModule ssaoSM = make_shader(dev, std::string(kCameraDefs) + kSsaoBody);
+    // ssao: compute, reconstructs world positions from gbuffer depth + normal (needs the UBO camera).
+    WGPUShaderModule ssaoSM = make_shader(dev, std::string(kSceneDecl) + kCameraDefs + kSsaoBody);
     WGPUComputePipelineDescriptor ssaoPD{
         .label   = WEBGPU_STR("ssao pipeline"),
         .compute = { .module = ssaoSM, .entryPoint = WEBGPU_STR("main") },
@@ -661,6 +669,15 @@ int main()
     int  shownDebug = -1;
     bool running    = true;
     const char* kDebugName[] = { "off", "albedo", "normal", "roughness", "depth", "ssao" };
+
+    // free-fly camera: WASD moves, left-drag rotates (yaw/pitch). Inits to the old fixed view.
+    float  camPos[3] = { 0.0f, 1.9f, 5.5f };
+    float  camYaw    = 0.0f;     // 0 -> looking down -Z
+    float  camPitch  = -0.36f;   // slight downward tilt
+    bool   dragging  = false;
+    double prevTime  = getTime();
+    const float kMouseSens = 0.0025f, kMoveSpeed = 4.0f;
+
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -676,10 +693,40 @@ int main()
                 debugMode = (e.key.scancode == SDL_SCANCODE_0) ? 0 : (int)(e.key.scancode - SDL_SCANCODE_1) + 1;
                 std::printf("debug: %s\n", kDebugName[debugMode]);
             }
+            else if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
+                dragging = true;
+                SDL_SetWindowRelativeMouseMode(window, true);   // capture + hide cursor while looking
+            }
+            else if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT) {
+                dragging = false;
+                SDL_SetWindowRelativeMouseMode(window, false);
+            }
+            else if (e.type == SDL_EVENT_MOUSE_MOTION && dragging) {
+                camYaw   += e.motion.xrel * kMouseSens;
+                camPitch -= e.motion.yrel * kMouseSens;
+                const float lim = 1.5533f;                       // ~89 deg, avoid gimbal flip
+                camPitch = camPitch >  lim ?  lim : (camPitch < -lim ? -lim : camPitch);
+            }
             else if (e.type == SDL_EVENT_WINDOW_RESIZED) {
                 cfg.width = (uint32_t)e.window.data1; cfg.height = (uint32_t)e.window.data2;
                 wgpuSurfaceConfigure(surf, &cfg);
             }
+        }
+
+        // camera basis from yaw/pitch, then WASD fly-movement (frame-rate independent via dt).
+        double now = getTime();
+        float  dt  = (float)(now - prevTime);
+        prevTime   = now;
+        float cp = cosf(camPitch), sp = sinf(camPitch), sy = sinf(camYaw), cy = cosf(camYaw);
+        float fwd[3]   = { cp * sy, sp, -cp * cy };
+        float right[3] = { cy, 0.0f, sy };
+        float up[3]    = { -sy * sp, cp, cy * sp };
+        {
+            auto ks = SDL_GetKeyboardState(nullptr);   // const bool* (SDL3); index with scancodes
+            float mv = kMoveSpeed * dt;
+            float f = (ks[SDL_SCANCODE_W] ? mv : 0.0f) - (ks[SDL_SCANCODE_S] ? mv : 0.0f);
+            float r = (ks[SDL_SCANCODE_D] ? mv : 0.0f) - (ks[SDL_SCANCODE_A] ? mv : 0.0f);
+            for (int i = 0; i < 3; ++i) camPos[i] += fwd[i] * f + right[i] * r;
         }
 
         WGPUSurfaceTexture st{};
@@ -774,18 +821,20 @@ int main()
             const uint32_t gx = (cfg.width + 7) / 8, gy = (cfg.height + 7) / 8;
             rg->add_pass(WEBGPU_STR("ssao"), PassKind::Compute,
                 [&](GraphBuilder& b) {
+                    b.uniform(sceneUbo);                 // camera basis for world reconstruction
                     b.sampled(gDepth);
                     b.sampled(gNormal);
                     b.storage_write(aoTex);
                 },
-                [dev, ssaoPipe, gDepth, gNormal, aoTex, gx, gy](PassContext& ctx) {
+                [dev, ssaoPipe, sceneUbo, gDepth, gNormal, aoTex, gx, gy](PassContext& ctx) {
                     WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(ssaoPipe, 0);
-                    WGPUBindGroupEntry e[3] = {
-                        { .binding = 0, .textureView = ctx.view(gDepth) },
-                        { .binding = 1, .textureView = ctx.view(gNormal) },
-                        { .binding = 2, .textureView = ctx.view(aoTex) },
+                    WGPUBindGroupEntry e[4] = {
+                        { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                        { .binding = 1, .textureView = ctx.view(gDepth) },
+                        { .binding = 2, .textureView = ctx.view(gNormal) },
+                        { .binding = 3, .textureView = ctx.view(aoTex) },
                     };
-                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 4, .entries = e };
                     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
                     wgpuComputePassEncoderSetPipeline(ctx.compute, ssaoPipe);
                     wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
@@ -961,6 +1010,7 @@ int main()
         float ln = sqrtf(lx * lx + ly * ly + lz * lz);
         sb.lightDir[0] = lx / ln; sb.lightDir[1] = ly / ln; sb.lightDir[2] = lz / ln;
         sb.lightColor[0] = 1.0f; sb.lightColor[1] = 0.96f; sb.lightColor[2] = 0.9f;
+        for (int i = 0; i < 3; ++i) { sb.camPos[i] = camPos[i]; sb.camFwd[i] = fwd[i]; sb.camRight[i] = right[i]; sb.camUp[i] = up[i]; }
         sb.resolution[0] = (float)cfg.width; sb.resolution[1] = (float)cfg.height;
         sb.time = t;
         sb.debugMode = (uint32_t)debugMode;
