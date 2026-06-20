@@ -41,17 +41,22 @@ struct ResourceHandle
     uint32_t id{};
 };
 
-// how a pass touches a resource. type -> read/write (deps) and -> WGPU usage flags
+// how a pass touches a resource -> read/write (hazards) and WGPU usage flags.
+// comment column = WebGPU internal usage (usage-scope class) -> hazard -> usage bit.
 enum struct AccessType : uint8_t
 {
-    ColorAttachment,         // write
-    DepthStencilAttachment,  // read+write (treat as write for deps for now)
-    Sampled,                 // read
-    StorageRead,             // read
-    StorageWrite,            // write
-    Uniform,                 // read
-    CopySrc,                 // read  (transfer source)
-    CopyDst,                 // write (transfer destination)
+    ColorAttachment,         // attachment      write   tex RenderAttachment
+    DepthStencilAttachment,  // attachment      write   tex RenderAttachment  (depth/stencil test + write)
+    DepthStencilReadOnly,    // attachment-read read    tex RenderAttachment  (test only, depthReadOnly; no write hazard)
+    Sampled,                 // constant        read    tex TextureBinding
+    StorageRead,             // storage-read    read    tex StorageBinding / buf Storage
+    StorageWrite,            // storage         write   tex StorageBinding / buf Storage
+    Uniform,                 // constant        read    buf Uniform (+CopyDst host-upload affordance)
+    CopySrc,                 // copy            read    tex/buf CopySrc
+    CopyDst,                 // copy            write   tex/buf CopyDst
+    Vertex,                  // input           read    buf Vertex
+    Index,                   // input           read    buf Index
+    Indirect,                // input           read    buf Indirect
 };
 
 struct ResourceAccess
@@ -87,10 +92,19 @@ struct PassContext
 
 struct GraphBuilder
 {
+    // single primitive every helper below is a thin wrapper over. load/store/clear/clearDepth only
+    // matter for the two attachment AccessTypes; leave them defaulted for every other access.
+    void use(ResourceHandle handle, AccessType type,
+             WGPULoadOp load = WGPULoadOp_Undefined, WGPUStoreOp store = WGPUStoreOp_Undefined,
+             WGPUColor clear = {}, float clearDepth = {});
+
     // color attachment
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1});
     // depth stencil attachment
     void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f);
+    // depth stencil attachment, read-only (depth/stencil test, no write -- e.g. lighting depth-testing
+    // a prepass depth). no load/store/clear: WebGPU requires depthLoadOp/StoreOp Undefined when read-only.
+    void depth_stencil_read_only(ResourceHandle handle);
     // sampled resouces
     void sampled(ResourceHandle handle);
     void storage_read(ResourceHandle handle);
@@ -100,6 +114,10 @@ struct GraphBuilder
     // transfer (copy) source / destination
     void copy_src(ResourceHandle handle);
     void copy_dst(ResourceHandle handle);
+    // buffer-only: vertex/index/indirect-args
+    void vertex_buffer(ResourceHandle handle);
+    void index_buffer(ResourceHandle handle);
+    void indirect_buffer(ResourceHandle handle);
 
     PassNode* m_new_pass{};
 };
@@ -132,6 +150,13 @@ struct RenderGraph
     ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
 
 
+    // CAVEAT -- pass declaration order matters (implicit SSA versioning, def-before-use): declare a
+    // resource's WRITER before any pass that reads it. Each write starts a new version; each read
+    // binds to the latest version declared so far. Passes that share no resource may be declared in
+    // any order. Reading a resource before any pass writes it does NOT get reordered for you --
+    // compile() emits a "read before its writer" warning and schedules the reader first, sampling
+    // uninitialized contents (e.g. a depth prepass writing depth must be added before a scene pass
+    // that samples it). Order-independent declaration would need multi-pass analysis; out of scope.
     template<typename BuilderFn, typename ExecuteFn>
     void add_pass(WGPUStringView name, PassKind kind, BuilderFn&& setup, ExecuteFn&& executeFn)
     {

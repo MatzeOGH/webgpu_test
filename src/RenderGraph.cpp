@@ -2,21 +2,20 @@
 #include <cstddef>
 #include <cassert>
 #include <cstdint>
-#include <new>
 #include <utility>
 #include <vector>
 #include <webgpu/webgpu.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "AlpUtils.h"
 
 
 namespace RG{
 
-
-
-// arena allocator to not fragment the heap during graph construction
-// TODO: implement scratch arena for all resouces that life inside of the rendergraph
+// arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
+// permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
+// for compile()-local temporaries, reset per-scope via defer (AlpUtils.h) instead of calloc/free.
 struct GraphAllocator
 {
     // Pointer to the base memory block
@@ -25,6 +24,8 @@ struct GraphAllocator
     size_t used{};
     // Total capacity in bytes
     size_t capacity{};
+    // Offset from the top of the buffer to the next free scratch byte (grows downward).
+    size_t scratchUsed{};
 
     // alignment must be a power of two
     static constexpr size_t align_up(size_t value, size_t alignment)
@@ -37,7 +38,7 @@ struct GraphAllocator
     {
         const size_t offset = align_up(used, align);
 
-        if (offset + size > capacity)
+        if (offset + size > capacity - scratchUsed)
         {
             assert(false && "GraphAllocator OOM");
             return nullptr;
@@ -48,24 +49,71 @@ struct GraphAllocator
         return p;
     }
 
+    // Raw aligned allocation from the TOP of the buffer, growing scratchUsed down -- short-lived,
+    // compile()-local scratch. Pair every call site with `defer { <allocator>->reset_scratch(); };`
+    // right after the scratch allocations in that scope.
+    void* scratch_alloc_raw(size_t size, size_t align)
+    {
+        if (size > capacity - scratchUsed)
+        {
+            assert(false && "GraphAllocator scratch OOM");
+            return nullptr;
+        }
+
+        size_t rawTop = (capacity - scratchUsed - size) & ~(align - 1);   // round start down to align
+        size_t newScratchUsed = capacity - rawTop;
+
+        if (newScratchUsed > capacity - used)   // would cross into the live front/permanent region
+        {
+            assert(false && "GraphAllocator scratch OOM");
+            return nullptr;
+        }
+
+        scratchUsed = newScratchUsed;
+        return base + rawTop;
+    }
+
+    // shared by make<T>/scratch_make<T>: placement-new construct T in raw storage.
+    template<typename T, typename... Args>
+    static T* construct(void* m, Args&&... args)
+    {
+        return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr;
+    }
+
+    // shared by alloc<T>/scratch_alloc<T>: zero `count` T's worth of raw storage and reinterpret.
+    template<typename T>
+    static T* zero(void* m, size_t count)
+    {
+        if (m) std::memset(m, 0, sizeof(T) * count);
+        return static_cast<T*>(m);
+    }
+
     // Allocate + construct
     template<typename T, typename... Args>
     T* make(Args&&... args)
     {
-        void* m = alloc_raw(sizeof(T), alignof(T));
-        return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr;
+        return construct<T>(alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
+    }
+
+    // Allocate + construct in scratch.
+    template<typename T, typename... Args>
+    T* scratch_make(Args&&... args)
+    {
+        return construct<T>(scratch_alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
     }
 
     // Allocate zeroed POD storage
     template<typename T>
     T* alloc(size_t count = 1)
     {
-        void* m = alloc_raw(sizeof(T) * count, alignof(T));
+        return zero<T>(alloc_raw(sizeof(T) * count, alignof(T)), count);
+    }
 
-        if (m)
-            std::memset(m, 0, sizeof(T) * count);
-
-        return static_cast<T*>(m);
+    // Allocate zeroed POD scratch storage (calloc replacement).
+    template<typename T>
+    T* scratch_alloc(size_t count = 1)
+    {
+        return zero<T>(scratch_alloc_raw(sizeof(T) * count, alignof(T)), count);
     }
 
     // Copy a string view into allocator-owned storage.
@@ -91,6 +139,12 @@ struct GraphAllocator
     void reset()
     {
         used = 0;
+        scratchUsed = 0;   // backstop if a scratch_alloc's paired reset_scratch() defer was ever missed
+    }
+
+    void reset_scratch()
+    {
+        scratchUsed = 0;
     }
 };
 
@@ -170,7 +224,6 @@ GraphAllocator* create_allocator(){
     GraphAllocator* allocator = new GraphAllocator;
     size_t capacity = 1u << 20;// alloc 1 MB
     allocator->base = (uint8_t*)malloc(capacity);
-    allocator->used = 0u;
     allocator->capacity = capacity;
     return allocator;
 }
@@ -210,6 +263,10 @@ static void list_append(T** head, T* newNode)
 }
 
 
+// the exclusive-write set (WebGPU usage-scope `attachment`/`storage`). everything else is a read
+// (`input`/`constant`/`storage-read`/`attachment-read`). NOTE: DepthStencilReadOnly is deliberately
+// absent -- read-only depth is `attachment-read`, a read; adding it here would reintroduce the false
+// write hazard this distinction exists to remove.
 static bool access_is_write(AccessType t)
 {
     return t == AccessType::ColorAttachment
@@ -346,9 +403,10 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
     // per resource id (1..next_id-1): the pass holding the current version, the readers of that
     // version not yet retired by a newer write, and the first pass (if any) that read it before any
     // writer existed.
-    PassNode**      currentProducer = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
-    NodeAdjacency** pendingReaders  = (NodeAdjacency**)std::calloc(next_id, sizeof(NodeAdjacency*));
-    PassNode**      earlyReader     = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
+    PassNode**      currentProducer = alloc->scratch_alloc<PassNode*>(next_id);
+    NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_id);
+    PassNode**      earlyReader     = alloc->scratch_alloc<PassNode*>(next_id);
+    defer { alloc->reset_scratch(); };
 
     for (PassNode* p = head; p; p = p->next)
         for (uint32_t i = 0; i < p->accessCount; ++i) {
@@ -368,7 +426,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
                 if (!currentProducer[id]) { if (!earlyReader[id]) earlyReader[id] = p; }  // read before any writer
                 else if (currentProducer[id] != p) onEdge(p, currentProducer[id], id, HazardKind::RAW);
                 // register as a pending reader of the current version (for a future write's WAR).
-                NodeAdjacency* link = alloc->make<NodeAdjacency>();
+                NodeAdjacency* link = alloc->scratch_make<NodeAdjacency>();   // transient: dead at function return
                 link->pass = p; link->next = pendingReaders[id]; pendingReaders[id] = link;
             }
         }
@@ -381,9 +439,6 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
         if (earlyReader[id] && currentProducer[id])
             onEarlyRead(earlyReader[id], id);
 
-    std::free(currentProducer);
-    std::free(pendingReaders);
-    std::free(earlyReader);
     // both self-guards above are load-bearing: read-then-write of one handle in a single pass would
     // WAR-self-edge; write-then-write would WAW-self-edge. every edge points from a later- to an
     // earlier-visited pass, so adjacency is acyclic by construction (no compile()-made cycles).
@@ -454,18 +509,20 @@ void RenderGraph::compile()
     // phase 2: dead-node removal + topo sort, fused into one DFS seeded from sinks.
     {
         // sinks = passes writing an imported resource. accesses store only handle.id, so flatten
-        // the imported flags into an id-indexed table first (same calloc-over-next_id trick as
-        // phase 1's lastWriter).
-        bool* imported = (bool*)std::calloc(next_id, sizeof(bool));
+        // the imported flags into an id-indexed table first (same scratch_alloc-over-next_id trick
+        // as phase 1's lastWriter).
+        bool* imported = m_allocator->scratch_alloc<bool>(next_id);
         for (ResourceNode* r = m_resouces; r; r = r->next)
             imported[r->handle.id] = r->imported;
 
         // topo into a transient array, then relink the intrusive list into execution order. The
-        // result lives in m_passes itself; the array is just DFS scratch, freed here.
+        // result lives in m_passes itself; the array is just DFS scratch, reclaimed by the
+        // deferred reset_scratch() below.
         uint32_t N = 0;
         for (PassNode* p = m_passes; p; p = p->next) ++N;
 
-        PassNode** order = (PassNode**)std::calloc(N, sizeof(PassNode*));
+        PassNode** order = m_allocator->scratch_alloc<PassNode*>(N);
+        defer { m_allocator->reset_scratch(); };
         uint32_t count = 0;
         for (PassNode* p = m_passes; p; p = p->next)
             if (is_sink(p, imported))
@@ -477,8 +534,6 @@ void RenderGraph::compile()
         if (count) order[count - 1]->next = nullptr;
         m_passes = count ? order[0] : nullptr;
 
-        std::free(order);
-        std::free(imported);
         // ponytail: transient array as DFS scratch — can't sort a one-field intrusive list in
         // place (a dep emitted before the driver reaches it clobbers its `next`, dropping
         // disconnected nodes). recursive DFS, no cycle detection: graph is author-acyclic; add an
@@ -488,8 +543,9 @@ void RenderGraph::compile()
     // phase 3: frame-independent CPU analysis -> accumulate WGPU usage + resolve concrete sizes.
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
     {
-        // id->node table, same calloc-over-next_id trick as phases 1/2.
-        ResourceNode** byId = (ResourceNode**)std::calloc(next_id, sizeof(ResourceNode*));
+        // id->node table, same scratch_alloc-over-next_id trick as phases 1/2.
+        ResourceNode** byId = m_allocator->scratch_alloc<ResourceNode*>(next_id);
+        defer { m_allocator->reset_scratch(); };
         for (ResourceNode* r = m_resouces; r; r = r->next) byId[r->handle.id] = r;
 
         for (PassNode* p = m_passes; p; p = p->next)          // m_passes == surviving (post-cull) passes
@@ -498,7 +554,8 @@ void RenderGraph::compile()
                 if (!r) continue;
                 switch (p->accesses[i].type) {
                   case AccessType::ColorAttachment:
-                  case AccessType::DepthStencilAttachment: r->texUsage |= WGPUTextureUsage_RenderAttachment; break;
+                  case AccessType::DepthStencilAttachment:
+                  case AccessType::DepthStencilReadOnly:   r->texUsage |= WGPUTextureUsage_RenderAttachment; break;
                   case AccessType::Sampled:                r->texUsage |= WGPUTextureUsage_TextureBinding;  break;
                   case AccessType::StorageRead:
                   case AccessType::StorageWrite:
@@ -506,10 +563,21 @@ void RenderGraph::compile()
                       if (r->kind == ResourceNode::Kind::Texture) r->texUsage |= WGPUTextureUsage_StorageBinding;
                       else                                        r->bufUsage |= WGPUBufferUsage_Storage;
                       break;
+                  // CopyDst here is a deliberate host-upload affordance: the graph can't see a host-side
+                  // wgpuQueueWriteBuffer, so uniform buffers get CopyDst by default (matches Renderer.cpp).
                   case AccessType::Uniform: r->bufUsage |= WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst; break;
-                  // ponytail: copy accesses map to texture usage only; buffer copy not needed yet
-                  case AccessType::CopySrc: r->texUsage |= WGPUTextureUsage_CopySrc; break;
-                  case AccessType::CopyDst: r->texUsage |= WGPUTextureUsage_CopyDst; break;
+                  // copy src/dst are kind-aware: a buffer copy needs the buffer-usage bit, not the texture one.
+                  case AccessType::CopySrc:
+                      if (r->kind == ResourceNode::Kind::Texture) r->texUsage |= WGPUTextureUsage_CopySrc;
+                      else                                        r->bufUsage |= WGPUBufferUsage_CopySrc;
+                      break;
+                  case AccessType::CopyDst:
+                      if (r->kind == ResourceNode::Kind::Texture) r->texUsage |= WGPUTextureUsage_CopyDst;
+                      else                                        r->bufUsage |= WGPUBufferUsage_CopyDst;
+                      break;
+                  case AccessType::Vertex:   r->bufUsage |= WGPUBufferUsage_Vertex;   break;
+                  case AccessType::Index:    r->bufUsage |= WGPUBufferUsage_Index;    break;
+                  case AccessType::Indirect: r->bufUsage |= WGPUBufferUsage_Indirect; break;
                 }
             }
 
@@ -518,7 +586,6 @@ void RenderGraph::compile()
         for (ResourceNode* r = m_resouces; r; r = r->next)
             if (r->kind == ResourceNode::Kind::Texture) resolve_size(r, byId);
 
-        std::free(byId);
         // ponytail: usage==0 here == untouched by a live pass -> future realize() skips it = free
         // dead-resource culling. no separate resource liveness list needed.
     }
@@ -674,12 +741,13 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                         .storeOp    = a.storeOp,
                         .clearValue = a.clearColor,
                     };
-                } else if (a.type == AccessType::DepthStencilAttachment) {
+                } else if (a.type == AccessType::DepthStencilAttachment || a.type == AccessType::DepthStencilReadOnly) {
                     depth = WGPURenderPassDepthStencilAttachment{
                         .view            = r->view,
                         .depthLoadOp     = a.loadOp,
                         .depthStoreOp    = a.storeOp,
                         .depthClearValue = a.clearDepth,
+                        .depthReadOnly   = a.type == AccessType::DepthStencilReadOnly,
                         // stencil ops left Undefined -> depth-only formats (e.g. Depth32Float)
                     };
                     hasDepth = true;
@@ -715,55 +783,75 @@ void RenderGraph::release_resources()
     }
 }
 
-// records one access on the pass currently being built. load/store/clear are only meaningful for
-// attachment accesses; the read/storage helpers below leave them at their (ignored) defaults.
-static void push_access(PassNode* p, ResourceHandle h, AccessType t,
-                        WGPULoadOp load = {}, WGPUStoreOp store = {},
-                        WGPUColor clearColor = {}, float clearDepth = {})
+// records one access on the pass currently being built -- the one primitive every GraphBuilder
+// helper below wraps. load/store/clear are only meaningful for the two attachment AccessTypes;
+// every other call site leaves them at their (ignored) defaults.
+void GraphBuilder::use(ResourceHandle handle, AccessType type,
+                       WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth)
 {
-    if (p && p->accessCount < PassNode::kMaxAccess)
-        p->accesses[p->accessCount++] = { h, t, load, store, clearColor, clearDepth };
+    if (m_new_pass && m_new_pass->accessCount < PassNode::kMaxAccess)
+        m_new_pass->accesses[m_new_pass->accessCount++] = { handle, type, load, store, clear, clearDepth };
     // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it
 }
 
 void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear)
 {
-    push_access(m_new_pass, handle, AccessType::ColorAttachment, load, store, clear);
+    use(handle, AccessType::ColorAttachment, load, store, clear);
 }
 
 void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth)
 {
-    push_access(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth);
+    use(handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth);
+}
+
+void GraphBuilder::depth_stencil_read_only(ResourceHandle handle)
+{
+    use(handle, AccessType::DepthStencilReadOnly);   // load/store/clear default Undefined/{} -- required when read-only
 }
 
 void GraphBuilder::sampled(ResourceHandle handle)
 {
-    push_access(m_new_pass, handle, AccessType::Sampled);
+    use(handle, AccessType::Sampled);
 }
 
 void GraphBuilder::storage_read(ResourceHandle handle)
 {
-    push_access(m_new_pass, handle, AccessType::StorageRead);
+    use(handle, AccessType::StorageRead);
 }
 
 void GraphBuilder::storage_write(ResourceHandle handle)
 {
-    push_access(m_new_pass, handle, AccessType::StorageWrite);
+    use(handle, AccessType::StorageWrite);
 }
 
 void GraphBuilder::uniform(ResourceHandle handle)
 {
-    push_access(m_new_pass, handle, AccessType::Uniform);
+    use(handle, AccessType::Uniform);
 }
 
 void GraphBuilder::copy_src(ResourceHandle handle)
 {
-    push_access(m_new_pass, handle, AccessType::CopySrc);
+    use(handle, AccessType::CopySrc);
 }
 
 void GraphBuilder::copy_dst(ResourceHandle handle)
 {
-    push_access(m_new_pass, handle, AccessType::CopyDst);
+    use(handle, AccessType::CopyDst);
+}
+
+void GraphBuilder::vertex_buffer(ResourceHandle handle)
+{
+    use(handle, AccessType::Vertex);
+}
+
+void GraphBuilder::index_buffer(ResourceHandle handle)
+{
+    use(handle, AccessType::Index);
+}
+
+void GraphBuilder::indirect_buffer(ResourceHandle handle)
+{
+    use(handle, AccessType::Indirect);
 }
 
 } // RG

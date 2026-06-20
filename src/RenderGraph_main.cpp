@@ -9,6 +9,8 @@
 // changes how many passes exist that frame -- the point of an immediate-mode graph.
 
 #include "RenderGraph.h"
+#include <cstdio>
+#include <ostream>
 #include <webgpu/webgpu_cpp.h>   // C++ wrappers, only for instance/surface/device bring-up
 #include <cmath>                 // sin/cos for the animated edge color
 
@@ -346,10 +348,13 @@ int main()
 
         // multi-writer smoke test (SSA versioning): a depth buffer written by two passes (v1 then
         // v2 -> WAW edge) and read by scene/compose -> RAW; scene's read of v1 makes depth.main's
-        // overwrite a WAR. the two writers are graph-shape-only no-op Transfer passes: execute()
-        // auto-wires a depth attachment for *graphics* passes (which would then need a depth-enabled
-        // pipeline), but skips that for Transfer -- so this drives compile()'s versioning without
-        // touching the render pipelines. a real renderer would z-prepass / draw geometry here.
+        // overwrite a WAR. a third pass ("lighting") reads v1 *read-only* (depth_stencil_read_only)
+        // to prove the read-only path: it gets no false write hazard vs scene (both read v1), takes a
+        // RAW edge to the prepass, and a WAR (not WAW) edge from depth.main -- so depth stays a 2-version
+        // chain. the writers/reader are graph-shape-only no-op Transfer passes: execute() auto-wires a
+        // depth attachment for *graphics* passes (which would then need a depth-enabled pipeline), but
+        // skips that for Transfer -- so this drives compile()'s versioning without touching the render
+        // pipelines. a real renderer would z-prepass / draw geometry here.
         auto depth = rg->create_image(WEBGPU_STR("depth"), {
             .dimension = WGPUTextureDimension_2D, .format = WGPUTextureFormat_Depth32Float,
             .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
@@ -368,9 +373,16 @@ int main()
                 wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
             });
 
+        rg->add_pass(WEBGPU_STR("lighting"), PassKind::Transfer,
+            [&](GraphBuilder& b) {
+                b.depth_stencil_read_only(depth);                        // reads depth v1 read-only (attachment-read; NOT a write)
+                b.color(sceneColor, WGPULoadOp_Load, WGPUStoreOp_Store); // writes sceneColor v2 -> keeps pass alive to a sink
+            },
+            [](PassContext&){});                                         // Transfer: execute() skips attachment wiring (no depth pipeline needed)
+
         rg->add_pass(WEBGPU_STR("depth.main"), PassKind::Transfer,
             [&](GraphBuilder& b) { b.depth_stencil(depth, WGPULoadOp_Load, WGPUStoreOp_Store, 1.0f); },
-            [](PassContext&){});      // writes depth v2 -> WAW edge to depth.prepass, WAR edge to scene's read of v1
+            [](PassContext&){});      // writes depth v2 -> WAW to depth.prepass; WAR to scene's and lighting's reads of v1
 
         ResourceHandle ubo{};   // only created on the glow path; needed after realize() to upload Params
         if (glow) {
