@@ -170,6 +170,8 @@ struct RenderGraph
 
     // returns false if the graph has an ordering error (see the add_pass CAVEAT above): a pass reads a
     // transient resource before any pass writes it. messages are printed; on false skip this frame.
+    // that check is a dev aid compiled out in release (NDEBUG) like assert -- see RG_VALIDATE in the
+    // .cpp; a release build skips the per-frame walk and compile() always returns true.
     bool compile();
 
     // create GPU resources from the usage + size that compile() worked out

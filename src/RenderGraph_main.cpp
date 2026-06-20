@@ -104,7 +104,10 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 {
     using namespace RG;
     auto noop = [](PassContext&){};                 // bodies never run -- compile() doesn't invoke them
-    std::printf("[rg-test] compile()-only edge cases:\n");
+    // ordering errors are reported only when validation is compiled in (RG_VALIDATE); a release build
+    // (NDEBUG) strips the check, so compile() can't fail and the error cases below return true instead.
+    const bool errCaught = (RG_VALIDATE != 0);
+    std::printf("[rg-test] compile()-only edge cases (validation %s):\n", errCaught ? "ON" : "OFF");
 
     // OK: producer declared before its consumer.
     {
@@ -123,7 +126,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("consumer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x);  b.color(out); }, noop);
         g->add_pass(WEBGPU_STR("producer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_write(x); b.color(out); }, noop);
-        rg_expect(g->compile(), false, "consumer before producer (transient)");
+        rg_expect(g->compile(), !errCaught, "consumer before producer (transient)");
     }
 
     // OK: a transient read but never written by any pass (host-uploaded uniform) -- hasWriter exemption.
@@ -163,7 +166,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("rmw"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x); b.storage_write(x); b.color(out); }, noop);
-        rg_expect(g->compile(), false, "within-pass read-then-write (unproduced)");
+        rg_expect(g->compile(), !errCaught, "within-pass read-then-write (unproduced)");
     }
 
     std::printf("[rg-test] %s (%d failure%s)\n\n",

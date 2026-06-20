@@ -81,6 +81,11 @@ now moot for this code path.
   `false` before phase 3, so the caller never realizes/executes a misordered graph; `compile()`'s return
   type is `bool`. This lives in `compile()`, not the sweep, because it must see the *final* schedule
   (surviving passes only) to be culling-correct and to catch every surviving reader, not just the first.
+- The whole post-cull pass is gated by **`RG_VALIDATE`** (defaults to `0` under `NDEBUG`, `1` otherwise —
+  the same strip-in-release behaviour as `assert`, but a separate macro so the OOM-style "assert vanishes"
+  trap doesn't apply elsewhere). When off, the per-frame walk is compiled out entirely and `compile()`
+  always returns `true` — a shipping build assumes author-valid graphs. Predefine `RG_VALIDATE=1` to keep
+  it in a release build, or `=0` to drop it from a debug build.
 - `debug_print_mermaid()` reuses the **same** `sweep_resource_versions` helper, emitting one labelled
   edge per discovered hazard (RAW unlabelled; WAW/WAR tagged), so the dump matches the real graph exactly
   — it does **not** keep a separate last-writer-wins table.

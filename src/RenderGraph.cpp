@@ -10,6 +10,18 @@
 #include <cstring>
 #include "AlpUtils.h"
 
+// Graph validation -- the post-cull "reads a resource before any pass writes it" check in compile().
+// It is a per-frame development aid; like assert it is compiled OUT in release builds (NDEBUG), so a
+// shipping build assumes author-valid graphs and compile() always returns true. Predefine RG_VALIDATE
+// to 1/0 to force it on/off independently of NDEBUG.
+#ifndef RG_VALIDATE
+#  ifdef NDEBUG
+#    define RG_VALIDATE 0
+#  else
+#    define RG_VALIDATE 1
+#  endif
+#endif
+
 
 namespace RG{
 
@@ -524,14 +536,16 @@ bool RenderGraph::compile()
         // `onstack` flag (+2 lines) only if a cyclic graph ever needs catching.
     }
 
-    // post-cull validation: over the FINAL schedule (m_passes is now culled + in execution order), a
-    // read of a TRANSIENT resource that no earlier pass has produced is an authoring error -- the reader
-    // would sample uninitialized contents (its writer was declared after it, or culled). walking the
-    // surviving passes makes this culling-correct and catches every surviving reader, not just the first.
+#if RG_VALIDATE
+    // post-cull validation (development aid; compiled out when RG_VALIDATE==0 -- e.g. release/NDEBUG --
+    // exactly like assert, so a shipping build pays none of this per-frame walk). Over the FINAL schedule
+    // (m_passes is now culled + in execution order), a read of a TRANSIENT resource that no earlier pass
+    // has produced is an authoring error -- the reader would sample uninitialized contents (its writer was
+    // declared after it, or culled). walking the surviving passes makes this culling-correct and catches
+    // every surviving reader, not just the first.
     //   imported resources                        -> exempt (their value comes from outside the graph).
     //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
     // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
-    bool hadError = false;
     {
         bool* hasWriter = m_allocator->scratch_alloc<bool>(next_id);   // some surviving pass writes id
         bool* produced  = m_allocator->scratch_alloc<bool>(next_id);   // ...has written it so far, in order
@@ -542,6 +556,7 @@ bool RenderGraph::compile()
             for (uint32_t i = 0; i < p->accessCount; ++i)
                 if (access_is_write(p->accesses[i].type)) hasWriter[p->accesses[i].handle.id] = true;
 
+        bool hadError = false;
         for (PassNode* p = m_passes; p; p = p->next)
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 uint32_t id = p->accesses[i].handle.id;
@@ -556,8 +571,9 @@ bool RenderGraph::compile()
                             (int)rn.length, rn.data ? rn.data : "");
                 hadError = true;
             }
+        if (hadError) return false;
     }
-    if (hadError) return false;
+#endif
 
     // phase 3: frame-independent CPU analysis -> accumulate WGPU usage + resolve concrete sizes.
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
