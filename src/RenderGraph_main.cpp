@@ -1,18 +1,30 @@
-// Windowed sample for the render graph — immediate mode.
+// Windowed sample for the render graph -- immediate mode, the WHOLE graph rebuilt every frame.
+// A small DEFERRED renderer driven entirely by the graph's read/write tracking:
+//   gbuffer  (graphics, MRT + depth) : raymarch an SDF (spheres in a UBO) -> albedo / normal / roughness / depth
+//   shadow   (graphics, depth-only)  : raymarch the same SDF from a directional light -> depth-only shadow map
+//   ssao     (compute)               : screen-space AO from gbuffer depth + normal          [SPACE toggles]
+//   lighting (graphics, fullscreen)  : gbuffer + shadow map + directional light -> lit color
+//   compose  (graphics, fullscreen)  : lit * ao -> swapchain   (a plain "present" of lit color when SSAO is off)
+// Pass order is derived from the accesses each frame; toggling SSAO with SPACE adds/drops the ssao pass
+// (and swaps compose<->present) -- the graph reshapes itself, the point of an immediate-mode graph.
+//
+// Keys: SPACE toggles SSAO. 1/2/3/4/5 = debug-blit a single buffer (albedo/normal/roughness/depth/ssao)
+// straight to the swapchain, 0 = back to the lit image. The debug pass writes the swapchain itself and
+// becomes the only sink, so the graph culls every pass not needed for that one image: views 1-4 leave
+// only gbuffer; view 5 leaves gbuffer+ssao; shadow/lighting/compose drop out.
+//
+// Matrix-free on purpose: camera + light are defined by a ray function in WGSL, so the gbuffer stores
+// LINEAR depth (t / FAR) and the lighting/ssao passes reconstruct the exact world hit as
+// CAM_POS + camera_ray(uv) * depth * FAR -- no projection/inverse matrices, no CPU math lib.
+//
 // Not a standalone TU: #included at the end of RenderGraph.cpp so it sees the internal node structs.
-// Opens an SDL3 window and rebuilds the WHOLE graph every frame (declare -> compile -> realize ->
-// execute -> release), arena-allocated from a single persistent GraphAllocator. Which passes exist
-// depends on a runtime toggle (SPACE):
-//   glow ON  : scene (graphics) -> sobel (compute) -> blur (compute) -> compose (graphics, additive)
-//   glow OFF : scene (graphics) -> present (graphics blit of the plain scene)
-// The graph derives pass order from the read/write accesses each frame; toggling glow literally
-// changes how many passes exist that frame -- the point of an immediate-mode graph.
 
 #include "RenderGraph.h"
 #include <cstdio>
 #include <ostream>
+#include <string>                // assemble shader sources from shared snippets
 #include <webgpu/webgpu_cpp.h>   // C++ wrappers, only for instance/surface/device bring-up
-#include <cmath>                 // sin/cos for the animated edge color
+#include <cmath>                 // sin/cos for the animated scene + light
 
 #define SDL_MAIN_HANDLED         // we keep our own main(); just call SDL_SetMainReady()
 #include <SDL3/SDL.h>
@@ -27,12 +39,26 @@ double getTime() {
 
 namespace {
 
-constexpr WGPUTextureFormat kSwapFormat    = WGPUTextureFormat_BGRA8Unorm;  // matches the surface
-constexpr WGPUTextureFormat kSceneFormat   = WGPUTextureFormat_RGBA8Unorm;  // offscreen scene color (attachment + sampled)
-constexpr WGPUTextureFormat kStorageFormat = WGPUTextureFormat_RGBA8Unorm;  // sobel/blur outputs; must match the rgba8unorm storage decls in the shaders
+constexpr WGPUTextureFormat kSwapFormat  = WGPUTextureFormat_BGRA8Unorm;   // matches the surface
+constexpr WGPUTextureFormat kColorFormat = WGPUTextureFormat_RGBA8Unorm;   // gbuffer albedo/normal/rough + lit color
+constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth32Float; // gbuffer depth + shadow map
+constexpr WGPUTextureFormat kAOFormat    = WGPUTextureFormat_RGBA8Unorm;   // ssao output (rgba8unorm = core storage format)
+constexpr uint32_t          kShadowSize  = 1024;                           // shadow map is a fixed square
+constexpr uint32_t          kMaxSpheres  = 8;
 
-// sobel edge color, animated per frame and uploaded to the sobel pass's uniform buffer.
-struct Params { float edgeColor[4]; };
+// One uniform buffer feeds gbuffer + shadow + lighting. Layout matches the WGSL `Scene` struct below
+// (std140: vec4 members on 16-byte offsets). Host-uploaded each frame -> never written by a pass.
+struct SceneUBO {
+    float    spheres[kMaxSpheres][4];   // xyz = center, w = radius          (offset 0)
+    float    lightDir[4];               // xyz = light TRAVEL direction      (offset 128)
+    float    lightColor[4];             // rgb                               (offset 144)
+    float    resolution[2];             // gbuffer pixel size (for aspect)   (offset 160)
+    uint32_t count;                     // live sphere count                 (offset 168)
+    float    time;                      //                                   (offset 172)
+    uint32_t debugMode;                 // 0 = lit, 1..4 = blit a gbuffer img (offset 176)
+    uint32_t _pad[3];                   // round up to a 16-byte multiple    (offset 180)
+};
+static_assert(sizeof(SceneUBO) == 192, "SceneUBO must match the std140 WGSL Scene layout");
 
 // same shape as Renderer.cpp::createShaderModule
 WGPUShaderModule make_shader(WGPUDevice dev, WGPUStringView code)
@@ -41,6 +67,291 @@ WGPUShaderModule make_shader(WGPUDevice dev, WGPUStringView code)
     WGPUShaderModuleDescriptor d{ .nextInChain = &wgsl.chain };
     return wgpuDeviceCreateShaderModule(dev, &d);
 }
+
+// build a shader module from an assembled std::string (snippets concatenated below)
+WGPUShaderModule make_shader(WGPUDevice dev, const std::string& code)
+{
+    return make_shader(dev, WGPUStringView{ code.c_str(), code.size() });
+}
+
+// ---- shared WGSL snippets ------------------------------------------------------------------------
+// Each pipeline's source = a few of these concatenated. Keeping the SDF + camera in one place is what
+// makes the gbuffer, shadow and lighting passes agree on world space without passing any matrices.
+
+// fullscreen triangle; `ndc` is clip-space xy in [-1,1] (y up) -> the per-pixel ray + reconstruct uv.
+const char* kVS = R"(
+struct VsOut { @builtin(position) pos : vec4f, @location(0) ndc : vec2f };
+@vertex fn vs(@builtin(vertex_index) vid : u32) -> VsOut {
+    var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+    var o : VsOut;
+    o.pos = vec4f(p[vid], 0.0, 1.0);
+    o.ndc = p[vid];
+    return o;
+}
+)";
+
+// scene UBO at @group(0) @binding(0) -- gbuffer/shadow/lighting all bind it there.
+const char* kSceneDecl = R"(
+struct Scene {
+    spheres    : array<vec4f, 8>,
+    lightDir   : vec4f,
+    lightColor : vec4f,
+    resolution : vec2f,
+    count      : u32,
+    time       : f32,
+    debugMode  : u32,
+};
+@group(0) @binding(0) var<uniform> scene : Scene;
+)";
+
+// camera + light, matrix-free. The single source of truth for "what world point is this pixel".
+const char* kCameraDefs = R"(
+const FAR         : f32 = 24.0;
+const FOV         : f32 = 1.0;                  // vertical, radians
+const CAM_POS     : vec3f = vec3f(0.0, 1.9, 5.5);
+const SCENE_CENTER: vec3f = vec3f(0.0, 0.0, 0.0);
+const LIGHT_ORTHO : f32 = 5.0;                  // half-extent of the shadow ortho frustum
+const LIGHT_DIST  : f32 = 12.0;                 // light "camera" distance from scene center
+
+// per-pixel primary ray for a camera at CAM_POS, looking -Z with a slight downward pitch.
+fn camera_ray(ndc : vec2f, aspect : f32) -> vec3f {
+    let t     = tan(0.5 * FOV);
+    let fwd   = normalize(vec3f(0.0, -0.38, -1.0));
+    let right = normalize(cross(fwd, vec3f(0.0, 1.0, 0.0)));
+    let up    = cross(right, fwd);
+    return normalize(fwd + right * (ndc.x * aspect * t) + up * (ndc.y * t));
+}
+// exact world hit from the LINEAR depth (t / FAR) the gbuffer stored -- the deferred passes' anchor.
+fn world_from_depth(ndc : vec2f, aspect : f32, lin : f32) -> vec3f {
+    return CAM_POS + camera_ray(ndc, aspect) * (lin * FAR);
+}
+// orthonormal basis for the directional light's ortho "camera": columns right, up, forward(=travel).
+fn light_basis(dir : vec3f) -> mat3x3f {
+    let f = normalize(dir);
+    var up = vec3f(0.0, 1.0, 0.0);
+    if (abs(f.y) > 0.99) { up = vec3f(1.0, 0.0, 0.0); }
+    let r = normalize(cross(up, f));
+    let u = cross(f, r);
+    return mat3x3f(r, u, f);
+}
+// world -> light space: xy in [-1,1] across the frustum, z in [0,1] matching what the shadow pass writes.
+fn light_space(wp : vec3f, dir : vec3f) -> vec3f {
+    let B   = light_basis(dir);
+    let rel = wp - SCENE_CENTER;
+    return vec3f(dot(rel, B[0]) / LIGHT_ORTHO,
+                 dot(rel, B[1]) / LIGHT_ORTHO,
+                 (dot(rel, B[2]) + LIGHT_DIST) / (2.0 * LIGHT_DIST));
+}
+)";
+
+// the SDF scene (references the `scene` UBO) -- shared by the gbuffer and shadow raymarches.
+const char* kSdfDefs = R"(
+fn sd_sphere(p : vec3f, c : vec3f, r : f32) -> f32 { return length(p - c) - r; }
+fn smin(a : f32, b : f32, k : f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+fn map(p : vec3f) -> f32 {
+    var d = 1e9;
+    for (var i = 0u; i < scene.count; i = i + 1u) {
+        let s = scene.spheres[i];
+        d = smin(d, sd_sphere(p, s.xyz, s.w), 0.6);   // blob the spheres together
+    }
+    return min(d, p.y + 1.5);                          // crisp ground plane at y = -1.5
+}
+fn estimate_normal(p : vec3f) -> vec3f {
+    let e = vec2f(0.0015, 0.0);
+    return normalize(vec3f(map(p + e.xyy) - map(p - e.xyy),
+                           map(p + e.yxy) - map(p - e.yxy),
+                           map(p + e.yyx) - map(p - e.yyx)));
+}
+fn raymarch(ro : vec3f, rd : vec3f, maxd : f32) -> f32 {
+    var t = 0.05;
+    for (var i = 0; i < 96; i = i + 1) {
+        let d = map(ro + rd * t);
+        if (d < 0.001) { return t; }
+        t = t + d;
+        if (t > maxd) { break; }
+    }
+    return -1.0;                                       // miss
+}
+)";
+
+// gbuffer fragment: raymarch from the camera, write the three G-targets + linear depth.
+const char* kGbufferFs = R"(
+struct GOut {
+    @location(0) albedo : vec4f,
+    @location(1) normal : vec4f,
+    @location(2) rough  : vec4f,
+    @builtin(frag_depth) depth : f32,
+};
+@fragment fn fs(in : VsOut) -> GOut {
+    let aspect = scene.resolution.x / scene.resolution.y;
+    let rd = camera_ray(in.ndc, aspect);
+    let t  = raymarch(CAM_POS, rd, FAR);
+    if (t < 0.0) { discard; }                          // background: leave cleared, write no depth
+    let p = CAM_POS + rd * t;
+    let n = estimate_normal(p);
+    var albedo = vec3f(0.85, 0.30, 0.20);
+    var rough  = 0.35;
+    // ponytail: material chosen by height (ground vs blob), no per-primitive id; return a material
+    // index out of map() if the scene grows more than two surfaces.
+    if (p.y < -1.4) {                                  // ground: checkerboard so AO/shadow read clearly
+        let chk = floor(p.x) + floor(p.z);
+        albedo  = mix(vec3f(0.18), vec3f(0.45), fract(chk * 0.5) * 2.0);
+        rough   = 0.9;
+    }
+    var o : GOut;
+    o.albedo = vec4f(albedo, 1.0);
+    o.normal = vec4f(n * 0.5 + 0.5, 1.0);              // encode [-1,1] -> [0,1]
+    o.rough  = vec4f(rough, 0.0, 0.0, 1.0);
+    o.depth  = clamp(t / FAR, 0.0, 1.0);               // LINEAR depth -> reconstructable later
+    return o;
+}
+)";
+
+// shadow fragment: raymarch the same SDF from the light's ortho camera, depth only (no color targets).
+const char* kShadowFs = R"(
+@fragment fn fs(in : VsOut) -> @builtin(frag_depth) f32 {
+    let B = light_basis(scene.lightDir.xyz);
+    let origin = SCENE_CENTER - B[2] * LIGHT_DIST
+               + B[0] * (in.ndc.x * LIGHT_ORTHO)
+               + B[1] * (in.ndc.y * LIGHT_ORTHO);
+    let t = raymarch(origin, B[2], 2.0 * LIGHT_DIST);  // parallel rays along the light direction
+    if (t < 0.0) { discard; }
+    return t / (2.0 * LIGHT_DIST);
+}
+)";
+
+// lighting fragment: read gbuffer, reconstruct world pos, directional light + shadow lookup + cheap spec.
+const char* kLightingFs = R"(
+@group(0) @binding(1) var gAlbedo   : texture_2d<f32>;
+@group(0) @binding(2) var gNormal   : texture_2d<f32>;
+@group(0) @binding(3) var gRough    : texture_2d<f32>;
+@group(0) @binding(4) var gDepth    : texture_depth_2d;
+@group(0) @binding(5) var shadowMap : texture_depth_2d;
+
+// ponytail: single tap -> hard edges; add a 3x3 PCF loop here if the shadow edges look too crunchy.
+fn sample_shadow(wp : vec3f) -> f32 {
+    let ls = light_space(wp, scene.lightDir.xyz);
+    if (abs(ls.x) > 1.0 || abs(ls.y) > 1.0 || ls.z > 1.0 || ls.z < 0.0) { return 1.0; }   // outside -> lit
+    let dim = vec2f(textureDimensions(shadowMap));
+    let tx  = vec2i(i32((ls.x * 0.5 + 0.5) * dim.x), i32((0.5 - ls.y * 0.5) * dim.y));     // flip y for texel space
+    let stored = textureLoad(shadowMap, tx, 0);
+    return select(1.0, 0.0, ls.z - 0.004 > stored);                                        // bias against acne
+}
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px  = vec2i(in.pos.xy);
+    let lin = textureLoad(gDepth, px, 0);
+    if (lin >= 1.0) { return vec4f(0.015, 0.02, 0.03, 1.0); }                               // background
+    let dim    = vec2f(textureDimensions(gDepth));
+    let wp     = world_from_depth(in.ndc, dim.x / dim.y, lin);
+    let n      = textureLoad(gNormal, px, 0).xyz * 2.0 - 1.0;
+    let albedo = textureLoad(gAlbedo, px, 0).rgb;
+    let rough  = textureLoad(gRough,  px, 0).r;
+    let L = normalize(-scene.lightDir.xyz);
+    let V = normalize(CAM_POS - wp);
+    let H = normalize(L + V);
+    let ndl  = max(dot(n, L), 0.0);
+    let sh   = sample_shadow(wp);
+    let spec = pow(max(dot(n, H), 0.0), mix(4.0, 64.0, 1.0 - rough)) * (1.0 - rough);
+    let direct  = (ndl + spec) * sh * scene.lightColor.rgb;
+    let ambient = 0.12;
+    return vec4f(albedo * (ambient + direct), 1.0);
+}
+)";
+
+// ssao compute: hemisphere AO from reconstructed positions (matrix-free, screen-space spiral taps).
+const char* kSsaoBody = R"(
+@group(0) @binding(0) var gDepth  : texture_depth_2d;
+@group(0) @binding(1) var gNormal : texture_2d<f32>;
+@group(0) @binding(2) var aoOut   : texture_storage_2d<rgba8unorm, write>;
+
+fn hash12(p : vec2f) -> f32 {
+    var p3 = fract(vec3f(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+fn ndc_of(px : vec2i, fdim : vec2f) -> vec2f {
+    return vec2f((f32(px.x) + 0.5) / fdim.x * 2.0 - 1.0,
+                 1.0 - (f32(px.y) + 0.5) / fdim.y * 2.0);   // clip y up
+}
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+    let dim = vec2i(textureDimensions(gDepth));
+    let px  = vec2i(i32(gid.x), i32(gid.y));
+    if (px.x >= dim.x || px.y >= dim.y) { return; }
+    let lin = textureLoad(gDepth, px, 0);
+    if (lin >= 1.0) { textureStore(aoOut, px, vec4f(1.0)); return; }     // background = fully lit
+
+    let fdim   = vec2f(dim);
+    let aspect = fdim.x / fdim.y;
+    let P = world_from_depth(ndc_of(px, fdim), aspect, lin);
+    let N = textureLoad(gNormal, px, 0).xyz * 2.0 - 1.0;
+
+    let focal = fdim.y / (2.0 * tan(0.5 * FOV));
+    let rpix  = clamp(0.85 * focal / (lin * FAR), 4.0, 96.0);            // ~constant world radius in pixels
+    let rot   = hash12(vec2f(px)) * 6.2831;
+    let SAMPLES = 16;
+    var ao = 0.0;
+    for (var i = 0; i < SAMPLES; i = i + 1) {
+        let r = sqrt((f32(i) + 0.5) / f32(SAMPLES));
+        let a = f32(i) * 2.39996 + rot;                                  // golden-angle spiral
+        let off = vec2f(cos(a), sin(a)) * r * rpix;
+        let npx = px + vec2i(i32(round(off.x)), i32(round(off.y)));
+        if (npx.x < 0 || npx.y < 0 || npx.x >= dim.x || npx.y >= dim.y) { continue; }
+        let nd = textureLoad(gDepth, npx, 0);
+        if (nd >= 1.0) { continue; }
+        let Pn   = world_from_depth(ndc_of(npx, fdim), aspect, nd);
+        let v    = Pn - P;
+        let dist = length(v);
+        let ndv  = dot(N, v) / (dist + 1e-4);                            // is the sample inside the hemisphere?
+        let rng  = 1.0 / (1.0 + dist * dist * 3.0);                      // distance falloff
+        ao = ao + max(ndv - 0.02, 0.0) * rng;
+    }
+    ao = clamp(1.0 - ao / f32(SAMPLES) * 2.5, 0.0, 1.0);
+    textureStore(aoOut, px, vec4f(ao, ao, ao, 1.0));
+}
+)";
+
+// compose fragment: lit color modulated by AO. present = lit color only (SSAO off).
+// ponytail: AO multiplies the whole lit result, not just the ambient term; if it over-darkens lit
+// surfaces, output ambient/direct separately from the lighting pass and apply AO to ambient only.
+const char* kComposeFs = R"(
+@group(0) @binding(0) var litColor : texture_2d<f32>;
+@group(0) @binding(1) var aoTex    : texture_2d<f32>;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px = vec2i(in.pos.xy);
+    return vec4f(textureLoad(litColor, px, 0).rgb * textureLoad(aoTex, px, 0).r, 1.0);
+}
+)";
+const char* kPresentFs = R"(
+@group(0) @binding(0) var litColor : texture_2d<f32>;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px = vec2i(in.pos.xy);
+    return vec4f(textureLoad(litColor, px, 0).rgb, 1.0);
+}
+)";
+
+// debug blit: dump one gbuffer image straight to the swapchain, picked by scene.debugMode (1..4).
+const char* kDebugFs = R"(
+@group(0) @binding(1) var gAlbedo : texture_2d<f32>;
+@group(0) @binding(2) var gNormal : texture_2d<f32>;
+@group(0) @binding(3) var gRough  : texture_2d<f32>;
+@group(0) @binding(4) var gDepth  : texture_depth_2d;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px = vec2i(in.pos.xy);
+    var col = vec3f(1.0, 0.0, 1.0);                          // magenta = unhandled mode
+    switch (scene.debugMode) {
+        case 1u: { col = textureLoad(gAlbedo, px, 0).rgb; }
+        case 2u: { col = textureLoad(gNormal, px, 0).rgb; } // stored as n*0.5+0.5
+        case 3u: { col = vec3f(textureLoad(gRough, px, 0).r); }
+        case 4u: { col = vec3f(textureLoad(gDepth, px, 0)); } // linear depth as grey
+        default: {}
+    }
+    return vec4f(col, 1.0);
+}
+)";
 
 // adapter + device against the given surface, pumped synchronously via the instance (kept alive by
 // the caller). mirrors Framework.cpp's request flow, plus compatibleSurface so the adapter can present.
@@ -220,155 +531,86 @@ int main()
     wgpuSurfaceConfigure(surf, &cfg);
 
     // ---- pipelines (created once: they depend on formats, not on the per-frame sizes) -------------
-    // triangle: positions from vertex_index, no vertex buffers. targets the offscreen scene color.
-    WGPUShaderModule triSM = make_shader(dev, WEBGPU_STR(R"(
-        @vertex fn vs(@builtin(vertex_index) vid : u32) -> @builtin(position) vec4f {
-            var p = array<vec2f, 3>(vec2f(0.0, 0.5), vec2f(-0.5, -0.5), vec2f(0.5, -0.5));
-            return vec4f(p[vid], 0.0, 1.0);
-        }
-        @fragment fn fs() -> @location(0) vec4f { return vec4f(1.0, 0.6, 0.1, 1.0); }
-    )"));
-    WGPUColorTargetState triCT{ .format = kSceneFormat, .writeMask = WGPUColorWriteMask_All };
-    WGPUFragmentState    triFrag{ .module = triSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &triCT };
-    WGPURenderPipelineDescriptor triPD{
-        .label       = WEBGPU_STR("triangle pipeline"),
-        .layout      = nullptr,
-        .vertex      = { .module = triSM, .entryPoint = WEBGPU_STR("vs") },
+    // depth-stencil shared by the gbuffer + shadow passes: write depth, Less, stencil disabled
+    // (depth-only format -> stencil faces must be the no-op Always/Keep default).
+    WGPUStencilFaceState stencilNop{
+        .compare     = WGPUCompareFunction_Always,
+        .failOp      = WGPUStencilOperation_Keep,
+        .depthFailOp = WGPUStencilOperation_Keep,
+        .passOp      = WGPUStencilOperation_Keep,
+    };
+    WGPUDepthStencilState depthWrite{
+        .format            = kDepthFormat,
+        .depthWriteEnabled = WGPUOptionalBool_True,
+        .depthCompare      = WGPUCompareFunction_Less,
+        .stencilFront      = stencilNop,
+        .stencilBack       = stencilNop,
+        .stencilReadMask   = 0xFFFFFFFF,
+        .stencilWriteMask  = 0xFFFFFFFF,
+    };
+
+    // gbuffer: fullscreen raymarch -> 3 color targets (albedo/normal/rough) + depth.
+    WGPUShaderModule gbufferSM = make_shader(dev, std::string(kVS) + kSceneDecl + kCameraDefs + kSdfDefs + kGbufferFs);
+    WGPUColorTargetState gbCT[3] = {
+        { .format = kColorFormat, .writeMask = WGPUColorWriteMask_All },
+        { .format = kColorFormat, .writeMask = WGPUColorWriteMask_All },
+        { .format = kColorFormat, .writeMask = WGPUColorWriteMask_All },
+    };
+    WGPUFragmentState gbFrag{ .module = gbufferSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 3, .targets = gbCT };
+    WGPURenderPipelineDescriptor gbPD{
+        .label        = WEBGPU_STR("gbuffer pipeline"),
+        .vertex       = { .module = gbufferSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive    = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .depthStencil = &depthWrite,
+        .multisample  = { .count = 1, .mask = ~0u },
+        .fragment     = &gbFrag,
+    };
+    WGPURenderPipeline gbufferPipe = wgpuDeviceCreateRenderPipeline(dev, &gbPD);
+    wgpuShaderModuleRelease(gbufferSM);
+
+    // shadow: fullscreen raymarch from the light -> depth only (no color targets).
+    WGPUShaderModule shadowSM = make_shader(dev, std::string(kVS) + kSceneDecl + kCameraDefs + kSdfDefs + kShadowFs);
+    WGPUFragmentState shadowFrag{ .module = shadowSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 0, .targets = nullptr };
+    WGPURenderPipelineDescriptor shadowPD{
+        .label        = WEBGPU_STR("shadow pipeline"),
+        .vertex       = { .module = shadowSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive    = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .depthStencil = &depthWrite,
+        .multisample  = { .count = 1, .mask = ~0u },
+        .fragment     = &shadowFrag,
+    };
+    WGPURenderPipeline shadowPipe = wgpuDeviceCreateRenderPipeline(dev, &shadowPD);
+    wgpuShaderModuleRelease(shadowSM);
+
+    // lighting: fullscreen -> lit color from gbuffer + shadow map.
+    WGPUShaderModule lightSM = make_shader(dev, std::string(kVS) + kSceneDecl + kCameraDefs + kLightingFs);
+    WGPUColorTargetState lightCT{ .format = kColorFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState lightFrag{ .module = lightSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &lightCT };
+    WGPURenderPipelineDescriptor lightPD{
+        .label       = WEBGPU_STR("lighting pipeline"),
+        .vertex      = { .module = lightSM, .entryPoint = WEBGPU_STR("vs") },
         .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
         .multisample = { .count = 1, .mask = ~0u },
-        .fragment    = &triFrag,
+        .fragment    = &lightFrag,
     };
-    WGPURenderPipeline triPipe = wgpuDeviceCreateRenderPipeline(dev, &triPD);
-    wgpuShaderModuleRelease(triSM);
+    WGPURenderPipeline lightingPipe = wgpuDeviceCreateRenderPipeline(dev, &lightPD);
+    wgpuShaderModuleRelease(lightSM);
 
-    // sobel: read scene color via textureLoad, write edge magnitude into a write-only storage texture.
-    WGPUShaderModule sobelSM = make_shader(dev, WEBGPU_STR(R"(
-        @group(0) @binding(0) var src : texture_2d<f32>;
-        @group(0) @binding(1) var dst : texture_storage_2d<rgba8unorm, write>;
-
-        struct Params {
-            edgeColor : vec4f
-        };
-
-        @group(0) @binding(2)
-        var<uniform> params : Params;
-
-        fn lum(p : vec2i, dim : vec2i) -> f32 {
-            let c = clamp(p, vec2i(0, 0), dim - vec2i(1, 1));
-            return dot(textureLoad(src, c, 0).rgb, vec3f(0.299, 0.587, 0.114));
-        }
-
-        @compute @workgroup_size(8, 8)
-        fn main(@builtin(global_invocation_id) gid : vec3u) {
-            let dim = vec2i(textureDimensions(src));
-            let p   = vec2i(i32(gid.x), i32(gid.y));
-            if (p.x >= dim.x || p.y >= dim.y) { return; }
-
-            let a = lum(p + vec2i(-1,-1), dim); let b = lum(p + vec2i(0,-1), dim); let c = lum(p + vec2i(1,-1), dim);
-            let d = lum(p + vec2i(-1, 0), dim);                                    let f = lum(p + vec2i(1, 0), dim);
-            let g = lum(p + vec2i(-1, 1), dim); let h = lum(p + vec2i(0, 1), dim); let i = lum(p + vec2i(1, 1), dim);
-
-            let gx  = (c + 2.0 * f + i) - (a + 2.0 * d + g);
-            let gy  = (g + 2.0 * h + i) - (a + 2.0 * b + c);
-
-            let mag = sqrt(gx * gx + gy * gy);
-            let color = params.edgeColor.rgb * mag * 10;
-            textureStore(dst, p, vec4f(color, 1.0));
-        }
-    )"));
-    WGPUComputePipelineDescriptor sobelPD{
-        .label   = WEBGPU_STR("sobel pipeline"),
-        .layout  = nullptr,
-        .compute = { .module = sobelSM, .entryPoint = WEBGPU_STR("main") },
+    // ssao: compute, reconstructs world positions from gbuffer depth + normal.
+    WGPUShaderModule ssaoSM = make_shader(dev, std::string(kCameraDefs) + kSsaoBody);
+    WGPUComputePipelineDescriptor ssaoPD{
+        .label   = WEBGPU_STR("ssao pipeline"),
+        .compute = { .module = ssaoSM, .entryPoint = WEBGPU_STR("main") },
     };
-    WGPUComputePipeline sobelPipe = wgpuDeviceCreateComputePipeline(dev, &sobelPD);
-    wgpuShaderModuleRelease(sobelSM);
+    WGPUComputePipeline ssaoPipe = wgpuDeviceCreateComputePipeline(dev, &ssaoPD);
+    wgpuShaderModuleRelease(ssaoSM);
 
-    // blur: box-blur the sobel result into a second storage texture (the "glow" source).
-    WGPUShaderModule blurSM = make_shader(dev, WEBGPU_STR(R"(
-        @group(0) @binding(0) var src : texture_2d<f32>;
-        @group(0) @binding(1) var dst : texture_storage_2d<rgba8unorm, write>;
-
-        @compute @workgroup_size(8, 8)
-        fn main(@builtin(global_invocation_id) gid : vec3u) {
-            let dim = vec2i(textureDimensions(src));
-            let p   = vec2i(i32(gid.x), i32(gid.y));
-            if (p.x >= dim.x || p.y >= dim.y) { return; }
-
-            let R = 8;
-            var sum   = vec3f(0.0);
-            var count = 0.0;
-            for (var dy = -R; dy <= R; dy = dy + 1) {
-                for (var dx = -R; dx <= R; dx = dx + 1) {
-                    let c = clamp(p + vec2i(dx, dy), vec2i(0, 0), dim - vec2i(1, 1));
-                    sum   = sum + textureLoad(src, c, 0).rgb;
-                    count = count + 1.0;
-                }
-            }
-            textureStore(dst, p, vec4f(sum / count, 1.0));
-        }
-    )"));
-    WGPUComputePipelineDescriptor blurPD{
-        .label   = WEBGPU_STR("blur pipeline"),
-        .layout  = nullptr,
-        .compute = { .module = blurSM, .entryPoint = WEBGPU_STR("main") },
-    };
-    WGPUComputePipeline blurPipe = wgpuDeviceCreateComputePipeline(dev, &blurPD);
-    wgpuShaderModuleRelease(blurSM);
-
-    // present (glow off): fullscreen-triangle blit of a single texture (the plain scene) onto the swapchain.
-    WGPUShaderModule blitSM = make_shader(dev, WEBGPU_STR(R"(
-        @group(0) @binding(0) var img : texture_2d<f32>;
-        @group(0) @binding(1) var smp : sampler;
-        struct VsOut { @builtin(position) pos : vec4f, @location(0) uv : vec2f };
-        @vertex fn vs(@builtin(vertex_index) vid : u32) -> VsOut {
-            var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
-            var o : VsOut;
-            o.pos  = vec4f(p[vid], 0.0, 1.0);
-            o.uv   = p[vid] * 0.5 + vec2f(0.5, 0.5);
-            o.uv.y = 1.0 - o.uv.y;
-            return o;
-        }
-        @fragment fn fs(in : VsOut) -> @location(0) vec4f { return textureSample(img, smp, in.uv); }
-    )"));
-    WGPUColorTargetState blitCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
-    WGPUFragmentState    blitFrag{ .module = blitSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &blitCT };
-    WGPURenderPipelineDescriptor blitPD{
-        .label       = WEBGPU_STR("blit pipeline"),
-        .layout      = nullptr,
-        .vertex      = { .module = blitSM, .entryPoint = WEBGPU_STR("vs") },
-        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
-        .multisample = { .count = 1, .mask = ~0u },
-        .fragment    = &blitFrag,
-    };
-    WGPURenderPipeline blitPipe = wgpuDeviceCreateRenderPipeline(dev, &blitPD);
-    wgpuShaderModuleRelease(blitSM);
-
-    // compose (glow on): fullscreen-triangle blit that adds the blurred edges over the scene.
-    WGPUShaderModule composeSM = make_shader(dev, WEBGPU_STR(R"(
-        @group(0) @binding(0) var sceneTex : texture_2d<f32>;
-        @group(0) @binding(1) var edgeTex  : texture_2d<f32>;
-        @group(0) @binding(2) var smp : sampler;
-        struct VsOut { @builtin(position) pos : vec4f, @location(0) uv : vec2f };
-        @vertex fn vs(@builtin(vertex_index) vid : u32) -> VsOut {
-            var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
-            var o : VsOut;
-            o.pos  = vec4f(p[vid], 0.0, 1.0);
-            o.uv   = p[vid] * 0.5 + vec2f(0.5, 0.5);
-            o.uv.y = 1.0 - o.uv.y;
-            return o;
-        }
-        @fragment fn fs(in : VsOut) -> @location(0) vec4f {
-            let scene = textureSample(sceneTex, smp, in.uv).rgb;
-            let edges = textureSample(edgeTex,  smp, in.uv).rgb;
-            return vec4f(scene + edges, 1.0);   // additive glow
-        }
-    )"));
+    // compose (SSAO on): lit * ao -> swapchain.
+    WGPUShaderModule composeSM = make_shader(dev, std::string(kVS) + kComposeFs);
     WGPUColorTargetState composeCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
-    WGPUFragmentState    composeFrag{ .module = composeSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &composeCT };
+    WGPUFragmentState composeFrag{ .module = composeSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &composeCT };
     WGPURenderPipelineDescriptor composePD{
         .label       = WEBGPU_STR("compose pipeline"),
-        .layout      = nullptr,
         .vertex      = { .module = composeSM, .entryPoint = WEBGPU_STR("vs") },
         .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
         .multisample = { .count = 1, .mask = ~0u },
@@ -377,15 +619,33 @@ int main()
     WGPURenderPipeline composePipe = wgpuDeviceCreateRenderPipeline(dev, &composePD);
     wgpuShaderModuleRelease(composeSM);
 
-    WGPUSamplerDescriptor sampDesc{
-        .addressModeU = WGPUAddressMode_ClampToEdge,
-        .addressModeV = WGPUAddressMode_ClampToEdge,
-        .addressModeW = WGPUAddressMode_ClampToEdge,
-        .magFilter    = WGPUFilterMode_Linear,
-        .minFilter    = WGPUFilterMode_Linear,
-        .maxAnisotropy = 1,
+    // present (SSAO off): lit color straight to the swapchain.
+    WGPUShaderModule presentSM = make_shader(dev, std::string(kVS) + kPresentFs);
+    WGPUColorTargetState presentCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState presentFrag{ .module = presentSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &presentCT };
+    WGPURenderPipelineDescriptor presentPD{
+        .label       = WEBGPU_STR("present pipeline"),
+        .vertex      = { .module = presentSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &presentFrag,
     };
-    WGPUSampler sampler = wgpuDeviceCreateSampler(dev, &sampDesc);
+    WGPURenderPipeline presentPipe = wgpuDeviceCreateRenderPipeline(dev, &presentPD);
+    wgpuShaderModuleRelease(presentSM);
+
+    // debug (keys 1..4): blit one gbuffer image straight to the swapchain.
+    WGPUShaderModule debugSM = make_shader(dev, std::string(kVS) + kSceneDecl + kDebugFs);
+    WGPUColorTargetState debugCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState debugFrag{ .module = debugSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &debugCT };
+    WGPURenderPipelineDescriptor debugPD{
+        .label       = WEBGPU_STR("debug pipeline"),
+        .vertex      = { .module = debugSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &debugFrag,
+    };
+    WGPURenderPipeline debugPipe = wgpuDeviceCreateRenderPipeline(dev, &debugPD);
+    wgpuShaderModuleRelease(debugSM);
 
     // single persistent arena. create_render_graph() resets it and arena-allocates a fresh
     // RenderGraph (+ all its nodes) from it each frame -> the allocator is the only graph-side
@@ -395,17 +655,26 @@ int main()
     run_rg_compile_tests(allocator);   // compile()-only edge-case checks (no GPU); next create_render_graph() resets the arena
 
     // ---- frame loop: declare + compile + realize + execute + release the graph EVERY frame -------
-    bool glow      = true;   // SPACE toggles the compute blur/compose glow
-    int  shownGlow = -1;     // last glow state we printed the execution order for
-    bool running   = true;
+    bool ssaoOn     = true;  // SPACE toggles the SSAO pass (and compose<->present)
+    int  debugMode  = 0;     // 0 = lit, 1..4 = blit gbuffer albedo/normal/roughness/depth
+    int  shownSsao  = -1;    // last (ssao, debug) state we printed the execution order for
+    int  shownDebug = -1;
+    bool running    = true;
+    const char* kDebugName[] = { "off", "albedo", "normal", "roughness", "depth", "ssao" };
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) running = false;
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_ESCAPE) running = false;
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_SPACE) {
-                glow = !glow;
-                std::printf("glow %s\n", glow ? "ON" : "OFF");
+                ssaoOn = !ssaoOn;
+                std::printf("ssao %s\n", ssaoOn ? "ON" : "OFF");
+            }
+            else if (e.type == SDL_EVENT_KEY_DOWN &&
+                     (e.key.scancode == SDL_SCANCODE_0 ||
+                      (e.key.scancode >= SDL_SCANCODE_1 && e.key.scancode <= SDL_SCANCODE_5))) {
+                debugMode = (e.key.scancode == SDL_SCANCODE_0) ? 0 : (int)(e.key.scancode - SDL_SCANCODE_1) + 1;
+                std::printf("debug: %s\n", kDebugName[debugMode]);
             }
             else if (e.type == SDL_EVENT_WINDOW_RESIZED) {
                 cfg.width = (uint32_t)e.window.data1; cfg.height = (uint32_t)e.window.data2;
@@ -433,125 +702,194 @@ int main()
         // ---- declare the whole graph for THIS frame (immediate mode) ----
         RenderGraph* rg = create_render_graph(allocator, nullptr);   // resets the arena, fresh RenderGraph
 
-        // import this frame's swapchain view directly; its size also roots the Relative chain below.
-        auto swapchain  = rg->importe_image(WEBGPU_STR("swapchain"), view, { cfg.width, cfg.height, 1 });
-        auto sceneColor = rg->create_image(WEBGPU_STR("scene.color"), {
-            .dimension = WGPUTextureDimension_2D, .format = kSceneFormat,
-            .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
-        });
+        // import this frame's swapchain view; its size roots every Relative texture below.
+        auto swapchain = rg->importe_image(WEBGPU_STR("swapchain"), view, { cfg.width, cfg.height, 1 });
 
-        // multi-writer smoke test (SSA versioning): a depth buffer written by two passes (v1 then
-        // v2 -> WAW edge) and read by scene/compose -> RAW; scene's read of v1 makes depth.main's
-        // overwrite a WAR. a third pass ("lighting") reads v1 *read-only* (depth_stencil_read_only)
-        // to prove the read-only path: it gets no false write hazard vs scene (both read v1), takes a
-        // RAW edge to the prepass, and a WAR (not WAW) edge from depth.main -- so depth stays a 2-version
-        // chain. the writers/reader are graph-shape-only no-op Transfer passes: execute() auto-wires a
-        // depth attachment for *graphics* passes (which would then need a depth-enabled pipeline), but
-        // skips that for Transfer -- so this drives compile()'s versioning without touching the render
-        // pipelines. a real renderer would z-prepass / draw geometry here.
-        auto depth = rg->create_image(WEBGPU_STR("depth"), {
-            .dimension = WGPUTextureDimension_2D, .format = WGPUTextureFormat_Depth32Float,
-            .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+        // helper for a swapchain-sized offscreen texture (WGPU_STRLEN -> copy_string measures it).
+        auto screenTex = [&](const char* name, WGPUTextureFormat fmt) {
+            return rg->create_image(WGPUStringView{ name, WGPU_STRLEN }, {
+                .dimension = WGPUTextureDimension_2D, .format = fmt,
+                .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+            });
+        };
+        auto gAlbedo = screenTex("gbuffer.albedo", kColorFormat);
+        auto gNormal = screenTex("gbuffer.normal", kColorFormat);
+        auto gRough  = screenTex("gbuffer.rough",  kColorFormat);
+        auto gDepth  = screenTex("gbuffer.depth",  kDepthFormat);
+        auto litColor = screenTex("lighting.color", kColorFormat);
+        auto shadowMap = rg->create_image(WEBGPU_STR("shadow.map"), {
+            .dimension = WGPUTextureDimension_2D, .format = kDepthFormat,
+            .sizeKind = SizeKind::Absolute, .absolute = { kShadowSize, kShadowSize, 1 },
         });
-        rg->add_pass(WEBGPU_STR("depth.prepass"), PassKind::Transfer,
-            [&](GraphBuilder& b) { b.depth_stencil(depth, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f); },
-            [](PassContext&){});                                  // writes depth v1
+        auto sceneUbo = rg->create_buffer(WEBGPU_STR("scene.ubo"), { .size = sizeof(SceneUBO) });
+        ResourceHandle aoTex{};   // only on the SSAO path
 
-        rg->add_pass(WEBGPU_STR("scene"), PassKind::Graphics,
+        // 1) gbuffer: raymarch the SDF -> albedo / normal / roughness (MRT) + linear depth.
+        rg->add_pass(WEBGPU_STR("gbuffer"), PassKind::Graphics,
             [&](GraphBuilder& b) {
-                b.color(sceneColor, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0.05, 0.05, 0.08, 1.0});
-                b.sampled(depth);                                 // reads depth v1 (graph-shape only; not bound in the body)
+                b.color(gAlbedo, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});         // @location(0)
+                b.color(gNormal, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0.5, 0.5, 1.0, 1});   // @location(1)
+                b.color(gRough,  WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});         // @location(2)
+                b.depth_stencil(gDepth, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f);
+                b.uniform(sceneUbo);
             },
-            [triPipe](PassContext& ctx){
-                wgpuRenderPassEncoderSetPipeline(ctx.render, triPipe);
+            [dev, gbufferPipe, sceneUbo](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(gbufferPipe, 0);
+                WGPUBindGroupEntry e[1] = {
+                    { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuRenderPassEncoderSetPipeline(ctx.render, gbufferPipe);
+                wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
                 wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                wgpuBindGroupRelease(bg);
+                wgpuBindGroupLayoutRelease(l);
             });
 
-        rg->add_pass(WEBGPU_STR("lighting"), PassKind::Transfer,
+        // 2) shadow: raymarch the same SDF from the directional light -> depth-only shadow map.
+        rg->add_pass(WEBGPU_STR("shadow"), PassKind::Graphics,
             [&](GraphBuilder& b) {
-                b.depth_stencil_read_only(depth);                        // reads depth v1 read-only (attachment-read; NOT a write)
-                b.color(sceneColor, WGPULoadOp_Load, WGPUStoreOp_Store); // writes sceneColor v2 -> keeps pass alive to a sink
+                b.depth_stencil(shadowMap, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f);
+                b.uniform(sceneUbo);
             },
-            [](PassContext&){});                                         // Transfer: execute() skips attachment wiring (no depth pipeline needed)
-
-        rg->add_pass(WEBGPU_STR("depth.main"), PassKind::Transfer,
-            [&](GraphBuilder& b) { b.depth_stencil(depth, WGPULoadOp_Load, WGPUStoreOp_Store, 1.0f); },
-            [](PassContext&){});      // writes depth v2 -> WAW to depth.prepass; WAR to scene's and lighting's reads of v1
-
-        ResourceHandle ubo{};   // only created on the glow path; needed after realize() to upload Params
-        if (glow) {
-            auto sobelOut = rg->create_image(WEBGPU_STR("sobel.out"), {
-                .dimension = WGPUTextureDimension_2D, .format = kStorageFormat,
-                .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = sceneColor,
+            [dev, shadowPipe, sceneUbo](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(shadowPipe, 0);
+                WGPUBindGroupEntry e[1] = {
+                    { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuRenderPassEncoderSetPipeline(ctx.render, shadowPipe);
+                wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                wgpuBindGroupRelease(bg);
+                wgpuBindGroupLayoutRelease(l);
             });
-            auto blurOut = rg->create_image(WEBGPU_STR("blur.out"), {
-                .dimension = WGPUTextureDimension_2D, .format = kStorageFormat,
-                .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = sceneColor,
-            });
-            ubo = rg->create_buffer(WEBGPU_STR("ubo"), { .size = sizeof(Params) });
 
-            const uint32_t groupsX = (cfg.width + 7) / 8, groupsY = (cfg.height + 7) / 8;
-
-            // bind groups reference this frame's freshly-realized views, so build them in the pass
-            // body from the resolved PassContext, then release right after recording -- the command
-            // buffer retains them until the GPU is done.
-            rg->add_pass(WEBGPU_STR("sobel"), PassKind::Compute,
+        // 3) ssao (optional): screen-space AO from gbuffer depth + normal -> aoTex. Also forced on when
+        // its debug view (key 5) is selected, so there's an AO buffer to blit.
+        if (ssaoOn || debugMode == 5) {
+            aoTex = screenTex("ssao.ao", kAOFormat);
+            const uint32_t gx = (cfg.width + 7) / 8, gy = (cfg.height + 7) / 8;
+            rg->add_pass(WEBGPU_STR("ssao"), PassKind::Compute,
                 [&](GraphBuilder& b) {
-                    b.sampled(sceneColor);
-                    b.storage_write(sobelOut);
-                    b.uniform(ubo);
+                    b.sampled(gDepth);
+                    b.sampled(gNormal);
+                    b.storage_write(aoTex);
                 },
-                [dev, sobelPipe, sceneColor, sobelOut, ubo, groupsX, groupsY](PassContext& ctx){
-                    WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(sobelPipe, 0);
+                [dev, ssaoPipe, gDepth, gNormal, aoTex, gx, gy](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(ssaoPipe, 0);
                     WGPUBindGroupEntry e[3] = {
-                        { .binding = 0, .textureView = ctx.view(sceneColor) },
-                        { .binding = 1, .textureView = ctx.view(sobelOut) },
-                        { .binding = 2, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(Params) },
+                        { .binding = 0, .textureView = ctx.view(gDepth) },
+                        { .binding = 1, .textureView = ctx.view(gNormal) },
+                        { .binding = 2, .textureView = ctx.view(aoTex) },
                     };
                     WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
                     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
-                    wgpuComputePassEncoderSetPipeline(ctx.compute, sobelPipe);
+                    wgpuComputePassEncoderSetPipeline(ctx.compute, ssaoPipe);
                     wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
-                    wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, groupsX, groupsY, 1);
+                    wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, gx, gy, 1);
                     wgpuBindGroupRelease(bg);
                     wgpuBindGroupLayoutRelease(l);
                 });
+        }
 
-            rg->add_pass(WEBGPU_STR("blur"), PassKind::Compute,
-                [&](GraphBuilder& b) {
-                    b.sampled(sobelOut);
-                    b.storage_write(blurOut);
-                },
-                [dev, blurPipe, sobelOut, blurOut, groupsX, groupsY](PassContext& ctx){
-                    WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(blurPipe, 0);
-                    WGPUBindGroupEntry e[2] = {
-                        { .binding = 0, .textureView = ctx.view(sobelOut) },
-                        { .binding = 1, .textureView = ctx.view(blurOut) },
-                    };
-                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
-                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
-                    wgpuComputePassEncoderSetPipeline(ctx.compute, blurPipe);
-                    wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
-                    wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, groupsX, groupsY, 1);
-                    wgpuBindGroupRelease(bg);
-                    wgpuBindGroupLayoutRelease(l);
-                });
+        // 4) lighting: gbuffer + shadow map + directional light -> lit color.
+        rg->add_pass(WEBGPU_STR("lighting"), PassKind::Graphics,
+            [&](GraphBuilder& b) {
+                b.sampled(gAlbedo);
+                b.sampled(gNormal);
+                b.sampled(gRough);
+                b.sampled(gDepth);
+                b.sampled(shadowMap);
+                b.uniform(sceneUbo);
+                b.color(litColor, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+            },
+            [dev, lightingPipe, sceneUbo, gAlbedo, gNormal, gRough, gDepth, shadowMap](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(lightingPipe, 0);
+                WGPUBindGroupEntry e[6] = {
+                    { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                    { .binding = 1, .textureView = ctx.view(gAlbedo) },
+                    { .binding = 2, .textureView = ctx.view(gNormal) },
+                    { .binding = 3, .textureView = ctx.view(gRough) },
+                    { .binding = 4, .textureView = ctx.view(gDepth) },
+                    { .binding = 5, .textureView = ctx.view(shadowMap) },
+                };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 6, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuRenderPassEncoderSetPipeline(ctx.render, lightingPipe);
+                wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                wgpuBindGroupRelease(bg);
+                wgpuBindGroupLayoutRelease(l);
+            });
 
-            rg->add_pass(WEBGPU_STR("compose"), PassKind::Graphics,
+        // 5) final blit -> swapchain. debug active: dump one image and let the graph cull whatever isn't
+        // needed to produce it (1-4 -> gbuffer, only gbuffer survives; 5 -> ao, gbuffer+ssao survive).
+        // else SSAO on: lit * ao; else lit color (present).
+        if (debugMode >= 1 && debugMode <= 4) {
+            rg->add_pass(WEBGPU_STR("debug.blit"), PassKind::Graphics,
                 [&](GraphBuilder& b) {
-                    b.sampled(sceneColor);
-                    b.sampled(blurOut);
-                    b.sampled(depth);                             // reads depth v2 -> RAW edge to depth.main
+                    b.uniform(sceneUbo);                     // scene.debugMode picks the image
+                    b.sampled(gAlbedo);
+                    b.sampled(gNormal);
+                    b.sampled(gRough);
+                    b.sampled(gDepth);
                     b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
                 },
-                [dev, composePipe, sampler, sceneColor, blurOut](PassContext& ctx){
-                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(composePipe, 0);
-                    WGPUBindGroupEntry e[3] = {
-                        { .binding = 0, .textureView = ctx.view(sceneColor) },
-                        { .binding = 1, .textureView = ctx.view(blurOut) },
-                        { .binding = 2, .sampler = sampler },
+                [dev, debugPipe, sceneUbo, gAlbedo, gNormal, gRough, gDepth](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(debugPipe, 0);
+                    WGPUBindGroupEntry e[5] = {
+                        { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                        { .binding = 1, .textureView = ctx.view(gAlbedo) },
+                        { .binding = 2, .textureView = ctx.view(gNormal) },
+                        { .binding = 3, .textureView = ctx.view(gRough) },
+                        { .binding = 4, .textureView = ctx.view(gDepth) },
                     };
-                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 5, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, debugPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
+        } else if (debugMode == 5) {
+            // AO is stored grey (ao,ao,ao) -> the present pipeline (blits .rgb) shows it as-is. Reading
+            // aoTex keeps gbuffer+ssao alive; shadow/lighting cull away.
+            rg->add_pass(WEBGPU_STR("debug.ssao"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(aoTex);
+                    b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, presentPipe, aoTex](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(presentPipe, 0);
+                    WGPUBindGroupEntry e[1] = {
+                        { .binding = 0, .textureView = ctx.view(aoTex) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, presentPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
+        } else if (ssaoOn) {
+            rg->add_pass(WEBGPU_STR("compose"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(litColor);
+                    b.sampled(aoTex);
+                    b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, composePipe, litColor, aoTex](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(composePipe, 0);
+                    WGPUBindGroupEntry e[2] = {
+                        { .binding = 0, .textureView = ctx.view(litColor) },
+                        { .binding = 1, .textureView = ctx.view(aoTex) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
                     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
                     wgpuRenderPassEncoderSetPipeline(ctx.render, composePipe);
                     wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
@@ -562,19 +900,17 @@ int main()
         } else {
             rg->add_pass(WEBGPU_STR("present"), PassKind::Graphics,
                 [&](GraphBuilder& b) {
-                    b.sampled(sceneColor);
-                    b.sampled(depth);                             // reads depth v2 -> RAW edge to depth.main
+                    b.sampled(litColor);
                     b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
                 },
-                [dev, blitPipe, sampler, sceneColor](PassContext& ctx){
-                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(blitPipe, 0);
-                    WGPUBindGroupEntry e[2] = {
-                        { .binding = 0, .textureView = ctx.view(sceneColor) },
-                        { .binding = 1, .sampler = sampler },
+                [dev, presentPipe, litColor](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(presentPipe, 0);
+                    WGPUBindGroupEntry e[1] = {
+                        { .binding = 0, .textureView = ctx.view(litColor) },
                     };
-                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
                     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
-                    wgpuRenderPassEncoderSetPipeline(ctx.render, blitPipe);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, presentPipe);
                     wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
                     wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
                     wgpuBindGroupRelease(bg);
@@ -590,26 +926,45 @@ int main()
             instance.ProcessEvents();
             continue;
         }
-        rg->realize(dev);     // creates this frame's offscreen textures (+ ubo) from the resolved usages/sizes
+        rg->realize(dev);     // creates this frame's gbuffer/shadow/lit/ao textures (+ scene ubo)
 
-        // proof the per-frame graph really changes shape: print the order whenever glow flips.
-        if ((int)glow != shownGlow) {
-            shownGlow = (int)glow;
+        // proof the per-frame graph really changes shape: print the order whenever SSAO or debug flips.
+        if ((int)ssaoOn != shownSsao || debugMode != shownDebug) {
+            shownSsao = (int)ssaoOn; shownDebug = debugMode;
             std::printf("execution order:");
             for (PassNode* p = rg->m_passes; p; p = p->next) std::printf(" %s", p->name.data);
             std::printf("\n");
             rg->debug_print_mermaid();
         }
 
-        if (glow) {
-            Params p;
-            float t = (float)(getTime() * 10);
-            p.edgeColor[0] = sin(t) * 0.5f + 0.5f;
-            p.edgeColor[1] = cos(t) * 0.5f + 0.5f;
-            p.edgeColor[2] = 1.0f;
-            p.edgeColor[3] = 1.0f;
-            wgpuQueueWriteBuffer(q, rg->node(ubo)->buffer, 0, &p, sizeof(p));
+        // host-upload the scene + a slowly rotating directional light. The spheres are packed into a
+        // pile resting ON the ground (centers within a radius of each other) so they overlap into tight
+        // concave necks and sit in ground contact -- that's where SSAO actually darkens. Spread them
+        // out and the AO has nothing to occlude.
+        SceneUBO sb{};
+        float t = (float)getTime();
+        const float gy = -1.5f;                                  // ground plane height (matches map())
+        sb.count = 7;
+        sb.spheres[0][0] = 0.0f; sb.spheres[0][1] = gy + 0.9f; sb.spheres[0][2] = 0.0f; sb.spheres[0][3] = 0.9f;  // center, on ground
+        for (uint32_t i = 0; i < 5; ++i) {                       // ring hugging the center + each other + ground
+            float a = (float)i * 1.25664f + t * 0.3f;            // 72deg apart, slow spin
+            sb.spheres[1 + i][0] = cosf(a) * 1.1f;
+            sb.spheres[1 + i][1] = gy + 0.6f;
+            sb.spheres[1 + i][2] = sinf(a) * 1.1f;
+            sb.spheres[1 + i][3] = 0.6f;
         }
+        sb.spheres[6][0] = 0.0f;                                 // capstone nestled on top, gentle bob
+        sb.spheres[6][1] = gy + 1.9f + sinf(t * 1.5f) * 0.12f;
+        sb.spheres[6][2] = 0.0f; sb.spheres[6][3] = 0.5f;
+        float la = t * 0.25f;
+        float lx = cosf(la) * 0.5f, ly = -1.0f, lz = sinf(la) * 0.5f;
+        float ln = sqrtf(lx * lx + ly * ly + lz * lz);
+        sb.lightDir[0] = lx / ln; sb.lightDir[1] = ly / ln; sb.lightDir[2] = lz / ln;
+        sb.lightColor[0] = 1.0f; sb.lightColor[1] = 0.96f; sb.lightColor[2] = 0.9f;
+        sb.resolution[0] = (float)cfg.width; sb.resolution[1] = (float)cfg.height;
+        sb.time = t;
+        sb.debugMode = (uint32_t)debugMode;
+        wgpuQueueWriteBuffer(q, rg->node(sceneUbo)->buffer, 0, &sb, sizeof(sb));
 
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev, nullptr);
         rg->execute(enc, q);
@@ -627,12 +982,13 @@ int main()
     }
 
     // ---- teardown --------------------------------------------------------------------------------
-    wgpuSamplerRelease(sampler);
+    wgpuRenderPipelineRelease(debugPipe);
+    wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(composePipe);
-    wgpuRenderPipelineRelease(blitPipe);
-    wgpuComputePipelineRelease(blurPipe);
-    wgpuComputePipelineRelease(sobelPipe);
-    wgpuRenderPipelineRelease(triPipe);
+    wgpuComputePipelineRelease(ssaoPipe);
+    wgpuRenderPipelineRelease(lightingPipe);
+    wgpuRenderPipelineRelease(shadowPipe);
+    wgpuRenderPipelineRelease(gbufferPipe);
     SDL_DestroyWindow(window);
     SDL_Quit();
     // ponytail: the GraphAllocator (1 MB block) is leaked at exit -- one-time, process reclaims it.
