@@ -183,12 +183,7 @@ struct RenderGraph
     // resolve a handle to its node (linear walk; see ceiling note in .cpp)
     ResourceNode* node(ResourceHandle h);
 
-    GraphAllocator* m_allocator{};
-    GraphResourceCache* cache{};
-    ResourceNode* m_resouces{};
-    PassNode* m_passes{};       // after compile(): in execution order (toposorted)
-    WGPUDevice m_device{};      // set by realize(); resources are created against it
-    uint32_t next_id = 1; // 0 = invalid handle; // TODO: rename to something sensible
+    // No data members: state lives in a .cpp-private RenderGraphStorage (see RenderGraph.cpp).
 
 private:
     // type-erase the execute callback into allocator-owned memory; the trampoline is a

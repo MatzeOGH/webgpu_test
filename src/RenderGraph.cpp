@@ -232,6 +232,26 @@ struct NodeAdjacency
     NodeAdjacency* next{};
 };
 
+// RenderGraph carries no data members; its state lives here, bump-allocated immediately after the
+// RenderGraph object (see create_render_graph) and recovered via a fixed offset from `this`. Keeps
+// the header a pure method-only interface.
+struct RenderGraphStorage
+{
+    GraphAllocator*     m_allocator{};
+    GraphResourceCache* cache{};
+    ResourceNode*       m_resouces{};
+    PassNode*           m_passes{};
+    WGPUDevice          m_device{};
+    uint32_t            next_id = 1; // 0 = invalid handle
+};
+
+static RenderGraphStorage* storage(RenderGraph* rg)
+{
+    return reinterpret_cast<RenderGraphStorage*>(
+        reinterpret_cast<uint8_t*>(rg)
+        + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
+}
+
 GraphAllocator* create_allocator(){
     GraphAllocator* allocator = new GraphAllocator;
     size_t capacity = 1u << 20;// alloc 1 MB
@@ -250,8 +270,10 @@ RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* 
 {
     allocator->reset();
     RenderGraph* rg = allocator->make<RenderGraph>();
-    rg->m_allocator = allocator;
-    rg->cache = cache;
+    RenderGraphStorage* st = allocator->make<RenderGraphStorage>();
+    assert(st == storage(rg) && "storage must sit immediately after the RenderGraph");
+    st->m_allocator = allocator;
+    st->cache       = cache;
     return rg;
 }
 
@@ -306,10 +328,11 @@ static bool in_pass_accesses_conflict(AccessType a, AccessType b)
 
 ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc& desc)
 {
-    ResourceNode* resouce = m_allocator->make<ResourceNode>();
+    RenderGraphStorage& s = *storage(this);
+    ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { next_id++ };
-    resouce->name = m_allocator->copy_string(name);
+    resouce->handle = { s.next_id++ };
+    resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->dimension = desc.dimension;
     resouce->format = desc.format;
@@ -319,7 +342,7 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
     resouce->relativeToHandle = desc.relativeTo;
     resouce->absolute = desc.absolute;
 
-    list_append(&m_resouces, resouce);
+    list_append(&s.m_resouces, resouce);
 
     return resouce->handle;
 }
@@ -327,15 +350,16 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
 
 ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc& desc)
 {
-    ResourceNode* resouce = m_allocator->make<ResourceNode>();
+    RenderGraphStorage& s = *storage(this);
+    ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { next_id++ };
-    resouce->name = m_allocator->copy_string(name);
+    resouce->handle = { s.next_id++ };
+    resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
 
     resouce->bufferSize = desc.size;
 
-    list_append(&m_resouces, resouce);
+    list_append(&s.m_resouces, resouce);
 
     return resouce->handle;
 }
@@ -345,16 +369,17 @@ ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc&
 // the graph only needs the `imported` flag so passes that write them count as sinks (compile()).
 ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size)
 {
-    ResourceNode* resouce = m_allocator->make<ResourceNode>();
+    RenderGraphStorage& s = *storage(this);
+    ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { next_id++ };
-    resouce->name = m_allocator->copy_string(name);
+    resouce->handle = { s.next_id++ };
+    resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->imported = true;
     resouce->view = view;
     resouce->resolved = size;
 
-    list_append(&m_resouces, resouce);
+    list_append(&s.m_resouces, resouce);
 
     return resouce->handle;
 }
@@ -362,15 +387,16 @@ ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView v
 
 ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer)
 {
-    ResourceNode* resouce = m_allocator->make<ResourceNode>();
+    RenderGraphStorage& s = *storage(this);
+    ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { next_id++ };
-    resouce->name = m_allocator->copy_string(name);
+    resouce->handle = { s.next_id++ };
+    resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->imported = true;
     resouce->buffer = buffer;
 
-    list_append(&m_resouces, resouce);
+    list_append(&s.m_resouces, resouce);
 
     return resouce->handle;
 }
@@ -378,8 +404,9 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 
 GraphBuilder RenderGraph::begin_pass(WGPUStringView name, PassKind kind)
 {
-    PassNode* pass = m_allocator->make<PassNode>();
-    pass->name = m_allocator->copy_string(name);
+    RenderGraphStorage& s = *storage(this);
+    PassNode* pass = s.m_allocator->make<PassNode>();
+    pass->name = s.m_allocator->copy_string(name);
     pass->kind = kind;
 
     GraphBuilder builder;
@@ -389,12 +416,12 @@ GraphBuilder RenderGraph::begin_pass(WGPUStringView name, PassKind kind)
 
 void RenderGraph::end_pass(GraphBuilder& builder)
 {
-    list_append(&m_passes, builder.m_new_pass);
+    list_append(&storage(this)->m_passes, builder.m_new_pass);
 }
 
 void* RenderGraph::alloc_exec(size_t size, size_t align)
 {
-    return m_allocator->alloc_raw(size, align);
+    return storage(this)->m_allocator->alloc_raw(size, align);
 }
 
 void RenderGraph::set_exec(GraphBuilder& builder, void* obj, void(*fn)(void*, PassContext&))
@@ -508,14 +535,16 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
 
 bool RenderGraph::compile()
 {
+    RenderGraphStorage& s = *storage(this);
+
     // phase 1: build adjacency (pass dependency DAG, "depends-on" direction). The versioning sweep
     // (see sweep_resource_versions) discovers every RAW/WAW/WAR hazard in declaration order; here all
     // three collapse to add_dependency -- its dedup folds multiple hazards between one pass pair into
     // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
     // before any writer get no edge here; the post-cull pass below turns them into errors.
-    sweep_resource_versions(m_allocator, m_passes, next_id,
+    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t /*id*/, HazardKind /*kind*/) {
-            add_dependency(m_allocator, dependent, dep);
+            add_dependency(s.m_allocator, dependent, dep);
         });
 
     // phase 2: dead-node removal + topo sort, fused into one DFS seeded from sinks.
@@ -523,20 +552,20 @@ bool RenderGraph::compile()
         // sinks = passes writing an imported resource. accesses store only handle.id, so flatten
         // the imported flags into an id-indexed table first (same scratch_alloc-over-next_id trick
         // as phase 1's lastWriter).
-        bool* imported = m_allocator->scratch_alloc<bool>(next_id);
-        for (ResourceNode* r = m_resouces; r; r = r->next)
+        bool* imported = s.m_allocator->scratch_alloc<bool>(s.next_id);
+        for (ResourceNode* r = s.m_resouces; r; r = r->next)
             imported[r->handle.id] = r->imported;
 
         // topo into a transient array, then relink the intrusive list into execution order. The
         // result lives in m_passes itself; the array is just DFS scratch, reclaimed by the
         // deferred reset_scratch() below.
         uint32_t N = 0;
-        for (PassNode* p = m_passes; p; p = p->next) ++N;
+        for (PassNode* p = s.m_passes; p; p = p->next) ++N;
 
-        PassNode** order = m_allocator->scratch_alloc<PassNode*>(N);
-        defer { m_allocator->reset_scratch(); };
+        PassNode** order = s.m_allocator->scratch_alloc<PassNode*>(N);
+        defer { s.m_allocator->reset_scratch(); };
         uint32_t count = 0;
-        for (PassNode* p = m_passes; p; p = p->next)
+        for (PassNode* p = s.m_passes; p; p = p->next)
             if (is_sink(p, imported))
                 topo_visit(p, order, count);          // only reaches passes that feed a sink
 
@@ -544,7 +573,7 @@ bool RenderGraph::compile()
         // pass not reachable from a sink was never emitted -> dead, dropped here for free.
         for (uint32_t i = 0; i + 1 < count; ++i) order[i]->next = order[i + 1];
         if (count) order[count - 1]->next = nullptr;
-        m_passes = count ? order[0] : nullptr;
+        s.m_passes = count ? order[0] : nullptr;
 
         // ponytail: transient array as DFS scratch — can't sort a one-field intrusive list in
         // place (a dep emitted before the driver reaches it clobbers its `next`, dropping
@@ -563,17 +592,17 @@ bool RenderGraph::compile()
     //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
     // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
     {
-        bool* hasWriter = m_allocator->scratch_alloc<bool>(next_id);   // some surviving pass writes id
-        bool* produced  = m_allocator->scratch_alloc<bool>(next_id);   // ...has written it so far, in order
-        bool* imported  = m_allocator->scratch_alloc<bool>(next_id);
-        defer { m_allocator->reset_scratch(); };
-        for (ResourceNode* r = m_resouces; r; r = r->next) imported[r->handle.id] = r->imported;
-        for (PassNode* p = m_passes; p; p = p->next)
+        bool* hasWriter = s.m_allocator->scratch_alloc<bool>(s.next_id);   // some surviving pass writes id
+        bool* produced  = s.m_allocator->scratch_alloc<bool>(s.next_id);   // ...has written it so far, in order
+        bool* imported  = s.m_allocator->scratch_alloc<bool>(s.next_id);
+        defer { s.m_allocator->reset_scratch(); };
+        for (ResourceNode* r = s.m_resouces; r; r = r->next) imported[r->handle.id] = r->imported;
+        for (PassNode* p = s.m_passes; p; p = p->next)
             for (uint32_t i = 0; i < p->accessCount; ++i)
                 if (access_is_write(p->accesses[i].type)) hasWriter[p->accesses[i].handle.id] = true;
 
         bool hadError = false;
-        for (PassNode* p = m_passes; p; p = p->next)
+        for (PassNode* p = s.m_passes; p; p = p->next)
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 uint32_t id = p->accesses[i].handle.id;
                 if (access_is_write(p->accesses[i].type)) { produced[id] = true; continue; }
@@ -595,11 +624,11 @@ bool RenderGraph::compile()
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
     {
         // id->node table, same scratch_alloc-over-next_id trick as phases 1/2.
-        ResourceNode** byId = m_allocator->scratch_alloc<ResourceNode*>(next_id);
-        defer { m_allocator->reset_scratch(); };
-        for (ResourceNode* r = m_resouces; r; r = r->next) byId[r->handle.id] = r;
+        ResourceNode** byId = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_id);
+        defer { s.m_allocator->reset_scratch(); };
+        for (ResourceNode* r = s.m_resouces; r; r = r->next) byId[r->handle.id] = r;
 
-        for (PassNode* p = m_passes; p; p = p->next)          // m_passes == surviving (post-cull) passes
+        for (PassNode* p = s.m_passes; p; p = p->next)          // m_passes == surviving (post-cull) passes
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 ResourceNode* r = byId[p->accesses[i].handle.id];
                 if (!r) continue;
@@ -634,7 +663,7 @@ bool RenderGraph::compile()
 
         // resolve concrete sizes here (CPU-only -> belongs in compile, not realize) by walking each
         // texture's relativeTo chain. memoized + recursive, so chains and any declaration order work.
-        for (ResourceNode* r = m_resouces; r; r = r->next)
+        for (ResourceNode* r = s.m_resouces; r; r = r->next)
             if (r->kind == ResourceNode::Kind::Texture) resolve_size(r, byId);
 
         // ponytail: usage==0 here == untouched by a live pass -> future realize() skips it = free
@@ -662,22 +691,23 @@ static uint32_t pass_index(PassNode* head, PassNode* target)
 // produce no pass->pass edge and don't appear.
 void debug_print_mermaid(RenderGraph* rg)
 {
+    RenderGraphStorage& s = *storage(rg);
     std::printf("flowchart LR\n");
 
     // node decl: stable id Pi -> pass name, indexed by list position.
     uint32_t idx = 0;
-    for (PassNode* p = rg->m_passes; p; p = p->next, ++idx)
+    for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
         std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->name.length, p->name.data ? p->name.data : "");
 
     // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
-    sweep_resource_versions(rg->m_allocator, rg->m_passes, rg->next_id,
+    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
             ResourceNode* r = rg->node({ id });
             WGPUStringView nm = r ? r->name : WGPUStringView{};
             const char* tag = kind == HazardKind::WAW ? " (WAW)" : kind == HazardKind::WAR ? " (WAR)" : "";
             std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
-                        pass_index(rg->m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
-                        pass_index(rg->m_passes, dependent));
+                        pass_index(s.m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
+                        pass_index(s.m_passes, dependent));
         });
 
     std::fflush(stdout);
@@ -689,7 +719,7 @@ void debug_print_mermaid(RenderGraph* rg)
 // ponytail: O(n) per lookup; build an id->node table on the graph if pass bodies do many lookups.
 ResourceNode* RenderGraph::node(ResourceHandle h)
 {
-    for (ResourceNode* r = m_resouces; r; r = r->next)
+    for (ResourceNode* r = storage(this)->m_resouces; r; r = r->next)
         if (r->handle.id == h.id) return r;
     return nullptr;
 }
@@ -714,8 +744,9 @@ WGPUBuffer PassContext::buffer(ResourceHandle h) const
 // untouched by a live pass -> skipped too (the free dead-resource cull compile() phase 3 set up).
 void RenderGraph::realize(WGPUDevice device)
 {
-    m_device = device;
-    for (ResourceNode* r = m_resouces; r; r = r->next) {
+    RenderGraphStorage& s = *storage(this);
+    s.m_device = device;
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->imported) continue;
         if (r->kind == ResourceNode::Kind::Texture) {
             if (!r->texUsage) continue;
@@ -751,7 +782,7 @@ void RenderGraph::realize(WGPUDevice device)
 // rather than shared because those live in Renderer.cpp (not a header) and this TU is standalone.
 void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
 {
-    for (PassNode* p = m_passes; p; p = p->next) {
+    for (PassNode* p = storage(this)->m_passes; p; p = p->next) {
         PassContext ctx{};
         ctx.encoder = encoder;
         ctx.graph = this;
@@ -817,7 +848,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
 // realize(); call once the frame's commands have been submitted.
 void RenderGraph::release_resources()
 {
-    for (ResourceNode* r = m_resouces; r; r = r->next) {
+    for (ResourceNode* r = storage(this)->m_resouces; r; r = r->next) {
         if (r->imported) continue;
         if (r->view)    { wgpuTextureViewRelease(r->view); r->view    = nullptr; }
         if (r->texture) { wgpuTextureRelease(r->texture);  r->texture = nullptr; }

@@ -1048,7 +1048,7 @@ int main()
         if ((int)ssaoOn != shownSsao || debugMode != shownDebug) {
             shownSsao = (int)ssaoOn; shownDebug = debugMode;
             std::printf("execution order:");
-            for (PassNode* p = rg->m_passes; p; p = p->next) std::printf(" %s", p->name.data);
+            for (PassNode* p = storage(rg)->m_passes; p; p = p->next) std::printf(" %s", p->name.data);
             std::printf("\n");
             debug_print_mermaid(rg);
         }
