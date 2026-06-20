@@ -180,20 +180,11 @@ struct RenderGraph
     void execute(WGPUCommandEncoder encoder, WGPUQueue queue);
     // release graph-created textures/views/buffers (imported resources left alone)
     void release_resources();
-    // re-point an imported resource at this frame's GPU handle (e.g. the swapchain view, which the
-    // surface hands out fresh every frame) so a graph can be built/compiled once and re-executed.
-    void update_imported_view(ResourceHandle h, WGPUTextureView view, WGPUExtent3D size, WGPUTexture texture = nullptr);
     // resolve a handle to its node (linear walk; see ceiling note in .cpp)
     ResourceNode* node(ResourceHandle h);
 
     // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
     void debug_print_mermaid();
-
-    // Marks the beginning of the declaration of a render pass
-    GraphBuilder begin_pass(WGPUStringView name, PassKind kind);
-
-    // Marks the end of the render pass
-    void end_pass(GraphBuilder& builder);
 
     GraphAllocator* m_allocator{};
     GraphResourceCache* cache{};
@@ -215,6 +206,11 @@ private:
     }
     void* alloc_exec(size_t size, size_t align);                                       // forwards to GraphAllocator
     void  set_exec(GraphBuilder& builder, void* obj, void(*fn)(void*, PassContext&));  // writes obj+fn onto PassNode
+
+    // .cpp shims add_pass uses to alloc/append a PassNode across the header/.cpp boundary
+    // (PassNode/GraphAllocator are incomplete here); not part of the public API.
+    GraphBuilder begin_pass(WGPUStringView name, PassKind kind);
+    void end_pass(GraphBuilder& builder);
 };
 
 GraphAllocator* create_allocator();

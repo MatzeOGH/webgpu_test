@@ -20,7 +20,6 @@ merged from RenderGraphsTODO.md + docs/rendergraph-state.md, sorted by priority
 
 [] resource lifetime tracking (firstUse/lastUse per resource, computed in compile()) -- prerequisite for transient aliasing below
 [] resource type validation: surface ResourceNode::Kind (Texture/Buffer) at the API layer and reject mismatched access (e.g. vertex_buffer() on a texture handle, sampled() on a buffer)
-[] separate generic ResourceAccess from attachment-only metadata (loadOp/storeOp/clearColor/clearDepth) -- those fields are dead weight on every non-attachment access; split into an AttachmentInfo struct/union
 [] MSAA support: sampleCount on TextureDesc + resolve attachment wiring in execute() (realize() currently hardcodes sampleCount=1, mipLevelCount=1)
 [] add instrumentation to measure compile() time
 

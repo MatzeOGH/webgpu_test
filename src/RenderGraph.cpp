@@ -678,12 +678,6 @@ ResourceNode* RenderGraph::node(ResourceHandle h)
     return nullptr;
 }
 
-void RenderGraph::update_imported_view(ResourceHandle h, WGPUTextureView view, WGPUExtent3D size, WGPUTexture texture)
-{
-    if (ResourceNode* r = node(h)) { r->view = view; r->resolved = size; r->texture = texture; }
-    // texture stays caller-owned: release_resources() skips imported nodes, so no double-free.
-}
-
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
     ResourceNode* r = graph ? graph->node(h) : nullptr;
