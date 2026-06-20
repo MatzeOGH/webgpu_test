@@ -188,7 +188,7 @@ struct RenderGraph
     ResourceNode* m_resouces{};
     PassNode* m_passes{};       // after compile(): in execution order (toposorted)
     WGPUDevice m_device{};      // set by realize(); resources are created against it
-    uint32_t next_id = 1; // 0 = invalid handle
+    uint32_t next_id = 1; // 0 = invalid handle; // TODO: rename to something sensible
 
 private:
     // type-erase the execute callback into allocator-owned memory; the trampoline is a

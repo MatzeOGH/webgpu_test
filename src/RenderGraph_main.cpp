@@ -4,6 +4,7 @@
 //   shadow   (graphics, depth-only)  : raymarch the same SDF from a directional light -> depth-only shadow map
 //   ssao     (compute)               : screen-space AO from gbuffer depth + normal          [SPACE toggles]
 //   lighting (graphics, fullscreen)  : gbuffer + shadow map + directional light -> lit color
+//   sky      (graphics, fullscreen)  : re-writes lit color's background pixels (2nd writer -> WAW edge)
 //   compose  (graphics, fullscreen)  : lit * ao -> swapchain   (a plain "present" of lit color when SSAO is off)
 // Pass order is derived from the accesses each frame; toggling SSAO with SPACE adds/drops the ssao pass
 // (and swaps compose<->present) -- the graph reshapes itself, the point of an immediate-mode graph.
@@ -361,6 +362,18 @@ const char* kDebugFs = R"(
 }
 )";
 
+// sky fill: re-write litColor on the BACKGROUND pixels only (a vertical gradient). Runs after lighting
+// with LoadOp_Load -> a second writer of litColor == a WAW edge (lighting -> sky) in the graph.
+const char* kSkyFs = R"(
+@group(0) @binding(0) var gDepth : texture_depth_2d;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px = vec2i(in.pos.xy);
+    if (textureLoad(gDepth, px, 0) < 1.0) { discard; }       // geometry -> keep the lit result
+    let h = clamp(in.ndc.y * 0.5 + 0.5, 0.0, 1.0);           // 0 horizon .. 1 zenith
+    return vec4f(mix(vec3f(0.45, 0.55, 0.70), vec3f(0.10, 0.20, 0.45), h), 1.0);
+}
+)";
+
 // adapter + device against the given surface, pumped synchronously via the instance (kept alive by
 // the caller). mirrors Framework.cpp's request flow, plus compatibleSurface so the adapter can present.
 wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
@@ -641,6 +654,20 @@ int main()
     WGPURenderPipeline presentPipe = wgpuDeviceCreateRenderPipeline(dev, &presentPD);
     wgpuShaderModuleRelease(presentSM);
 
+    // sky: fills litColor's background pixels (discards on geometry). 2nd writer of litColor -> WAW.
+    WGPUShaderModule skySM = make_shader(dev, std::string(kVS) + kSkyFs);
+    WGPUColorTargetState skyCT{ .format = kColorFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState skyFrag{ .module = skySM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &skyCT };
+    WGPURenderPipelineDescriptor skyPD{
+        .label       = WEBGPU_STR("sky pipeline"),
+        .vertex      = { .module = skySM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &skyFrag,
+    };
+    WGPURenderPipeline skyPipe = wgpuDeviceCreateRenderPipeline(dev, &skyPD);
+    wgpuShaderModuleRelease(skySM);
+
     // debug (keys 1..4): blit one gbuffer image straight to the swapchain.
     WGPUShaderModule debugSM = make_shader(dev, std::string(kVS) + kSceneDecl + kDebugFs);
     WGPUColorTargetState debugCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
@@ -874,6 +901,26 @@ int main()
                 wgpuBindGroupLayoutRelease(l);
             });
 
+        // 4b) sky: 2nd writer of litColor (LoadOp_Load, background pixels only) -> WAW edge after lighting.
+        rg->add_pass(WEBGPU_STR("sky"), PassKind::Graphics,
+            [&](GraphBuilder& b) {
+                b.sampled(gDepth);                                                              // which pixels are background
+                b.color(litColor, WGPULoadOp_Load, WGPUStoreOp_Store);                          // keep lit geometry, add sky
+            },
+            [dev, skyPipe, gDepth](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(skyPipe, 0);
+                WGPUBindGroupEntry e[1] = {
+                    { .binding = 0, .textureView = ctx.view(gDepth) },
+                };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuRenderPassEncoderSetPipeline(ctx.render, skyPipe);
+                wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                wgpuBindGroupRelease(bg);
+                wgpuBindGroupLayoutRelease(l);
+            });
+
         // 5) final blit -> swapchain. debug active: dump one image and let the graph cull whatever isn't
         // needed to produce it (1-4 -> gbuffer, only gbuffer survives; 5 -> ao, gbuffer+ssao survive).
         // else SSAO on: lit * ao; else lit color (present).
@@ -983,7 +1030,7 @@ int main()
             std::printf("execution order:");
             for (PassNode* p = rg->m_passes; p; p = p->next) std::printf(" %s", p->name.data);
             std::printf("\n");
-            rg->debug_print_mermaid();
+            debug_print_mermaid(rg);
         }
 
         // host-upload the scene + a slowly rotating directional light. The spheres are packed into a
@@ -1033,6 +1080,7 @@ int main()
 
     // ---- teardown --------------------------------------------------------------------------------
     wgpuRenderPipelineRelease(debugPipe);
+    wgpuRenderPipelineRelease(skyPipe);
     wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(composePipe);
     wgpuComputePipelineRelease(ssaoPipe);
