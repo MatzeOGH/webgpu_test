@@ -501,6 +501,26 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
         rg_expect(g->compile(), !errCaught, "within-pass read-then-write (unproduced)");
     }
 
+    // OK: same resource sampled twice in one pass (read+read) -- the build-time use() check must NOT trip
+    // (no write involved). The illegal cases it DOES catch (sampled+storage_write, double write) assert at
+    // declaration time, so they can't be exercised here without aborting the run -- verified manually.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto tex = g->create_image(WEBGPU_STR("tex"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
+        g->add_pass(WEBGPU_STR("read.twice"), PassKind::Graphics, [&](GraphBuilder& b){ b.sampled(tex); b.sampled(tex); b.color(out); }, noop);
+        rg_expect(g->compile(), true, "sampled twice (read+read)");
+    }
+
+    // OK: read-only depth + sampled of the same texture in one pass (both reads) -- must NOT trip either.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out   = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto depth = g->create_image(WEBGPU_STR("depth"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
+        g->add_pass(WEBGPU_STR("depth.ro+sampled"), PassKind::Graphics, [&](GraphBuilder& b){ b.depth_stencil_read_only(depth); b.sampled(depth); b.color(out); }, noop);
+        rg_expect(g->compile(), true, "read-only depth + sampled (read+read)");
+    }
+
     std::printf("[rg-test] %s (%d failure%s)\n\n",
                 g_rgTestFails ? "FAILURES" : "all passed", g_rgTestFails, g_rgTestFails == 1 ? "" : "s");
 }

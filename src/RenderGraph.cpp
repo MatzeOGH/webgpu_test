@@ -287,6 +287,22 @@ static bool access_is_write(AccessType t)
         || t == AccessType::CopyDst;
 }
 
+#if RG_VALIDATE
+// do two accesses to the SAME resource in ONE pass (one usage scope) conflict? read+read never does.
+// the lone read+write exception is StorageRead+StorageWrite: that is how the graph spells a read-modify-
+// write storage binding (var<storage, read_write>) -- one writable-storage usage, not an alias (the
+// "multi-writer chain" test + the sweep's WAR self-guard depend on it). Any other pairing involving a
+// write is illegal: a read-only binding aliasing a write (e.g. Sampled+StorageWrite, the named case), or
+// two writes the graph can't order within an atomic pass ("multiple unsynchronized writes").
+static bool in_pass_accesses_conflict(AccessType a, AccessType b)
+{
+    if (!access_is_write(a) && !access_is_write(b)) return false;
+    if ((a == AccessType::StorageRead  && b == AccessType::StorageWrite) ||
+        (a == AccessType::StorageWrite && b == AccessType::StorageRead)) return false;
+    return true;
+}
+#endif
+
 
 ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc& desc)
 {
@@ -815,6 +831,31 @@ void RenderGraph::release_resources()
 void GraphBuilder::use(ResourceHandle handle, AccessType type,
                        WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth)
 {
+#if RG_VALIDATE
+    // immediate (declaration-time) usage check -- fires at the exact b.sampled()/b.storage_write() call
+    // site, not deferred to compile(). A pass is one WebGPU usage scope; a resource may not be aliased
+    // read+write (e.g. sampled + storage_write -- the named case) or written more than once (the graph
+    // can't order two writes inside an atomic pass). read+read and the StorageRead+StorageWrite RMW pair
+    // are fine -- see in_pass_accesses_conflict.
+    // ponytail: WebGPU itself permits multiple writable-storage uses in one scope; the graph is stricter
+    // because it has no way to synchronize two writes inside a pass -- relax if a shader ever needs it.
+    if (m_new_pass && handle.id) {
+        const bool w = access_is_write(type);
+        for (uint32_t i = 0; i < m_new_pass->accessCount; ++i) {
+            if (m_new_pass->accesses[i].handle.id != handle.id) continue;
+            if (in_pass_accesses_conflict(type, m_new_pass->accesses[i].type)) {
+                std::printf("[RenderGraph] error: pass \"%.*s\" uses resource id %u %s in one pass -- a "
+                            "written resource must be its only use in the pass.\n",
+                            (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "",
+                            handle.id, (w && access_is_write(m_new_pass->accesses[i].type))
+                                           ? "as more than one write (unsynchronized)"
+                                           : "as both written and read");
+                assert(false && "RenderGraph: illegal in-pass resource usage (read+write or double write in one pass)");
+            }
+        }
+    }
+#endif
+
     if (m_new_pass && m_new_pass->accessCount < PassNode::kMaxAccess)
         m_new_pass->accesses[m_new_pass->accessCount++] = { handle, type, load, store, clear, clearDepth };
     // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it

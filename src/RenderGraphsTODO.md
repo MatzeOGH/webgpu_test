@@ -12,7 +12,6 @@ merged from RenderGraphsTODO.md + docs/rendergraph-state.md, sorted by priority
 
 [] force_keep flag on passes / explicit mark_output(ResourceHandle) -- culling currently only roots at passes writing an *imported* resource, so side-effect-only passes (readback/debug/profiling/indirect-arg-gen) and non-imported outputs get silently dropped
 [] kMaxAccess=16 per pass and the 1MB arena are fixed with no growth path; add an assert or grow-on-demand -- currently silently drops accesses past the cap
-[] add immediate validation in GraphBuilder: catch illegal usage (texture as both sampled + storage-write in same pass, multiple unsynchronized writes) at build time instead of silently compiling something wrong -- no validation exists today
 [] implement a PoC of GraphResourceCache -- struct already exists (RenderGraph.cpp) but is just an empty vector, not wired into realize(), so resources are still recreated every frame
 [] review/critique the scratch_alloc implementation -- scrutinize the two-sided arena arithmetic (alignment round-down, unsigned-underflow guards, the capacity-scratchUsed vs capacity-used boundary checks in alloc_raw/scratch_alloc_raw), confirm no front/scratch overlap edge case, and sanity-check the per-scope defer reset_scratch() pattern in compile()/sweep_resource_versions()
 
@@ -39,6 +38,7 @@ merged from RenderGraphsTODO.md + docs/rendergraph-state.md, sorted by priority
 
 ## Done
 
+[x] immediate (declaration-time) usage validation in GraphBuilder::use() -- asserts at the exact b.xxx() call site (one frame above) when a resource is aliased read+write in one pass (e.g. sampled + storage_write, the named case) or written more than once (the graph can't order two writes in an atomic pass). StorageRead+StorageWrite (RMW: a read_write storage binding) and read+read are exempt -- see in_pass_accesses_conflict(). Gated by RG_VALIDATE, compiled out in release like the def-before-use check. The cross-pass def-before-use check is KEPT: it catches reader-before-writer over the culled schedule, which a per-pass builder check structurally cannot see
 [x] DepthStencilReadOnly access type -- read-only depth (lighting reading a prepass's depth) is now AccessType::DepthStencilReadOnly: classified as a read (attachment-read), sets depthReadOnly in execute(), no false write hazard. Also fixed buffer copy_src/copy_dst usage (were texture-only) as part of a full AccessType->WGPU-usage spec audit
 [x] AccessType::Vertex/Index/Indirect + matching WGPUBufferUsage bits, so RG-managed vertex/index/indirect-args buffers are possible
 [x] pass culling -- compile() phase 2 does DFS from sinks (passes writing an imported resource); unreached passes are dropped for free
