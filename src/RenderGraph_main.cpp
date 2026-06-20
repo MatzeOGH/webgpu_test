@@ -83,6 +83,95 @@ wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
 
 } // anon
 
+// ---------------------------------------------------------------------------------------------------
+// compile()-only edge-case tests (NO GPU work): build tiny graphs and run them through compile(),
+// checking only the bool return. Covers the consumer-before-producer error and the exemptions that
+// must NOT false-positive. Bodies never run (compile() doesn't invoke them); realize()/execute() are
+// never called. Runs once at startup, before the render loop.
+namespace {
+
+int g_rgTestFails = 0;
+
+void rg_expect(bool got, bool want, const char* name)
+{
+    const bool ok = (got == want);
+    if (!ok) ++g_rgTestFails;
+    std::printf("[rg-test] %-42s %s  (compile()=%s)\n",
+                name, ok ? "PASS" : "FAIL", got ? "true" : "false");
+}
+
+void run_rg_compile_tests(RG::GraphAllocator* alloc)
+{
+    using namespace RG;
+    auto noop = [](PassContext&){};                 // bodies never run -- compile() doesn't invoke them
+    std::printf("[rg-test] compile()-only edge cases:\n");
+
+    // OK: producer declared before its consumer.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
+        g->add_pass(WEBGPU_STR("producer"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(x); }, noop);
+        g->add_pass(WEBGPU_STR("consumer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x); b.color(out); }, noop);
+        rg_expect(g->compile(), true, "producer before consumer");
+    }
+
+    // ERROR: consumer declared before producer of a transient (both survive -- both write the sink).
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
+        g->add_pass(WEBGPU_STR("consumer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x);  b.color(out); }, noop);
+        g->add_pass(WEBGPU_STR("producer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_write(x); b.color(out); }, noop);
+        rg_expect(g->compile(), false, "consumer before producer (transient)");
+    }
+
+    // OK: a transient read but never written by any pass (host-uploaded uniform) -- hasWriter exemption.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto ubo = g->create_buffer(WEBGPU_STR("ubo"), { .size = 16 });
+        g->add_pass(WEBGPU_STR("use"), PassKind::Graphics, [&](GraphBuilder& b){ b.uniform(ubo); b.color(out); }, noop);
+        rg_expect(g->compile(), true, "read-never-written transient (ubo)");
+    }
+
+    // OK: an imported resource read before an in-graph write (legal "read then overwrite" WAR).
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto imp = g->import_buffer(WEBGPU_STR("imp"), nullptr);
+        g->add_pass(WEBGPU_STR("read.imported"),  PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(imp);  b.color(out); }, noop);
+        g->add_pass(WEBGPU_STR("write.imported"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(imp); }, noop);
+        rg_expect(g->compile(), true, "imported read-before-write");
+    }
+
+    // OK: multi-writer chain (v1 written, read, v2 written, read) -- no false early-read error.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
+        g->add_pass(WEBGPU_STR("prepass"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(x); }, noop);                   // x v1
+        g->add_pass(WEBGPU_STR("read.v1"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_read(x); }, noop);
+        g->add_pass(WEBGPU_STR("main"),    PassKind::Compute,  [&](GraphBuilder& b){ b.storage_read(x); b.storage_write(x); }, noop); // v1 -> v2
+        g->add_pass(WEBGPU_STR("read.v2"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x); b.color(out); }, noop);
+        rg_expect(g->compile(), true, "multi-writer chain");
+    }
+
+    // ERROR: a pass reads then writes the same transient that nothing else produced -> reads uninitialized.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
+        g->add_pass(WEBGPU_STR("rmw"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x); b.storage_write(x); b.color(out); }, noop);
+        rg_expect(g->compile(), false, "within-pass read-then-write (unproduced)");
+    }
+
+    std::printf("[rg-test] %s (%d failure%s)\n\n",
+                g_rgTestFails ? "FAILURES" : "all passed", g_rgTestFails, g_rgTestFails == 1 ? "" : "s");
+}
+
+} // anon
+
 int main()
 {
     using namespace RG;
@@ -300,6 +389,8 @@ int main()
     // object that lives across frames.
     GraphAllocator* allocator = create_allocator();
 
+    run_rg_compile_tests(allocator);   // compile()-only edge-case checks (no GPU); next create_render_graph() resets the arena
+
     // ---- frame loop: declare + compile + realize + execute + release the graph EVERY frame -------
     bool glow      = true;   // SPACE toggles the compute blur/compose glow
     int  shownGlow = -1;     // last glow state we printed the execution order for
@@ -488,7 +579,14 @@ int main()
                 });
         }
 
-        rg->compile();
+        if (!rg->compile()) {
+            // ordering error (a transient resource read before its writer); compile() already printed
+            // the offending pass/resource. skip this frame's GPU work instead of rendering garbage.
+            wgpuTextureViewRelease(view);
+            wgpuTextureRelease(st.texture);
+            instance.ProcessEvents();
+            continue;
+        }
         rg->realize(dev);     // creates this frame's offscreen textures (+ ubo) from the resolved usages/sizes
 
         // proof the per-frame graph really changes shape: print the order whenever glow flips.
