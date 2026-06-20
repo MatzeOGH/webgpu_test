@@ -329,6 +329,66 @@ static void add_dependency(GraphAllocator* alloc, PassNode* p, PassNode* dep)
     p->adjacency = link;                       // prepend
 }
 
+enum struct HazardKind : uint8_t { RAW, WAW, WAR };
+
+// One declaration-order sweep with implicit SSA resource versioning, shared by compile() phase 1
+// (turns each edge into add_dependency) and debug_print_mermaid() (prints it) so the dump can never
+// drift from the real graph. Each write to a resource starts a new "version" (the writing pass IS the
+// version identity); each read binds to the current one. Calls onEdge(dependent, dep, id, kind) per
+// discovered hazard -- RAW (read -> producer), WAW (write -> prev writer), WAR (write -> readers of
+// the version being clobbered); `dependent` is always later in the walk than `dep`. Calls
+// onEarlyRead(reader, id) once per resource read before its first writer yet written later -- the
+// caller resolves id->name and decides whether to warn (compile() does; the dump passes a no-op).
+template<typename OnEdge, typename OnEarlyRead>
+static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_id,
+                                    OnEdge&& onEdge, OnEarlyRead&& onEarlyRead)
+{
+    // per resource id (1..next_id-1): the pass holding the current version, the readers of that
+    // version not yet retired by a newer write, and the first pass (if any) that read it before any
+    // writer existed.
+    PassNode**      currentProducer = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
+    NodeAdjacency** pendingReaders  = (NodeAdjacency**)std::calloc(next_id, sizeof(NodeAdjacency*));
+    PassNode**      earlyReader     = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
+
+    for (PassNode* p = head; p; p = p->next)
+        for (uint32_t i = 0; i < p->accessCount; ++i) {
+            uint32_t id = p->accesses[i].handle.id;
+            if (access_is_write(p->accesses[i].type)) {
+                // WAW: order this write after the previous writer. without it two writers of one
+                // resource have no edge -> undefined order -> corruption.
+                if (currentProducer[id] && currentProducer[id] != p)
+                    onEdge(p, currentProducer[id], id, HazardKind::WAW);
+                // WAR: order this write after every reader still using the version it clobbers.
+                for (NodeAdjacency* r = pendingReaders[id]; r; r = r->next)
+                    if (r->pass != p) onEdge(p, r->pass, id, HazardKind::WAR);
+                currentProducer[id] = p;        // new version born
+                pendingReaders[id]  = nullptr;  // its readers retired (old nodes are arena garbage)
+            } else {
+                // RAW: this read depends on the producer of the version it sees.
+                if (!currentProducer[id]) { if (!earlyReader[id]) earlyReader[id] = p; }  // read before any writer
+                else if (currentProducer[id] != p) onEdge(p, currentProducer[id], id, HazardKind::RAW);
+                // register as a pending reader of the current version (for a future write's WAR).
+                NodeAdjacency* link = alloc->make<NodeAdjacency>();
+                link->pass = p; link->next = pendingReaders[id]; pendingReaders[id] = link;
+            }
+        }
+
+    // declaration order is load-bearing: a read seen before its resource's first writer got no edge
+    // (it bound to "no producer"). if that resource is written later the read can't see that result --
+    // almost certainly the writer was declared after the reader. report it; reading an unproduced
+    // resource (imported input) is legal and stays silent (currentProducer[id] is null at the end).
+    for (uint32_t id = 1; id < next_id; ++id)
+        if (earlyReader[id] && currentProducer[id])
+            onEarlyRead(earlyReader[id], id);
+
+    std::free(currentProducer);
+    std::free(pendingReaders);
+    std::free(earlyReader);
+    // both self-guards above are load-bearing: read-then-write of one handle in a single pass would
+    // WAR-self-edge; write-then-write would WAW-self-edge. every edge points from a later- to an
+    // earlier-visited pass, so adjacency is acyclic by construction (no compile()-made cycles).
+}
+
 // Topological sort via recursive DFS post-order over predecessor (depends-on) edges: a pass is
 // appended only after everything it depends on, so `order` comes out deps-first. `placed` doubles
 // as the visited marker so shared deps are emitted once.
@@ -374,32 +434,22 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
 
 void RenderGraph::compile()
 {
-    // phase 1: build adjacency (pass dependency DAG, "depends-on" direction).
-    // declaration-order-independent: a reader links to its producer even when the reader was
-    // declared first (e.g. sink B sampling A's texture while B is declared before A).
-    {
-        // producer[id] = the pass that writes resource id; ids are 1..next_id-1. computed over
-        // ALL passes first, so the read sweep below can see producers declared later.
-        PassNode** producer = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
-        for (PassNode* p = m_passes; p; p = p->next)
-            for (uint32_t i = 0; i < p->accessCount; ++i)
-                if (access_is_write(p->accesses[i].type))
-                    producer[p->accesses[i].handle.id] = p;   // last writer wins (see ceiling note)
-
-        // RAW edges: each pass depends on the producer of every resource it READS.
-        for (PassNode* p = m_passes; p; p = p->next)
-            for (uint32_t i = 0; i < p->accessCount; ++i)
-                if (!access_is_write(p->accesses[i].type)) {
-                    PassNode* w = producer[p->accesses[i].handle.id];
-                    if (w && w != p) add_dependency(m_allocator, p, w);   // self-read skipped
-                }
-
-        std::free(producer);
-        // ponytail: single-producer model — RAW only, declaration order no longer matters. Drops
-        // the old order-dependent WAW edge (incompatible with order-independence; a resource with
-        // two live writers is undefined here). Ceiling: one writer per resource — add resource
-        // versioning if ping-pong / multiple live writers ever appear. WAR still unmodeled.
-    }
+    // phase 1: build adjacency (pass dependency DAG, "depends-on" direction). The versioning sweep
+    // (see sweep_resource_versions) discovers every RAW/WAW/WAR hazard in declaration order; here all
+    // three collapse to add_dependency -- its dedup folds multiple hazards between one pass pair into
+    // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored.
+    sweep_resource_versions(m_allocator, m_passes, next_id,
+        [&](PassNode* dependent, PassNode* dep, uint32_t /*id*/, HazardKind /*kind*/) {
+            add_dependency(m_allocator, dependent, dep);
+        },
+        [&](PassNode* reader, uint32_t id) {
+            ResourceNode* r = node({ id });   // node() lives here, so the diagnostic can name the resource
+            WGPUStringView rn = r ? r->name : WGPUStringView{};
+            std::printf("[RenderGraph] warning: pass \"%.*s\" reads resource \"%.*s\" before any pass "
+                        "writes it -- declare the writer first.\n",
+                        (int)reader->name.length, reader->name.data ? reader->name.data : "",
+                        (int)rn.length, rn.data ? rn.data : "");
+        });
 
     // phase 2: dead-node removal + topo sort, fused into one DFS seeded from sinks.
     {
@@ -484,11 +534,13 @@ static uint32_t pass_index(PassNode* head, PassNode* target)
     return 0;
 }
 
-// dump the graph as a Mermaid flowchart on stdout. passes are nodes; an edge P -->|res| Q means
-// pass P writes a resource that pass Q reads. edges are recomputed from the access lists (same
-// producer->reader rule as compile() phase 1), so this works before or after compile(). resources
-// read-but-unwritten (imported inputs) and written-but-unread (sinks like the swapchain) carry no
-// pass->pass edge and don't appear.
+// dump the graph as a Mermaid flowchart on stdout. passes are nodes; an edge dep -->|res| Q means Q
+// depends on dep via resource res (data/order flow points dep -> Q). edges come from the SAME
+// versioning sweep compile() uses, so the dump matches the real graph -- RAW (unlabelled), plus WAW
+// and WAR tagged in the edge label -- rather than an approximation. safe before or after compile():
+// the topo sort preserves the relative order of any two passes touching the same resource, so the
+// rediscovered edges are unchanged. resources with a single touch (imported inputs, unread sinks)
+// produce no pass->pass edge and don't appear.
 void RenderGraph::debug_print_mermaid()
 {
     std::printf("flowchart LR\n");
@@ -498,28 +550,18 @@ void RenderGraph::debug_print_mermaid()
     for (PassNode* p = m_passes; p; p = p->next, ++idx)
         std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->name.length, p->name.data ? p->name.data : "");
 
-    // producer[id] = pass writing resource id (last writer wins, matches compile()'s single-producer model)
-    PassNode** producer = (PassNode**)std::calloc(next_id, sizeof(PassNode*));
-    for (PassNode* p = m_passes; p; p = p->next)
-        for (uint32_t i = 0; i < p->accessCount; ++i)
-            if (access_is_write(p->accesses[i].type))
-                producer[p->accesses[i].handle.id] = p;
-
-    // one edge per read: link the reader back to the resource's producer, labelled with the resource name
-    for (PassNode* p = m_passes; p; p = p->next)
-        for (uint32_t i = 0; i < p->accessCount; ++i) {
-            const ResourceAccess& a = p->accesses[i];
-            if (access_is_write(a.type)) continue;
-            PassNode* w = producer[a.handle.id];
-            if (!w || w == p) continue;                 // unproduced input / self-read
-            ResourceNode* r = node(a.handle);
+    // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
+    sweep_resource_versions(m_allocator, m_passes, next_id,
+        [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
+            ResourceNode* r = node({ id });
             WGPUStringView nm = r ? r->name : WGPUStringView{};
-            std::printf("  P%u -->|\"%.*s\"| P%u\n",
-                        pass_index(m_passes, w), (int)nm.length, nm.data ? nm.data : "",
-                        pass_index(m_passes, p));
-        }
+            const char* tag = kind == HazardKind::WAW ? " (WAW)" : kind == HazardKind::WAR ? " (WAR)" : "";
+            std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
+                        pass_index(m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
+                        pass_index(m_passes, dependent));
+        },
+        [](PassNode*, uint32_t){});   // a debug dump doesn't diagnose authoring bugs -- stay quiet
 
-    std::free(producer);
     std::fflush(stdout);
     // ponytail: pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a
     // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.

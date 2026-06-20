@@ -1,9 +1,9 @@
 
 
-// RenderGraph
+// RenderGraph PoC
 // The goal is to define a immidiate mode render graph system
 // without thrashing the memory.
-// RULE: dont abstract webgpu api
+// RULE: dont abstract the webgpu api
 
 #pragma once
 
@@ -49,7 +49,7 @@ enum struct AccessType : uint8_t
     Sampled,                 // read
     StorageRead,             // read
     StorageWrite,            // write
-    Uniform,
+    Uniform,                 // read
     CopySrc,                 // read  (transfer source)
     CopyDst,                 // write (transfer destination)
 };
