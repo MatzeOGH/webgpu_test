@@ -183,9 +183,6 @@ struct RenderGraph
     // resolve a handle to its node (linear walk; see ceiling note in .cpp)
     ResourceNode* node(ResourceHandle h);
 
-    // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
-    void debug_print_mermaid();
-
     GraphAllocator* m_allocator{};
     GraphResourceCache* cache{};
     ResourceNode* m_resouces{};
@@ -217,6 +214,8 @@ GraphAllocator* create_allocator();
 GraphResourceCache* create_cache();
 RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* cache);
 
+// debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
+void debug_print_mermaid(RenderGraph* rg);
 
 }// RG
 #endif // RENDERGRAPH_H

@@ -644,24 +644,24 @@ static uint32_t pass_index(PassNode* head, PassNode* target)
 // the topo sort preserves the relative order of any two passes touching the same resource, so the
 // rediscovered edges are unchanged. resources with a single touch (imported inputs, unread sinks)
 // produce no pass->pass edge and don't appear.
-void RenderGraph::debug_print_mermaid()
+void debug_print_mermaid(RenderGraph* rg)
 {
     std::printf("flowchart LR\n");
 
     // node decl: stable id Pi -> pass name, indexed by list position.
     uint32_t idx = 0;
-    for (PassNode* p = m_passes; p; p = p->next, ++idx)
+    for (PassNode* p = rg->m_passes; p; p = p->next, ++idx)
         std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->name.length, p->name.data ? p->name.data : "");
 
     // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
-    sweep_resource_versions(m_allocator, m_passes, next_id,
+    sweep_resource_versions(rg->m_allocator, rg->m_passes, rg->next_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
-            ResourceNode* r = node({ id });
+            ResourceNode* r = rg->node({ id });
             WGPUStringView nm = r ? r->name : WGPUStringView{};
             const char* tag = kind == HazardKind::WAW ? " (WAW)" : kind == HazardKind::WAR ? " (WAR)" : "";
             std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
-                        pass_index(m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
-                        pass_index(m_passes, dependent));
+                        pass_index(rg->m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
+                        pass_index(rg->m_passes, dependent));
         });
 
     std::fflush(stdout);
