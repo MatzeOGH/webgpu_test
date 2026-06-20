@@ -48,6 +48,7 @@ wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
     wgpu::RequestAdapterOptions ao{};
     ao.powerPreference   = wgpu::PowerPreference::HighPerformance;
     ao.compatibleSurface = surface;
+    ao.backendType       = wgpu::BackendType::D3D12;   // or D3D12 -- force a backend instead of Dawn's default pick
     instance.RequestAdapter(&ao, wgpu::CallbackMode::AllowSpontaneous,
         [](wgpu::RequestAdapterStatus s, wgpu::Adapter a, wgpu::StringView m, AdState* st){
             if (s != wgpu::RequestAdapterStatus::Success)
@@ -177,7 +178,7 @@ int main()
             let gy  = (g + 2.0 * h + i) - (a + 2.0 * b + c);
 
             let mag = sqrt(gx * gx + gy * gy);
-            let color = params.edgeColor.rgb * mag;
+            let color = params.edgeColor.rgb * mag * 10;
             textureStore(dst, p, vec4f(color, 1.0));
         }
     )"));
@@ -200,7 +201,7 @@ int main()
             let p   = vec2i(i32(gid.x), i32(gid.y));
             if (p.x >= dim.x || p.y >= dim.y) { return; }
 
-            let R = 4;                          // ponytail: single-pass box, bump R or go separable if a profile says so
+            let R = 8;
             var sum   = vec3f(0.0);
             var count = 0.0;
             for (var dy = -R; dy <= R; dy = dy + 1) {
@@ -343,14 +344,33 @@ int main()
             .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
         });
 
+        // multi-writer smoke test (SSA versioning): a depth buffer written by two passes (v1 then
+        // v2 -> WAW edge) and read by scene/compose -> RAW; scene's read of v1 makes depth.main's
+        // overwrite a WAR. the two writers are graph-shape-only no-op Transfer passes: execute()
+        // auto-wires a depth attachment for *graphics* passes (which would then need a depth-enabled
+        // pipeline), but skips that for Transfer -- so this drives compile()'s versioning without
+        // touching the render pipelines. a real renderer would z-prepass / draw geometry here.
+        auto depth = rg->create_image(WEBGPU_STR("depth"), {
+            .dimension = WGPUTextureDimension_2D, .format = WGPUTextureFormat_Depth32Float,
+            .sizeKind  = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+        });
+        rg->add_pass(WEBGPU_STR("depth.prepass"), PassKind::Transfer,
+            [&](GraphBuilder& b) { b.depth_stencil(depth, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f); },
+            [](PassContext&){});                                  // writes depth v1
+
         rg->add_pass(WEBGPU_STR("scene"), PassKind::Graphics,
             [&](GraphBuilder& b) {
                 b.color(sceneColor, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0.05, 0.05, 0.08, 1.0});
+                b.sampled(depth);                                 // reads depth v1 (graph-shape only; not bound in the body)
             },
             [triPipe](PassContext& ctx){
                 wgpuRenderPassEncoderSetPipeline(ctx.render, triPipe);
                 wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
             });
+
+        rg->add_pass(WEBGPU_STR("depth.main"), PassKind::Transfer,
+            [&](GraphBuilder& b) { b.depth_stencil(depth, WGPULoadOp_Load, WGPUStoreOp_Store, 1.0f); },
+            [](PassContext&){});      // writes depth v2 -> WAW edge to depth.prepass, WAR edge to scene's read of v1
 
         ResourceHandle ubo{};   // only created on the glow path; needed after realize() to upload Params
         if (glow) {
@@ -415,6 +435,7 @@ int main()
                 [&](GraphBuilder& b) {
                     b.sampled(sceneColor);
                     b.sampled(blurOut);
+                    b.sampled(depth);                             // reads depth v2 -> RAW edge to depth.main
                     b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
                 },
                 [dev, composePipe, sampler, sceneColor, blurOut](PassContext& ctx){
@@ -436,6 +457,7 @@ int main()
             rg->add_pass(WEBGPU_STR("present"), PassKind::Graphics,
                 [&](GraphBuilder& b) {
                     b.sampled(sceneColor);
+                    b.sampled(depth);                             // reads depth v2 -> RAW edge to depth.main
                     b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
                 },
                 [dev, blitPipe, sampler, sceneColor](PassContext& ctx){
