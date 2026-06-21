@@ -432,6 +432,13 @@ void rg_expect(bool got, bool want, const char* name)
                 name, ok ? "PASS" : "FAIL", got ? "true" : "false");
 }
 
+// plain pass/fail check for assertions that aren't about compile()'s return (e.g. computed lifetimes).
+void rg_check(bool ok, const char* name)
+{
+    if (!ok) ++g_rgTestFails;
+    std::printf("[rg-test] %-42s %s\n", name, ok ? "PASS" : "FAIL");
+}
+
 void run_rg_compile_tests(RG::GraphAllocator* alloc)
 {
     using namespace RG;
@@ -519,6 +526,22 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
         auto depth = g->create_image(WEBGPU_STR("depth"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("depth.ro+sampled"), PassKind::Graphics, [&](GraphBuilder& b){ b.depth_stencil_read_only(depth); b.sampled(depth); b.color(out); }, noop);
         rg_expect(g->compile(), true, "read-only depth + sampled (read+read)");
+    }
+
+    // lifetimes: producer writes transient t (pass 0); consumer samples t and writes the sink (pass 1).
+    // phase 3 records firstUse/lastUse over the post-cull execution order; the imported sink is excluded.
+    {
+        RenderGraph* g = create_render_graph(alloc, nullptr);
+        auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
+        auto t   = g->create_image(WEBGPU_STR("t"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
+        g->add_pass(WEBGPU_STR("producer"), PassKind::Graphics, [&](GraphBuilder& b){ b.color(t); }, noop);
+        g->add_pass(WEBGPU_STR("consumer"), PassKind::Graphics, [&](GraphBuilder& b){ b.sampled(t); b.color(out); }, noop);
+        const bool compiled = g->compile();
+        ResourceNode* rt = g->node(t);
+        ResourceNode* ro = g->node(out);
+        const bool span   = rt && rt->firstUse == 0 && rt->lastUse == 1;     // transient spans both passes
+        const bool impOut = ro && ro->firstUse == ResourceNode::kNoPass;     // imported left out
+        rg_check(compiled && span && impOut, "lifetime first/last use (imported excluded)");
     }
 
     std::printf("[rg-test] %s (%d failure%s)\n\n",
@@ -1051,6 +1074,7 @@ int main()
             for (PassNode* p = storage(rg)->m_passes; p; p = p->next) std::printf(" %s", p->name.data);
             std::printf("\n");
             debug_print_mermaid(rg);
+            debug_print_lifetimes(rg);
         }
 
         // host-upload the scene + a slowly rotating directional light. The spheres are packed into a

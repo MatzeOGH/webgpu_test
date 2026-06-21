@@ -189,5 +189,8 @@ RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* 
 // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
 void debug_print_mermaid(RenderGraph* rg);
 
+// debug: dump transient resource lifetimes as a Mermaid Gantt (one bar per resource over pass order)
+void debug_print_lifetimes(RenderGraph* rg);
+
 }// RG
 #endif // RENDERGRAPH_H

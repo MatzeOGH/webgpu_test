@@ -17,7 +17,6 @@ merged from RenderGraphsTODO.md + docs/rendergraph-state.md, sorted by priority
 
 ## Medium Priority
 
-[] resource lifetime tracking (firstUse/lastUse per resource, computed in compile()) -- prerequisite for transient aliasing below
 [] resource type validation: surface ResourceNode::Kind (Texture/Buffer) at the API layer and reject mismatched access (e.g. vertex_buffer() on a texture handle, sampled() on a buffer)
 [] MSAA support: sampleCount on TextureDesc + resolve attachment wiring in execute() (realize() currently hardcodes sampleCount=1, mipLevelCount=1)
 [] add instrumentation to measure compile() time
@@ -38,6 +37,7 @@ merged from RenderGraphsTODO.md + docs/rendergraph-state.md, sorted by priority
 
 ## Done
 
+[x] resource lifetime tracking (firstUse/lastUse per resource) -- compile() phase 3 records, over the post-cull execution order, the first/last pass index touching each TRANSIENT resource (imported excluded); stored on ResourceNode with a kNoPass sentinel (untouched/dead). debug_print_lifetimes() dumps them as a mermaid Gantt (one bar per resource over pass order). prerequisite for the transient aliasing item under Low Priority
 [x] immediate (declaration-time) usage validation in GraphBuilder::use() -- asserts at the exact b.xxx() call site (one frame above) when a resource is aliased read+write in one pass (e.g. sampled + storage_write, the named case) or written more than once (the graph can't order two writes in an atomic pass). StorageRead+StorageWrite (RMW: a read_write storage binding) and read+read are exempt -- see in_pass_accesses_conflict(). Gated by RG_VALIDATE, compiled out in release like the def-before-use check. The cross-pass def-before-use check is KEPT: it catches reader-before-writer over the culled schedule, which a per-pass builder check structurally cannot see
 [x] DepthStencilReadOnly access type -- read-only depth (lighting reading a prepass's depth) is now AccessType::DepthStencilReadOnly: classified as a read (attachment-read), sets depthReadOnly in execute(), no false write hazard. Also fixed buffer copy_src/copy_dst usage (were texture-only) as part of a full AccessType->WGPU-usage spec audit
 [x] AccessType::Vertex/Index/Indirect + matching WGPUBufferUsage bits, so RG-managed vertex/index/indirect-args buffers are possible

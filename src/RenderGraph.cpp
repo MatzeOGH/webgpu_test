@@ -228,6 +228,13 @@ struct ResourceNode
     WGPUTextureUsage texUsage{};                      // accumulated in compile() from the access list
     WGPUBufferUsage  bufUsage{};                      //   "       (WebGPU needs these at create time)
 
+    // first/last surviving pass (execution-order index) to touch this, filled in compile() phase 3.
+    // kNoPass = no live pass touched it (dead transient) or imported -- imported is left out: the graph
+    // doesn't own its memory, so an aliasing lifetime would be meaningless.
+    static constexpr uint32_t kNoPass = ~0u;
+    uint32_t firstUse = kNoPass;
+    uint32_t lastUse  = kNoPass;
+
     ResourceNode* next{}; // ptr to the next resouce node of the render graph
 };
 
@@ -659,10 +666,21 @@ bool RenderGraph::compile()
         defer { s.m_allocator->reset_scratch(); };
         for (ResourceNode* r = s.m_resouces; r; r = r->next) byId[r->handle.id] = r;
 
-        for (PassNode* p = s.m_passes; p; p = p->next)          // m_passes == surviving (post-cull) passes
+        uint32_t passIdx = 0;
+        for (PassNode* p = s.m_passes; p; p = p->next, ++passIdx)  // m_passes == surviving (post-cull) passes
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 ResourceNode* r = byId[p->accesses[i].handle.id];
                 if (!r) continue;
+                // lifetime: the walk is already in execution order, so the first touch is firstUse and
+                // each later touch overwrites lastUse. imported resources are skipped -- excluded from
+                // aliasing, so a span would be meaningless. assumes a validly-ordered graph (writer
+                // before reader); the def-before-use check that guarantees that is RG_VALIDATE-gated, so
+                // a release build fed a read-before-write records a too-early firstUse -- the same
+                // garbage-in/garbage-out a misordered graph already produces.
+                if (!r->imported) {
+                    if (r->firstUse == ResourceNode::kNoPass) r->firstUse = passIdx;
+                    r->lastUse = passIdx;
+                }
                 switch (p->accesses[i].type) {
                   case AccessType::ColorAttachment:
                   case AccessType::DepthStencilAttachment:
@@ -744,6 +762,47 @@ void debug_print_mermaid(RenderGraph* rg)
     std::fflush(stdout);
     // ponytail: pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a
     // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.
+}
+
+// dump transient resource lifetimes as a Mermaid Gantt on stdout. x-axis is pass execution order (the
+// same Pi numbering debug_print_mermaid uses); each bar spans [firstUse..lastUse] for one resource.
+// overlapping bars can't share memory; gaps between them are aliasing candidates. imported resources
+// are excluded (the graph doesn't own them); a transient no surviving pass touched is reported dead and
+// gets no bar. reads firstUse/lastUse, so call it after compile().
+void debug_print_lifetimes(RenderGraph* rg)
+{
+    RenderGraphStorage& s = *storage(rg);
+
+    // text summary first: the chart below has no bar for a dead resource, so name them here.
+    std::printf("resource lifetimes (pass execution order):\n");
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+        if (r->imported) continue;
+        if (r->firstUse == ResourceNode::kNoPass)
+            std::printf("  %.*s -- unused (dead)\n", (int)r->name.length, r->name.data ? r->name.data : "");
+        else
+            std::printf("  %.*s -- alive [P%u..P%u]\n", (int)r->name.length, r->name.data ? r->name.data : "",
+                        r->firstUse, r->lastUse);
+    }
+
+    // mermaid gantt is time-based: dateFormat x reads each bar value as unix milliseconds, so map a
+    // pass index to a whole second (i -> i*1000 ms) and axisFormat %S then labels the axis with the
+    // pass index. each bar runs first..last+1 so a single-pass resource still draws a one-second bar;
+    // the Pn-Pm in the label is the authoritative span regardless of how the axis renders.
+    std::printf("gantt\n");
+    std::printf("  title RenderGraph transient resource lifetimes (axis = pass index)\n");
+    std::printf("  dateFormat x\n");
+    std::printf("  axisFormat %%S\n");
+    std::printf("  section transient\n");
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+        if (r->imported || r->firstUse == ResourceNode::kNoPass) continue;
+        std::printf("  %.*s P%u-P%u :%u, %u\n",
+                    (int)r->name.length, r->name.data ? r->name.data : "",
+                    r->firstUse, r->lastUse, r->firstUse * 1000, (r->lastUse + 1) * 1000);
+    }
+
+    std::fflush(stdout);
+    // ponytail: %S labels the axis 00..59, so it wraps past 60 passes; fine for the handful here. bump
+    // the axisFormat if a graph ever exceeds that. names assumed colon/pipe-free -> no escaping.
 }
 
 // resolve a handle to its node by linear walk of the resource list.
