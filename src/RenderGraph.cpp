@@ -673,10 +673,7 @@ bool RenderGraph::compile()
                 if (!r) continue;
                 // lifetime: the walk is already in execution order, so the first touch is firstUse and
                 // each later touch overwrites lastUse. imported resources are skipped -- excluded from
-                // aliasing, so a span would be meaningless. assumes a validly-ordered graph (writer
-                // before reader); the def-before-use check that guarantees that is RG_VALIDATE-gated, so
-                // a release build fed a read-before-write records a too-early firstUse -- the same
-                // garbage-in/garbage-out a misordered graph already produces.
+                // aliasing, so a span would be meaningless.
                 if (!r->imported) {
                     if (r->firstUse == ResourceNode::kNoPass) r->firstUse = passIdx;
                     r->lastUse = passIdx;
@@ -731,6 +728,16 @@ static uint32_t pass_index(PassNode* head, PassNode* target)
     return 0;
 }
 
+// debug-only: name of the pass at execution-order position idx (empty past the end). O(n) per call.
+static WGPUStringView pass_name_at(PassNode* head, uint32_t idx)
+{
+    for (PassNode* p = head; p; p = p->next) {
+        if (idx == 0) return p->name;
+        --idx;
+    }
+    return WGPUStringView{};
+}
+
 // dump the graph as a Mermaid flowchart on stdout. passes are nodes; an edge dep -->|res| Q means Q
 // depends on dep via resource res (data/order flow points dep -> Q). edges come from the SAME
 // versioning sweep compile() uses, so the dump matches the real graph: RAW (unlabelled), plus WAW
@@ -764,40 +771,63 @@ void debug_print_mermaid(RenderGraph* rg)
     // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.
 }
 
-// dump transient resource lifetimes as a Mermaid Gantt on stdout. x-axis is pass execution order (the
-// same Pi numbering debug_print_mermaid uses); each bar spans [firstUse..lastUse] for one resource.
-// overlapping bars can't share memory; gaps between them are aliasing candidates. imported resources
-// are excluded (the graph doesn't own them); a transient no surviving pass touched is reported dead and
-// gets no bar. reads firstUse/lastUse, so call it after compile().
+// dump resource lifetimes as a Mermaid Gantt on stdout. the timeline runs over passes in execution
+// order: a "passes" row names each slot (one bar per pass), and below it each transient resource is a
+// bar from its first to its last pass. overlapping bars can't share memory; gaps between them are
+// aliasing candidates. imported resources are excluded (the graph doesn't own them); a transient no
+// surviving pass touched is reported dead and gets no bar. reads firstUse/lastUse, so call after compile().
 void debug_print_lifetimes(RenderGraph* rg)
 {
     RenderGraphStorage& s = *storage(rg);
 
-    // text summary first: the chart below has no bar for a dead resource, so name them here.
-    std::printf("resource lifetimes (pass execution order):\n");
+    // text summary first: the chart below has no bar for a dead resource, so name them here. spans are
+    // named by the passes that bound them, not by index.
+    std::printf("resource lifetimes (by pass):\n");
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->imported) continue;
-        if (r->firstUse == ResourceNode::kNoPass)
+        if (r->firstUse == ResourceNode::kNoPass) {
             std::printf("  %.*s -- unused (dead)\n", (int)r->name.length, r->name.data ? r->name.data : "");
-        else
-            std::printf("  %.*s -- alive [P%u..P%u]\n", (int)r->name.length, r->name.data ? r->name.data : "",
-                        r->firstUse, r->lastUse);
+            continue;
+        }
+        WGPUStringView f = pass_name_at(s.m_passes, r->firstUse);
+        if (r->firstUse == r->lastUse)
+            std::printf("  %.*s -- alive in %.*s\n",
+                        (int)r->name.length, r->name.data ? r->name.data : "",
+                        (int)f.length, f.data ? f.data : "");
+        else {
+            WGPUStringView l = pass_name_at(s.m_passes, r->lastUse);
+            std::printf("  %.*s -- alive %.*s..%.*s\n",
+                        (int)r->name.length, r->name.data ? r->name.data : "",
+                        (int)f.length, f.data ? f.data : "",
+                        (int)l.length, l.data ? l.data : "");
+        }
     }
 
-    // mermaid gantt is time-based: dateFormat x reads each bar value as unix milliseconds, so map a
-    // pass index to a whole second (i -> i*1000 ms) and axisFormat %S then labels the axis with the
-    // pass index. each bar runs first..last+1 so a single-pass resource still draws a one-second bar;
-    // the Pn-Pm in the label is the authoritative span regardless of how the axis renders.
+    // mermaid gantt is time-based, so map pass index i to a one-second slot (dateFormat x reads bar
+    // values as unix ms -> i*1000). the "passes" section drops a named one-second bar in each slot so
+    // the timeline reads as pass names rather than bare seconds; each resource bar then spans from its
+    // first pass to its last (+1 so a single-pass resource still fills its slot).
     std::printf("gantt\n");
-    std::printf("  title RenderGraph transient resource lifetimes (axis = pass index)\n");
+    std::printf("  title RenderGraph resource lifetimes (timeline = passes in execution order)\n");
     std::printf("  dateFormat x\n");
     std::printf("  axisFormat %%S\n");
+
+    std::printf("  section passes\n");
+    uint32_t idx = 0;
+    for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
+        std::printf("    %.*s :%u, %u\n",
+                    (int)p->name.length, p->name.data ? p->name.data : "", idx * 1000, (idx + 1) * 1000);
+
     std::printf("  section transient\n");
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->imported || r->firstUse == ResourceNode::kNoPass) continue;
-        std::printf("  %.*s P%u-P%u :%u, %u\n",
+        WGPUStringView f = pass_name_at(s.m_passes, r->firstUse);
+        WGPUStringView l = pass_name_at(s.m_passes, r->lastUse);
+        std::printf("    %.*s (%.*s..%.*s) :%u, %u\n",
                     (int)r->name.length, r->name.data ? r->name.data : "",
-                    r->firstUse, r->lastUse, r->firstUse * 1000, (r->lastUse + 1) * 1000);
+                    (int)f.length, f.data ? f.data : "",
+                    (int)l.length, l.data ? l.data : "",
+                    r->firstUse * 1000, (r->lastUse + 1) * 1000);
     }
 
     std::fflush(stdout);
