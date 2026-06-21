@@ -141,5 +141,5 @@ frame loop skips that frame.
   produces/consumes so ping-pong/accumulation no longer depend on declaration order (the residual the
   fatal-error rule above cannot remove).
 - **Cross-frame temporal resources** (TAA/accumulation) — orthogonal; the graph is rebuilt every
-  frame, so a history buffer is a *persistence* problem for the planned `GraphResourceCache`, not an
+  frame, so a history buffer is a *persistence* problem for the planned `PersistentResourcePool`, not an
   intra-frame versioning one. Import frame N's final resource into frame N+1 as version 0.

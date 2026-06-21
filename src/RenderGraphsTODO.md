@@ -12,7 +12,7 @@ merged from RenderGraphsTODO.md + docs/rendergraph-state.md, sorted by priority
 
 [] force_keep flag on passes / explicit mark_output(ResourceHandle) -- culling currently only roots at passes writing an *imported* resource, so side-effect-only passes (readback/debug/profiling/indirect-arg-gen) and non-imported outputs get silently dropped
 [] kMaxAccess=16 per pass and the 1MB arena are fixed with no growth path; add an assert or grow-on-demand -- currently silently drops accesses past the cap
-[] implement a PoC of GraphResourceCache -- struct already exists (RenderGraph.cpp) but is just an empty vector, not wired into realize(), so resources are still recreated every frame
+[] implement a PoC of PersistentResourcePool -- struct already exists (RenderGraph.cpp) but is just an empty vector, not wired into realize(), so resources are still recreated every frame
 [] review/critique the scratch_alloc implementation -- scrutinize the two-sided arena arithmetic (alignment round-down, unsigned-underflow guards, the capacity-scratchUsed vs capacity-used boundary checks in alloc_raw/scratch_alloc_raw), confirm no front/scratch overlap edge case, and sanity-check the per-scope defer reset_scratch() pattern in compile()/sweep_resource_versions()
 
 ## Medium Priority
