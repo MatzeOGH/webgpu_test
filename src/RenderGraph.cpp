@@ -191,9 +191,9 @@ struct GraphAllocator
     }
 };
 
-struct GraphResourceCache
+struct PersistentResourcePool
 {
-    std::vector<ResourceNode> cachedResources;
+    std::vector<ResourceNode> resources;
 };
 
 // internal resouceNode of an image or buffer
@@ -275,12 +275,12 @@ struct NodeAdjacency
 // the header a pure method-only interface.
 struct RenderGraphStorage
 {
-    GraphAllocator*     m_allocator{};
-    GraphResourceCache* cache{};
-    ResourceNode*       m_resouces{};
-    PassNode*           m_passes{};
-    WGPUDevice          m_device{};
-    uint32_t            next_id = 1; // 0 = invalid handle
+    GraphAllocator*         m_allocator{};
+    PersistentResourcePool* pool{};
+    ResourceNode*           m_resouces{};
+    PassNode*               m_passes{};
+    WGPUDevice              m_device{};
+    uint32_t                next_id = 1; // 0 = invalid handle
 };
 
 static RenderGraphStorage* storage(RenderGraph* rg)
@@ -298,20 +298,20 @@ GraphAllocator* create_allocator(){
     return allocator;
 }
 
-GraphResourceCache* create_cache()
+PersistentResourcePool* create_persistent_pool()
 {
-    GraphResourceCache* cache = new GraphResourceCache;
-    return cache;
+    PersistentResourcePool* pool = new PersistentResourcePool;
+    return pool;
 }
 
-RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* cache)
+RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool)
 {
     allocator->reset();
     RenderGraph* rg = allocator->make<RenderGraph>();
     RenderGraphStorage* st = allocator->make<RenderGraphStorage>();
     assert(st == storage(rg) && "storage must sit immediately after the RenderGraph");
     st->m_allocator = allocator;
-    st->cache       = cache;
+    st->pool        = pool;
     return rg;
 }
 

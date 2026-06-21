@@ -98,7 +98,7 @@ struct GraphBuilder
     PassNode* m_new_pass{};
 };
 struct GraphAllocator; // internal allocator
-struct GraphResourceCache; // holds the graphs resources over multiple frames.
+struct PersistentResourcePool; // owns resources that persist across frames (history/temporal buffers).
 
 struct TextureDesc
 {
@@ -183,8 +183,8 @@ private:
 };
 
 GraphAllocator* create_allocator();
-GraphResourceCache* create_cache();
-RenderGraph* create_render_graph(GraphAllocator* allocator, GraphResourceCache* cache);
+PersistentResourcePool* create_persistent_pool();
+RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool);
 
 // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
 void debug_print_mermaid(RenderGraph* rg);
