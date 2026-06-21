@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <utility>
 #include <vector>
+#include <string>
 #include <webgpu/webgpu.h>
 #include <cstdio>
 #include <cstdlib>
@@ -191,9 +192,193 @@ struct GraphAllocator
     }
 };
 
+// length of a (possibly WGPU_STRLEN-sentinel) string view, measured like copy_string.
+static size_t sv_length(WGPUStringView s)
+{
+    return (s.length == WGPU_STRLEN) ? (s.data ? std::strlen(s.data) : 0) : s.length;
+}
+
+// Owns GPU resources that must outlive the per-frame graph teardown -- today, temporal/history textures
+// (TAA, accumulation, ping-pong). One Entry per logical temporal resource, keyed by name content (the
+// graph copies names into the per-frame arena, so the pointers don't survive between frames). Each Entry
+// holds two physical textures the graph ping-pongs: layer 0 (current) maps to the opposite slot each
+// frame, so last frame's "current" is this frame's "previous" for free.
 struct PersistentResourcePool
 {
-    std::vector<ResourceNode> resources;
+    static constexpr uint32_t kLayers = 2;   // ping-pong: current + previous. N>2 deliberately unsupported.
+
+    struct Entry
+    {
+        std::string          name;               // identity across frames (arena names don't persist)
+        uint64_t             frame  = 0;          // rotation counter, bumped once per touch (declaration)
+
+        WGPUTexture          tex[kLayers]  = {};
+        WGPUTextureView      view[kLayers] = {};
+
+        // what the live textures were created with; a mismatch forces a recreate (resize/format/usage).
+        bool                 created       = false;
+        WGPUExtent3D         size          = {};
+        WGPUTextureFormat    format        = WGPUTextureFormat_Undefined;
+        WGPUTextureDimension dim           = WGPUTextureDimension_2D;
+        WGPUTextureUsage     usage         = {};  // running union of every layer's usage
+        WGPUTextureUsage     usageAtCreate = {};
+    };
+    std::vector<Entry> entries;   // ponytail: linear scan + memcmp; fine for the handful of temporal resources
+
+    Entry* find(WGPUStringView name)
+    {
+        const size_t len = sv_length(name);   // names may arrive as WGPU_STRLEN (see screenTex)
+        for (Entry& e : entries)
+            if (e.name.size() == len &&
+                (len == 0 || std::memcmp(e.name.data(), name.data, len) == 0))
+                return &e;
+        return nullptr;
+    }
+
+    // declaration-time: ensure the entry exists and advance its rotation. create_temporal_image is the only
+    // caller and declares each resource once per frame, so one touch == one frame == one rotation. Declaring
+    // the same name twice in a frame is an authoring error (it would double-rotate the slot mapping).
+    Entry* touch(WGPUStringView name)
+    {
+        if (Entry* e = find(name)) { ++e->frame; return e; }   // next frame: rotate the ping-pong
+        entries.emplace_back();
+        Entry& e = entries.back();
+        e.name.assign(name.data ? name.data : "", sv_length(name));   // WGPU_STRLEN -> measured, not SIZE_MAX
+        return &e;                                             // first frame: no rotation yet
+    }
+
+    // physical slot backing logical layer `layerIndex` (0 == current, 1 == previous) this frame.
+    uint32_t slot(const Entry& e, uint32_t layerIndex) const
+    {
+        return (uint32_t)((e.frame + layerIndex) & 1);         // ping-pong: flips each frame
+    }
+
+    // (re)create the two textures when missing or the descriptor changed (lazy: needs the device + the
+    // usage union, both known only at realize()).
+    void realize_entry(Entry* e, WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
+                       WGPUTextureDimension dim)
+    {
+        bool same = e->created
+            && e->size.width == size.width && e->size.height == size.height
+            && e->size.depthOrArrayLayers == size.depthOrArrayLayers
+            && e->format == format && e->dim == dim && e->usageAtCreate == e->usage;
+        if (same) return;
+        destroy(e);
+        e->size = size; e->format = format; e->dim = dim; e->usageAtCreate = e->usage;
+        for (uint32_t i = 0; i < kLayers; ++i) {
+            WGPUTextureDescriptor d{
+                .label         = WGPUStringView{ e->name.c_str(), e->name.size() },
+                .usage         = e->usage,
+                .dimension     = dim,
+                .size          = size,
+                .format        = format,
+                .mipLevelCount = 1,
+                .sampleCount   = 1,
+            };
+            e->tex[i]  = wgpuDeviceCreateTexture(device, &d);
+            e->view[i] = wgpuTextureCreateView(e->tex[i], nullptr);
+        }
+        e->created = true;
+    }
+
+    void destroy(Entry* e)
+    {
+        for (uint32_t i = 0; i < kLayers; ++i) {
+            if (e->view[i]) { wgpuTextureViewRelease(e->view[i]); e->view[i] = nullptr; }
+            if (e->tex[i])  { wgpuTextureRelease(e->tex[i]);      e->tex[i]  = nullptr; }
+        }
+        e->created = false;
+    }
+
+    ~PersistentResourcePool() { for (Entry& e : entries) destroy(&e); }
+};
+
+// Caches transient textures across the per-frame teardown so realize()/release_resources() stop
+// churning the driver: one physical texture per Entry, matched by descriptor (size/format/dim/usage)
+// and handed back out next frame instead of recreated + destroyed. Sibling to PersistentResourcePool
+// (name-keyed ping-pong for history); this one is descriptor-keyed and evicts textures left idle.
+// ponytail: linear scan over a vector -- fine for the ~dozen transients a frame declares. This same
+// pool is the substrate for within-frame aliasing later: release a claim at a resource's lastUse
+// instead of frame end and a later disjoint-lifetime resource reclaims the texture.
+struct TransientResourcePool
+{
+    static constexpr uint64_t kRetain = 4;   // destroy a texture left unclaimed this many frames
+
+    struct Entry
+    {
+        WGPUExtent3D         size   = {};
+        WGPUTextureFormat    format = WGPUTextureFormat_Undefined;
+        WGPUTextureDimension dim    = WGPUTextureDimension_2D;
+        WGPUTextureUsage     usage  = {};
+
+        WGPUTexture          tex    = {};
+        WGPUTextureView      view   = {};
+
+        bool                 inUse         = false;  // claimed right now; released in end_frame (or mid-frame once aliasing lands)
+        uint64_t             lastUsedFrame = 0;      // recency, eviction only
+    };
+    std::vector<Entry> entries;
+    uint64_t frame            = 0;
+    uint32_t createdThisFrame = 0;                   // debug: cache misses this frame (reset each end_frame)
+
+    // hand out a free texture matching the descriptor, else create one. inUse (not the frame stamp)
+    // is the claim, so two simultaneously-live same-descriptor resources get two distinct textures.
+    void acquire(WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
+                 WGPUTextureDimension dim, WGPUTextureUsage usage,
+                 WGPUTexture& outTex, WGPUTextureView& outView)
+    {
+        for (Entry& e : entries) {
+            if (!e.inUse && e.format == format && e.dim == dim && e.usage == usage
+                && e.size.width == size.width && e.size.height == size.height
+                && e.size.depthOrArrayLayers == size.depthOrArrayLayers) {
+                e.inUse = true;
+                e.lastUsedFrame = frame;
+                outTex = e.tex; outView = e.view;
+                return;
+            }
+        }
+        entries.emplace_back();
+        Entry& e = entries.back();
+        e.size = size; e.format = format; e.dim = dim; e.usage = usage;
+        WGPUTextureDescriptor d{
+            .usage         = usage,
+            .dimension     = dim,
+            .size          = size,
+            .format        = format,
+            .mipLevelCount = 1,
+            .sampleCount   = 1,
+        };
+        e.tex  = wgpuDeviceCreateTexture(device, &d);
+        e.view = wgpuTextureCreateView(e.tex, nullptr);
+        e.inUse = true;
+        e.lastUsedFrame = frame;
+        ++createdThisFrame;
+        outTex = e.tex; outView = e.view;
+    }
+
+    // end of frame: drop every claim, destroy textures idle >= kRetain frames, advance the clock.
+    void end_frame()
+    {
+        for (size_t i = entries.size(); i-- > 0; ) {
+            Entry& e = entries[i];
+            e.inUse = false;
+            if (frame - e.lastUsedFrame >= kRetain) {   // lastUsedFrame <= frame always -> no underflow
+                destroy(&e);
+                entries[i] = entries.back();
+                entries.pop_back();
+            }
+        }
+        createdThisFrame = 0;
+        ++frame;
+    }
+
+    void destroy(Entry* e)
+    {
+        if (e->view) { wgpuTextureViewRelease(e->view); e->view = nullptr; }
+        if (e->tex)  { wgpuTextureRelease(e->tex);      e->tex  = nullptr; }
+    }
+
+    ~TransientResourcePool() { for (Entry& e : entries) destroy(&e); }
 };
 
 // internal resouceNode of an image or buffer
@@ -207,6 +392,15 @@ struct ResourceNode
 
     // the resource is managed from outside te render graph. i.e: swapchain
     bool imported{};
+
+    // temporal/history resource backed by the PersistentResourcePool: survives the per-frame teardown
+    // and is rotated each frame. persistent == one layer of such a resource.
+    bool     persistent{};
+    uint32_t temporalIndex{};    // 0 == current frame (write target); 1 == previous frame (read)
+
+    // storage not owned by the per-frame graph (imported or pool-backed) -> realize()/release_resources()
+    // skip it and lifetime aliasing excludes it.
+    bool is_external() const { return imported || persistent; }
 
     // texture fields
     WGPUTextureDimension dimension = WGPUTextureDimension_Undefined;
@@ -277,6 +471,7 @@ struct RenderGraphStorage
 {
     GraphAllocator*         m_allocator{};
     PersistentResourcePool* pool{};
+    TransientResourcePool*  transient{};
     ResourceNode*           m_resouces{};
     PassNode*               m_passes{};
     WGPUDevice              m_device{};
@@ -304,7 +499,12 @@ PersistentResourcePool* create_persistent_pool()
     return pool;
 }
 
-RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool)
+TransientResourcePool* create_transient_pool()
+{
+    return new TransientResourcePool;
+}
+
+RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool, TransientResourcePool* transient)
 {
     allocator->reset();
     RenderGraph* rg = allocator->make<RenderGraph>();
@@ -312,6 +512,7 @@ RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePo
     assert(st == storage(rg) && "storage must sit immediately after the RenderGraph");
     st->m_allocator = allocator;
     st->pool        = pool;
+    st->transient   = transient;
     return rg;
 }
 
@@ -440,6 +641,38 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 }
 
 
+// temporal/history resource: two rotating physical textures owned by the PersistentResourcePool. allocates
+// two ResourceNodes (curr = layer 0, prev = layer 1); the pool backs them and swaps which physical texture
+// each maps to every frame (see realize()), so this frame's curr is next frame's prev.
+TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc)
+{
+    RenderGraphStorage& s = *storage(this);
+    assert(s.pool && "create_temporal_image needs a PersistentResourcePool -- pass one to create_render_graph");
+    const bool pooled = s.pool != nullptr;   // no pool (release misuse): degrade to plain transients, never null-deref
+    if (pooled) s.pool->touch(name);   // ensure the pool entry exists + advance its rotation
+
+    TemporalImage out{};
+    for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
+        ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
+        resouce->handle = { s.next_id++ };
+        resouce->name = s.m_allocator->copy_string(name);
+        resouce->kind = ResourceNode::Kind::Texture;
+        resouce->persistent = pooled;
+        resouce->temporalIndex = i;
+        resouce->dimension = desc.dimension;
+        resouce->format = desc.format;
+        resouce->sizeKind = desc.sizeKind;
+        resouce->scaleX = desc.scaleX;
+        resouce->scaleY = desc.scaleY;
+        resouce->relativeToHandle = desc.relativeTo;
+        resouce->absolute = desc.absolute;
+        list_append(&s.m_resouces, resouce);
+        if (i == 0) out.curr = resouce->handle; else out.prev = resouce->handle;
+    }
+    return out;
+}
+
+
 GraphBuilder RenderGraph::begin_pass(WGPUStringView name, PassKind kind)
 {
     RenderGraphStorage& s = *storage(this);
@@ -547,12 +780,13 @@ static void topo_visit(PassNode* p, PassNode** order, uint32_t& count)
     order[count++] = p;          // all deps already placed
 }
 
-// a sink/output pass writes at least one imported resource (swapchain, etc).
-// these are the only roots that keep a pass alive; anything not reachable from one is dead.
-static bool is_sink(PassNode* p, const bool* imported)
+// a sink/output pass writes at least one resource whose value leaves the frame: an imported resource
+// (swapchain, etc) or a temporal/persistent one (this frame's history layer, read next frame). these are
+// the only roots that keep a pass alive; anything not reachable from one is dead.
+static bool is_sink(PassNode* p, const bool* external)
 {
     for (uint32_t i = 0; i < p->accessCount; ++i)
-        if (access_is_write(p->accesses[i].type) && imported[p->accesses[i].handle.id])
+        if (access_is_write(p->accesses[i].type) && external[p->accesses[i].handle.id])
             return true;
     return false;
 }
@@ -590,9 +824,11 @@ bool RenderGraph::compile()
         // sinks = passes writing an imported resource. accesses store only handle.id, so flatten
         // the imported flags into an id-indexed table first (same scratch_alloc-over-next_id trick
         // as phase 1's lastWriter).
-        bool* imported = s.m_allocator->scratch_alloc<bool>(s.next_id);
+        // external = imported OR persistent (temporal). both are output sinks when written (their value
+        // leaves the frame) and exempt from the read-before-write check (value comes from outside the frame).
+        bool* external = s.m_allocator->scratch_alloc<bool>(s.next_id);
         for (ResourceNode* r = s.m_resouces; r; r = r->next)
-            imported[r->handle.id] = r->imported;
+            external[r->handle.id] = r->is_external();
 
         // topo into a transient array, then relink the intrusive list into execution order. The
         // result lives in m_passes itself; the array is just DFS scratch, reclaimed by the
@@ -604,7 +840,7 @@ bool RenderGraph::compile()
         defer { s.m_allocator->reset_scratch(); };
         uint32_t count = 0;
         for (PassNode* p = s.m_passes; p; p = p->next)
-            if (is_sink(p, imported))
+            if (is_sink(p, external))
                 topo_visit(p, order, count);          // only reaches passes that feed a sink
 
         // relink next-pointers to follow topo order; m_passes is now == execution order, and any
@@ -626,15 +862,19 @@ bool RenderGraph::compile()
     // has produced is an authoring error: the reader would sample uninitialized contents (its writer was
     // declared after it, or culled). walking the surviving passes makes this culling-correct and catches
     // every surviving reader, not just the first.
-    //   imported resources                        -> exempt (their value comes from outside the graph).
+    //   imported + temporal/persistent resources  -> exempt (their value comes from outside this frame).
     //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
     // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
     {
         bool* hasWriter = s.m_allocator->scratch_alloc<bool>(s.next_id);   // some surviving pass writes id
         bool* produced  = s.m_allocator->scratch_alloc<bool>(s.next_id);   // ...has written it so far, in order
-        bool* imported  = s.m_allocator->scratch_alloc<bool>(s.next_id);
+        bool* external  = s.m_allocator->scratch_alloc<bool>(s.next_id);   // imported OR temporal: value from outside the frame
+        bool* prevLayer = s.m_allocator->scratch_alloc<bool>(s.next_id);   // temporal layer k>0: read-only this frame
         defer { s.m_allocator->reset_scratch(); };
-        for (ResourceNode* r = s.m_resouces; r; r = r->next) imported[r->handle.id] = r->imported;
+        for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+            external[r->handle.id]  = r->is_external();
+            prevLayer[r->handle.id] = r->persistent && r->temporalIndex != 0;
+        }
         for (PassNode* p = s.m_passes; p; p = p->next)
             for (uint32_t i = 0; i < p->accessCount; ++i)
                 if (access_is_write(p->accesses[i].type)) hasWriter[p->accesses[i].handle.id] = true;
@@ -643,8 +883,23 @@ bool RenderGraph::compile()
         for (PassNode* p = s.m_passes; p; p = p->next)
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 uint32_t id = p->accesses[i].handle.id;
-                if (access_is_write(p->accesses[i].type)) { produced[id] = true; continue; }
-                if (id == 0 || imported[id] || produced[id] || !hasWriter[id]) continue;
+                if (access_is_write(p->accesses[i].type)) {
+                    produced[id] = true;
+                    // older layers of a temporal resource are read-only this frame: writing layer k>0 clobbers
+                    // a slot that becomes a future "current". layer 0 (create_temporal_image's handle) is the
+                    // only legal write target.
+                    if (prevLayer[id]) {
+                        ResourceNode* w = node(p->accesses[i].handle);
+                        WGPUStringView wn = w ? w->name : WGPUStringView{};
+                        std::printf("[RenderGraph] error: pass \"%.*s\" writes temporal resource \"%.*s\" "
+                                    "layer %u -- only layer 0 (create_temporal_image's handle) is writable.\n",
+                                    (int)p->name.length, p->name.data ? p->name.data : "",
+                                    (int)wn.length, wn.data ? wn.data : "", w ? w->temporalIndex : 0u);
+                        hadError = true;
+                    }
+                    continue;
+                }
+                if (id == 0 || external[id] || produced[id] || !hasWriter[id]) continue;
                 ResourceNode* r = node(p->accesses[i].handle);
                 WGPUStringView rn = r ? r->name : WGPUStringView{};
                 std::printf("[RenderGraph] error: pass \"%.*s\" reads resource \"%.*s\" before any pass "
@@ -674,7 +929,7 @@ bool RenderGraph::compile()
                 // lifetime: the walk is already in execution order, so the first touch is firstUse and
                 // each later touch overwrites lastUse. imported resources are skipped -- excluded from
                 // aliasing, so a span would be meaningless.
-                if (!r->imported) {
+                if (!r->is_external()) {   // persistent is pool-owned -> excluded from aliasing, like imported
                     if (r->firstUse == ResourceNode::kNoPass) r->firstUse = passIdx;
                     r->lastUse = passIdx;
                 }
@@ -784,7 +1039,7 @@ void debug_print_lifetimes(RenderGraph* rg)
     // named by the passes that bound them, not by index.
     std::printf("resource lifetimes (by pass):\n");
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-        if (r->imported) continue;
+        if (r->is_external()) continue;   // imported + pool-backed: no per-frame lifetime span
         if (r->firstUse == ResourceNode::kNoPass) {
             std::printf("  %.*s -- unused (dead)\n", (int)r->name.length, r->name.data ? r->name.data : "");
             continue;
@@ -866,22 +1121,52 @@ void RenderGraph::realize(WGPUDevice device)
 {
     RenderGraphStorage& s = *storage(this);
     s.m_device = device;
+
+    // temporal/persistent resources: back each layer with a rotating pool texture instead of a per-frame
+    // one. first union the usage over all layers (each physical texture cycles through every layer role
+    // across frames), then (re)create on demand, then point each layer node at its rotated slot. size +
+    // usage came from compile(); the pool owns lifetime, so release_resources() leaves these alone.
+    if (s.pool) {
+        for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+            if (!r->persistent || !r->texUsage) continue;
+            if (PersistentResourcePool::Entry* e = s.pool->find(r->name)) e->usage |= r->texUsage;
+        }
+        for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+            if (!r->persistent || !r->texUsage) continue;
+            PersistentResourcePool::Entry* e = s.pool->find(r->name);
+            if (!e) continue;
+            s.pool->realize_entry(e, device, r->resolved, r->format, r->dimension);
+            uint32_t sl = s.pool->slot(*e, r->temporalIndex);
+            r->texture = e->tex[sl];
+            r->view    = e->view[sl];
+        }
+    }
+
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-        if (r->imported) continue;
+        if (r->is_external()) continue;
         if (r->kind == ResourceNode::Kind::Texture) {
             if (!r->texUsage) continue;
-            WGPUTextureDescriptor d{
-                .label         = r->name,
-                .usage         = r->texUsage,
-                .dimension     = r->dimension,
-                .size          = r->resolved,
-                .format        = r->format,
-                .mipLevelCount = 1,
-                .sampleCount   = 1,
-            };
-            r->texture = wgpuDeviceCreateTexture(device, &d);
-            r->view    = wgpuTextureCreateView(r->texture, nullptr);
+            if (s.transient) {
+                // reuse a pooled texture matching this descriptor instead of recreating one. the pool
+                // owns it -> release_resources() leaves it alone and recycles/evicts at end_frame().
+                s.transient->acquire(device, r->resolved, r->format, r->dimension, r->texUsage,
+                                     r->texture, r->view);
+            } else {
+                WGPUTextureDescriptor d{
+                    .label         = r->name,
+                    .usage         = r->texUsage,
+                    .dimension     = r->dimension,
+                    .size          = r->resolved,
+                    .format        = r->format,
+                    .mipLevelCount = 1,
+                    .sampleCount   = 1,
+                };
+                r->texture = wgpuDeviceCreateTexture(device, &d);
+                r->view    = wgpuTextureCreateView(r->texture, nullptr);
+            }
         } else {
+            // buffers stay on the direct path: the lone transient buffer (scene ubo) is tiny and
+            // fully host-overwritten each frame, so pooling it saves nothing.
             if (!r->bufUsage) continue;
             WGPUBufferDescriptor d{
                 .label = r->name,
@@ -891,8 +1176,6 @@ void RenderGraph::realize(WGPUDevice device)
             r->buffer = wgpuDeviceCreateBuffer(device, &d);
         }
     }
-    // ponytail: recreated on every realize(); no caching/aliasing. add a transient pool if
-    // per-frame churn ever shows up in a profile.
 }
 
 // record the compiled passes (already in execution order) into a caller-owned encoder: open the
@@ -968,12 +1251,17 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
 // realize(); call once the frame's commands have been submitted.
 void RenderGraph::release_resources()
 {
-    for (ResourceNode* r = storage(this)->m_resouces; r; r = r->next) {
-        if (r->imported) continue;
+    RenderGraphStorage& s = *storage(this);
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+        if (r->is_external()) continue;   // pool owns temporal textures; freed on resize/pool destroy
+        // with a transient pool, textures are pool-owned -> drop our borrowed refs, don't release.
+        // buffers are never pooled (see realize), so always release them here.
+        if (s.transient && r->kind == ResourceNode::Kind::Texture) { r->texture = nullptr; r->view = nullptr; continue; }
         if (r->view)    { wgpuTextureViewRelease(r->view); r->view    = nullptr; }
         if (r->texture) { wgpuTextureRelease(r->texture);  r->texture = nullptr; }
         if (r->buffer)  { wgpuBufferRelease(r->buffer);    r->buffer  = nullptr; }
     }
+    if (s.transient) s.transient->end_frame();   // release every claim + evict idle textures
 }
 
 // records one access on the pass currently being built: the one primitive every GraphBuilder

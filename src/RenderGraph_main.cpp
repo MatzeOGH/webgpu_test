@@ -344,6 +344,39 @@ const char* kPresentFs = R"(
 }
 )";
 
+// temporal accumulation with neighborhood clamping (demo of create_temporal_image). binding 0 = current
+// lit, binding 1 = history.prev (last frame, rotated in by the pool). The scene animates every frame
+// (spinning spheres, bobbing capstone, rotating light), so a plain history blend smears that motion
+// forever and never settles. The standard TAA fix, no motion vectors required: clamp the history sample
+// to the colour AABB of the current 3x3 neighborhood before blending. A static pixel's history sits
+// inside the box -> the blend accumulates and converges; a pixel whose content moved has its stale
+// history fall outside the box and snap to current -> no ghost trails. No motion vectors (out of scope),
+// so "reprojection" is the same pixel -- exactly right while the camera is still.
+const char* kTaaFs = R"(
+@group(0) @binding(0) var curr : texture_2d<f32>;
+@group(0) @binding(1) var hist : texture_2d<f32>;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px  = vec2i(in.pos.xy);
+    let dim = vec2i(textureDimensions(curr));
+    let c   = textureLoad(curr, px, 0).rgb;
+
+    // colour bounding box of the 3x3 current-frame neighborhood = the range history may stay in.
+    var lo = c;
+    var hi = c;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let q = clamp(px + vec2i(dx, dy), vec2i(0), dim - vec2i(1));
+            let n = textureLoad(curr, q, 0).rgb;
+            lo = min(lo, n);
+            hi = max(hi, n);
+        }
+    }
+
+    let h = clamp(textureLoad(hist, px, 0).rgb, lo, hi);   // reject stale history where content moved
+    return vec4f(mix(h, c, 0.1), 1.0);                     // 10% current/frame: static converges, moving can't ghost
+}
+)";
+
 // debug blit: dump one gbuffer image straight to the swapchain, picked by scene.debugMode (1..4).
 const char* kDebugFs = R"(
 @group(0) @binding(1) var gAlbedo : texture_2d<f32>;
@@ -452,7 +485,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: producer declared before its consumer.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("producer"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(x); }, noop);
@@ -462,7 +495,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // ERROR: consumer declared before producer of a transient (both survive -- both write the sink).
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("consumer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x);  b.color(out); }, noop);
@@ -472,7 +505,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: a transient read but never written by any pass (host-uploaded uniform) -- hasWriter exemption.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto ubo = g->create_buffer(WEBGPU_STR("ubo"), { .size = 16 });
         g->add_pass(WEBGPU_STR("use"), PassKind::Graphics, [&](GraphBuilder& b){ b.uniform(ubo); b.color(out); }, noop);
@@ -481,7 +514,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: an imported resource read before an in-graph write (legal "read then overwrite" WAR).
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto imp = g->import_buffer(WEBGPU_STR("imp"), nullptr);
         g->add_pass(WEBGPU_STR("read.imported"),  PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(imp);  b.color(out); }, noop);
@@ -491,7 +524,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: multi-writer chain (v1 written, read, v2 written, read) -- no false early-read error.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("prepass"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(x); }, noop);                   // x v1
@@ -503,7 +536,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // ERROR: a pass reads then writes the same transient that nothing else produced -> reads uninitialized.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("rmw"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x); b.storage_write(x); b.color(out); }, noop);
@@ -514,7 +547,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
     // (no write involved). The illegal cases it DOES catch (sampled+storage_write, double write) assert at
     // declaration time, so they can't be exercised here without aborting the run -- verified manually.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto tex = g->create_image(WEBGPU_STR("tex"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("read.twice"), PassKind::Graphics, [&](GraphBuilder& b){ b.sampled(tex); b.sampled(tex); b.color(out); }, noop);
@@ -523,7 +556,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: read-only depth + sampled of the same texture in one pass (both reads) -- must NOT trip either.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out   = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto depth = g->create_image(WEBGPU_STR("depth"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("depth.ro+sampled"), PassKind::Graphics, [&](GraphBuilder& b){ b.depth_stencil_read_only(depth); b.sampled(depth); b.color(out); }, noop);
@@ -533,7 +566,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
     // lifetimes: producer writes transient t (pass 0); consumer samples t and writes the sink (pass 1).
     // phase 3 records firstUse/lastUse over the post-cull execution order; the imported sink is excluded.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr);
+        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto t   = g->create_image(WEBGPU_STR("t"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("producer"), PassKind::Graphics, [&](GraphBuilder& b){ b.color(t); }, noop);
@@ -699,6 +732,22 @@ int main()
     WGPURenderPipeline presentPipe = wgpuDeviceCreateRenderPipeline(dev, &presentPD);
     wgpuShaderModuleRelease(presentSM);
 
+    // taa accumulation: writes the history texture (kSwapFormat, NOT the swapchain) by blending the
+    // current shaded colour with the previous history layer. history is kSwapFormat so the compose/
+    // present pipelines can shade the TAA input into the same format that feeds it.
+    WGPUShaderModule taaSM = make_shader(dev, std::string(kVS) + kTaaFs);
+    WGPUColorTargetState taaCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState taaFrag{ .module = taaSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &taaCT };
+    WGPURenderPipelineDescriptor taaPD{
+        .label       = WEBGPU_STR("taa pipeline"),
+        .vertex      = { .module = taaSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &taaFrag,
+    };
+    WGPURenderPipeline taaPipe = wgpuDeviceCreateRenderPipeline(dev, &taaPD);
+    wgpuShaderModuleRelease(taaSM);
+
     // sky: fills litColor's background pixels (discards on geometry). 2nd writer of litColor -> WAW.
     WGPUShaderModule skySM = make_shader(dev, std::string(kVS) + kSkyFs);
     WGPUColorTargetState skyCT{ .format = kColorFormat, .writeMask = WGPUColorWriteMask_All };
@@ -731,11 +780,18 @@ int main()
     // RenderGraph (+ all its nodes) from it each frame -> the allocator is the only graph-side
     // object that lives across frames.
     GraphAllocator* allocator = create_allocator();
+    // persistent pool: owns temporal/history textures across the per-frame teardown (create_temporal_image).
+    // lives the whole run alongside the allocator; handed to create_render_graph each frame.
+    PersistentResourcePool* pool = create_persistent_pool();
+    // transient pool: caches this-frame textures (gbuffer/lit/shadow/...) across the teardown so
+    // realize()/release_resources() reuse them instead of recreating every frame. lives the whole run.
+    TransientResourcePool* transient = create_transient_pool();
 
     run_rg_compile_tests(allocator);   // compile()-only edge-case checks (no GPU); next create_render_graph() resets the arena
 
     // ---- frame loop: declare + compile + realize + execute + release the graph EVERY frame -------
     bool ssaoOn     = true;  // SPACE toggles the SSAO pass (and compose<->present)
+    bool taaOn      = true;  // T toggles temporal accumulation (demo of create_temporal_image)
     int  debugMode  = 0;     // 0 = lit, 1..4 = blit gbuffer albedo/normal/roughness/depth
     int  shownSsao  = -1;    // last (ssao, debug) state we printed the execution order for
     int  shownDebug = -1;
@@ -761,6 +817,10 @@ int main()
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_SPACE) {
                 ssaoOn = !ssaoOn;
                 std::printf("ssao %s\n", ssaoOn ? "ON" : "OFF");
+            }
+            else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_T) {
+                taaOn = !taaOn;
+                std::printf("taa %s\n", taaOn ? "ON" : "OFF");
             }
             else if (e.type == SDL_EVENT_KEY_DOWN &&
                      (e.key.scancode == SDL_SCANCODE_0 ||
@@ -826,7 +886,7 @@ int main()
         WGPUTextureView view = wgpuTextureCreateView(st.texture, &vd);
 
         // ---- declare the whole graph for THIS frame (immediate mode) ----
-        RenderGraph* rg = create_render_graph(allocator, nullptr);   // resets the arena, fresh RenderGraph
+        RenderGraph* rg = create_render_graph(allocator, pool, transient);   // resets the arena, fresh RenderGraph (pools persist)
 
         // import this frame's swapchain view; its size roots every Relative texture below.
         auto swapchain = rg->importe_image(WEBGPU_STR("swapchain"), view, { cfg.width, cfg.height, 1 });
@@ -1024,6 +1084,84 @@ int main()
                     wgpuBindGroupRelease(bg);
                     wgpuBindGroupLayoutRelease(l);
                 });
+        } else if (taaOn) {
+            // Run TAA on the FINAL shaded colour, not raw lit -- otherwise it bypasses the lit*ao compose
+            // and swallows SSAO. With SSAO on, compose lit*ao into an intermediate first and accumulate
+            // THAT; with SSAO off, lit IS the final colour, so TAA samples it directly (textureLoad doesn't
+            // care that litColor is kColorFormat while history is kSwapFormat).
+            ResourceHandle taaInput = litColor;
+            if (ssaoOn) {
+                auto sceneColor = screenTex("taa.scene", kSwapFormat);
+                rg->add_pass(WEBGPU_STR("taa.compose"), PassKind::Graphics,
+                    [&](GraphBuilder& b) {
+                        b.sampled(litColor);
+                        b.sampled(aoTex);
+                        b.color(sceneColor, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                    },
+                    [dev, composePipe, litColor, aoTex](PassContext& ctx) {
+                        WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(composePipe, 0);
+                        WGPUBindGroupEntry e[2] = {
+                            { .binding = 0, .textureView = ctx.view(litColor) },
+                            { .binding = 1, .textureView = ctx.view(aoTex) },
+                        };
+                        WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                        wgpuRenderPassEncoderSetPipeline(ctx.render, composePipe);
+                        wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                        wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                        wgpuBindGroupRelease(bg);
+                        wgpuBindGroupLayoutRelease(l);
+                    });
+                taaInput = sceneColor;
+            }
+
+            // history: ping-pong temporal resource. .curr = this frame's write target, .prev = last
+            // frame's result (read-only). the pool swaps the two physical textures every frame, so this
+            // frame's result becomes next frame's history -- no manual ping-pong.
+            auto history = rg->create_temporal_image(WEBGPU_STR("taa.history"), {
+                .dimension = WGPUTextureDimension_2D, .format = kSwapFormat,
+                .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+            });
+
+            rg->add_pass(WEBGPU_STR("taa"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(taaInput);                 // this frame's shaded colour (lit*ao or lit)
+                    b.sampled(history.prev);             // previous frame (rotated in by the pool)
+                    b.color(history.curr, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, taaPipe, taaInput, history](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(taaPipe, 0);
+                    WGPUBindGroupEntry e[2] = {
+                        { .binding = 0, .textureView = ctx.view(taaInput) },
+                        { .binding = 1, .textureView = ctx.view(history.prev) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, taaPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
+
+            rg->add_pass(WEBGPU_STR("taa.present"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(history.curr);             // this frame's accumulated result
+                    b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, presentPipe, history](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(presentPipe, 0);
+                    WGPUBindGroupEntry e[1] = {
+                        { .binding = 0, .textureView = ctx.view(history.curr) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, presentPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
         } else if (ssaoOn) {
             rg->add_pass(WEBGPU_STR("compose"), PassKind::Graphics,
                 [&](GraphBuilder& b) {
@@ -1099,6 +1237,10 @@ int main()
             std::printf("\n");
             debug_print_mermaid(rg);
             debug_print_lifetimes(rg);
+            // transient cache proof: toggle a feature off then back on within kRetain frames and the
+            // return shows 0 created -> textures were reused from the pool, not reallocated.
+            std::printf("transient pool: %zu textures, %u created this frame\n",
+                        transient->entries.size(), transient->createdThisFrame);
         }
 
         // host-upload the scene + a slowly rotating directional light. The spheres are packed into a
@@ -1149,6 +1291,7 @@ int main()
     // ---- teardown --------------------------------------------------------------------------------
     wgpuRenderPipelineRelease(debugPipe);
     wgpuRenderPipelineRelease(skyPipe);
+    wgpuRenderPipelineRelease(taaPipe);
     wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(composePipe);
     wgpuComputePipelineRelease(ssaoPipe);

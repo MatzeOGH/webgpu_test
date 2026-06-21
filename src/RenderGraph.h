@@ -41,6 +41,14 @@ struct ResourceHandle
     uint32_t id{};
 };
 
+// a ping-pong temporal (history) resource: two physical textures the PersistentResourcePool rotates
+// each frame. write `curr`, read `prev`. returned by create_temporal_image.
+struct TemporalImage
+{
+    ResourceHandle curr;   // this frame's WRITE target
+    ResourceHandle prev;   // last frame's result, READ-only this frame
+};
+
 // how a pass touches a resource (read/write hazards + WGPU usage flags). The enumerators encode
 // WebGPU usage-scope semantics used only by RenderGraph.cpp's hazard/usage passes, so the full
 // definition -- and ResourceAccess, the recorded access -- live there; the header needs just the
@@ -99,6 +107,7 @@ struct GraphBuilder
 };
 struct GraphAllocator; // internal allocator
 struct PersistentResourcePool; // owns resources that persist across frames (history/temporal buffers).
+struct TransientResourcePool;  // descriptor-keyed cache of per-frame textures, reused across frames.
 
 struct TextureDesc
 {
@@ -124,6 +133,15 @@ struct RenderGraph
     ResourceHandle importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size);
     ResourceHandle create_buffer(WGPUStringView name, const BufferDesc& desc);
     ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
+
+    // Temporal (history) resource: a ping-pong pair the PersistentResourcePool rotates each frame, so
+    // this frame's `.curr` becomes next frame's `.prev` for free -- no manual ping-pong or caller-owned
+    // textures. Write `.curr`, read `.prev`. Survives the per-frame teardown (realize()/release_resources()
+    // defer to the pool), so a pool must be passed to create_render_graph. Writing `.prev` is an authoring
+    // error (it backs a future frame's curr): compile() reports it under RG_VALIDATE.
+    // ponytail: ping-pong only. N-deep history (checkerboard reconstruction, frame-gen reading 2 frames
+    // back) was removed for simplicity; reinstate a `layers` count + indexed accessor if ever needed.
+    TemporalImage create_temporal_image(WGPUStringView name, const TextureDesc& desc);
 
 
     // CAVEAT: pass declaration order matters (implicit SSA versioning, def-before-use): declare a
@@ -184,7 +202,8 @@ private:
 
 GraphAllocator* create_allocator();
 PersistentResourcePool* create_persistent_pool();
-RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool);
+TransientResourcePool* create_transient_pool();
+RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool, TransientResourcePool* transient);
 
 // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
 void debug_print_mermaid(RenderGraph* rg);
