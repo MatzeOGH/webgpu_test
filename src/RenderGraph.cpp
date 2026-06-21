@@ -57,141 +57,6 @@ struct ResourceAccess
     float       clearDepth{};
 };
 
-// arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
-// permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
-// for compile()-local temporaries, reset per-scope via defer (AlpUtils.h) instead of calloc/free.
-struct GraphAllocator
-{
-    // Pointer to the base memory block
-    uint8_t* base{};
-    // Offset to the next free byte
-    size_t used{};
-    // Total capacity in bytes
-    size_t capacity{};
-    // Offset from the top of the buffer to the next free scratch byte (grows downward).
-    size_t scratchUsed{};
-
-    // alignment must be a power of two
-    static constexpr size_t align_up(size_t value, size_t alignment)
-    {
-        return (value + alignment - 1) & ~(alignment - 1);
-    }
-
-    // Raw aligned allocation for type-erased payloads.
-    void* alloc_raw(size_t size, size_t align)
-    {
-        const size_t offset = align_up(used, align);
-
-        if (offset + size > capacity - scratchUsed)
-        {
-            assert(false && "GraphAllocator OOM");
-            return nullptr;
-        }
-
-        void* p = base + offset;
-        used = offset + size;
-        return p;
-    }
-
-    // Raw aligned allocation from the TOP of the buffer, growing scratchUsed down. Short-lived,
-    // compile()-local scratch. Pair every call site with `defer { <allocator>->reset_scratch(); };`
-    // right after the scratch allocations in that scope.
-    void* scratch_alloc_raw(size_t size, size_t align)
-    {
-        if (size > capacity - scratchUsed)
-        {
-            assert(false && "GraphAllocator scratch OOM");
-            return nullptr;
-        }
-
-        size_t rawTop = (capacity - scratchUsed - size) & ~(align - 1);   // round start down to align
-        size_t newScratchUsed = capacity - rawTop;
-
-        if (newScratchUsed > capacity - used)   // would cross into the live front/permanent region
-        {
-            assert(false && "GraphAllocator scratch OOM");
-            return nullptr;
-        }
-
-        scratchUsed = newScratchUsed;
-        return base + rawTop;
-    }
-
-    // shared by make<T>/scratch_make<T>: placement-new construct T in raw storage.
-    template<typename T, typename... Args>
-    static T* construct(void* m, Args&&... args)
-    {
-        return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr;
-    }
-
-    // shared by alloc<T>/scratch_alloc<T>: zero `count` T's worth of raw storage and reinterpret.
-    template<typename T>
-    static T* zero(void* m, size_t count)
-    {
-        if (m) std::memset(m, 0, sizeof(T) * count);
-        return static_cast<T*>(m);
-    }
-
-    // Allocate + construct
-    template<typename T, typename... Args>
-    T* make(Args&&... args)
-    {
-        return construct<T>(alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
-    }
-
-    // Allocate + construct in scratch.
-    template<typename T, typename... Args>
-    T* scratch_make(Args&&... args)
-    {
-        return construct<T>(scratch_alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
-    }
-
-    // Allocate zeroed POD storage
-    template<typename T>
-    T* alloc(size_t count = 1)
-    {
-        return zero<T>(alloc_raw(sizeof(T) * count, alignof(T)), count);
-    }
-
-    // Allocate zeroed POD scratch storage (calloc replacement).
-    template<typename T>
-    T* scratch_alloc(size_t count = 1)
-    {
-        return zero<T>(scratch_alloc_raw(sizeof(T) * count, alignof(T)), count);
-    }
-
-    // Copy a string view into allocator-owned storage.
-    // Result is always null-terminated.
-    WGPUStringView copy_string(WGPUStringView s)
-    {
-        const size_t len = (s.length == WGPU_STRLEN)
-                ? (s.data ? std::strlen(s.data) : 0)
-                : s.length;
-
-        char* buf = alloc<char>(len + 1);
-        if (!buf)
-            return {};
-
-        if (len)
-            std::memcpy(buf, s.data, len);
-
-        buf[len] = '\0';
-
-        return WGPUStringView{ buf, len };
-    }
-
-    void reset()
-    {
-        used = 0;
-        scratchUsed = 0;
-    }
-
-    void reset_scratch()
-    {
-        scratchUsed = 0;
-    }
-};
-
 // length of a (possibly WGPU_STRLEN-sentinel) string view, measured like copy_string.
 static size_t sv_length(WGPUStringView s)
 {
@@ -381,6 +246,147 @@ struct TransientResourcePool
     ~TransientResourcePool() { for (Entry& e : entries) destroy(&e); }
 };
 
+// arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
+// permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
+// for compile()-local temporaries, reset per-scope via defer (AlpUtils.h) instead of calloc/free.
+// Also owns the two resource pools (below): they share the allocator's lifetime, so when it goes they go.
+struct GraphAllocator
+{
+    // Pointer to the base memory block
+    uint8_t* base{};
+    // Offset to the next free byte
+    size_t used{};
+    // Total capacity in bytes
+    size_t capacity{};
+    // Offset from the top of the buffer to the next free scratch byte (grows downward).
+    size_t scratchUsed{};
+
+    // resource pools folded in. reset() below only rewinds the bump cursors -- it leaves these be,
+    // because they cache GPU textures across frames on purpose (history ping-pong + transient reuse).
+    PersistentResourcePool pool;        // name-keyed temporal/history textures
+    TransientResourcePool  transient;   // descriptor-keyed per-frame texture cache
+
+    // alignment must be a power of two
+    static constexpr size_t align_up(size_t value, size_t alignment)
+    {
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    // Raw aligned allocation for type-erased payloads.
+    void* alloc_raw(size_t size, size_t align)
+    {
+        const size_t offset = align_up(used, align);
+
+        if (offset + size > capacity - scratchUsed)
+        {
+            assert(false && "GraphAllocator OOM");
+            return nullptr;
+        }
+
+        void* p = base + offset;
+        used = offset + size;
+        return p;
+    }
+
+    // Raw aligned allocation from the TOP of the buffer, growing scratchUsed down. Short-lived,
+    // compile()-local scratch. Pair every call site with `defer { <allocator>->reset_scratch(); };`
+    // right after the scratch allocations in that scope.
+    void* scratch_alloc_raw(size_t size, size_t align)
+    {
+        if (size > capacity - scratchUsed)
+        {
+            assert(false && "GraphAllocator scratch OOM");
+            return nullptr;
+        }
+
+        size_t rawTop = (capacity - scratchUsed - size) & ~(align - 1);   // round start down to align
+        size_t newScratchUsed = capacity - rawTop;
+
+        if (newScratchUsed > capacity - used)   // would cross into the live front/permanent region
+        {
+            assert(false && "GraphAllocator scratch OOM");
+            return nullptr;
+        }
+
+        scratchUsed = newScratchUsed;
+        return base + rawTop;
+    }
+
+    // shared by make<T>/scratch_make<T>: placement-new construct T in raw storage.
+    template<typename T, typename... Args>
+    static T* construct(void* m, Args&&... args)
+    {
+        return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr;
+    }
+
+    // shared by alloc<T>/scratch_alloc<T>: zero `count` T's worth of raw storage and reinterpret.
+    template<typename T>
+    static T* zero(void* m, size_t count)
+    {
+        if (m) std::memset(m, 0, sizeof(T) * count);
+        return static_cast<T*>(m);
+    }
+
+    // Allocate + construct
+    template<typename T, typename... Args>
+    T* make(Args&&... args)
+    {
+        return construct<T>(alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
+    }
+
+    // Allocate + construct in scratch.
+    template<typename T, typename... Args>
+    T* scratch_make(Args&&... args)
+    {
+        return construct<T>(scratch_alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
+    }
+
+    // Allocate zeroed POD storage
+    template<typename T>
+    T* alloc(size_t count = 1)
+    {
+        return zero<T>(alloc_raw(sizeof(T) * count, alignof(T)), count);
+    }
+
+    // Allocate zeroed POD scratch storage (calloc replacement).
+    template<typename T>
+    T* scratch_alloc(size_t count = 1)
+    {
+        return zero<T>(scratch_alloc_raw(sizeof(T) * count, alignof(T)), count);
+    }
+
+    // Copy a string view into allocator-owned storage.
+    // Result is always null-terminated.
+    WGPUStringView copy_string(WGPUStringView s)
+    {
+        const size_t len = (s.length == WGPU_STRLEN)
+                ? (s.data ? std::strlen(s.data) : 0)
+                : s.length;
+
+        char* buf = alloc<char>(len + 1);
+        if (!buf)
+            return {};
+
+        if (len)
+            std::memcpy(buf, s.data, len);
+
+        buf[len] = '\0';
+
+        return WGPUStringView{ buf, len };
+    }
+
+    void reset()
+    {
+        used = 0;
+        scratchUsed = 0;
+    }
+
+    void reset_scratch()
+    {
+        scratchUsed = 0;
+    }
+};
+
 // internal resouceNode of an image or buffer
 // structured as a intrusive linked list for memory resouce
 // fat stuct style
@@ -470,9 +476,7 @@ struct NodeAdjacency
 // the header a pure method-only interface.
 struct RenderGraphStorage
 {
-    GraphAllocator*         m_allocator{};
-    PersistentResourcePool* pool{};
-    TransientResourcePool*  transient{};
+    GraphAllocator*         m_allocator{};   // owns the pools; reach them via m_allocator->pool / ->transient
     ResourceNode*           m_resouces{};
     PassNode*               m_passes{};
     WGPUDevice              m_device{};
@@ -494,26 +498,13 @@ GraphAllocator* create_allocator(){
     return allocator;
 }
 
-PersistentResourcePool* create_persistent_pool()
-{
-    PersistentResourcePool* pool = new PersistentResourcePool;
-    return pool;
-}
-
-TransientResourcePool* create_transient_pool()
-{
-    return new TransientResourcePool;
-}
-
-RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool, TransientResourcePool* transient)
+RenderGraph* create_render_graph(GraphAllocator* allocator)
 {
     allocator->reset();
     RenderGraph* rg = allocator->make<RenderGraph>();
     RenderGraphStorage* st = allocator->make<RenderGraphStorage>();
     assert(st == storage(rg) && "storage must sit immediately after the RenderGraph");
     st->m_allocator = allocator;
-    st->pool        = pool;
-    st->transient   = transient;
     return rg;
 }
 
@@ -648,9 +639,7 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
-    assert(s.pool && "create_temporal_image needs a PersistentResourcePool -- pass one to create_render_graph");
-    const bool pooled = s.pool != nullptr;   // no pool (release misuse): degrade to plain transients, never null-deref
-    if (pooled) s.pool->touch(name);   // ensure the pool entry exists + advance its rotation
+    s.m_allocator->pool.touch(name);   // ensure the pool entry exists + advance its rotation
 
     TemporalImage out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
@@ -658,7 +647,7 @@ TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const Text
         resouce->handle = { s.next_id++ };
         resouce->name = s.m_allocator->copy_string(name);
         resouce->kind = ResourceNode::Kind::Texture;
-        resouce->persistent = pooled;
+        resouce->persistent = true;
         resouce->temporalIndex = i;
         resouce->dimension = desc.dimension;
         resouce->format = desc.format;
@@ -1130,44 +1119,31 @@ void RenderGraph::realize(WGPUDevice device)
     // one. first union the usage over all layers (each physical texture cycles through every layer role
     // across frames), then (re)create on demand, then point each layer node at its rotated slot. size +
     // usage came from compile(); the pool owns lifetime, so release_resources() leaves these alone.
-    if (s.pool) {
-        for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-            if (!r->persistent || !r->texUsage) continue;
-            if (PersistentResourcePool::Entry* e = s.pool->find(r->name)) e->usage |= r->texUsage;
-        }
-        for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-            if (!r->persistent || !r->texUsage) continue;
-            PersistentResourcePool::Entry* e = s.pool->find(r->name);
-            if (!e) continue;
-            s.pool->realize_entry(e, device, r->resolved, r->format, r->dimension);
-            uint32_t sl = s.pool->slot(*e, r->temporalIndex);
-            r->texture = e->tex[sl];
-            r->view    = e->view[sl];
-        }
+    PersistentResourcePool& pool      = s.m_allocator->pool;
+    TransientResourcePool&  transient = s.m_allocator->transient;
+
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+        if (!r->persistent || !r->texUsage) continue;
+        if (PersistentResourcePool::Entry* e = pool.find(r->name)) e->usage |= r->texUsage;
+    }
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+        if (!r->persistent || !r->texUsage) continue;
+        PersistentResourcePool::Entry* e = pool.find(r->name);
+        if (!e) continue;
+        pool.realize_entry(e, device, r->resolved, r->format, r->dimension);
+        uint32_t sl = pool.slot(*e, r->temporalIndex);
+        r->texture = e->tex[sl];
+        r->view    = e->view[sl];
     }
 
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->is_external()) continue;
         if (r->kind == ResourceNode::Kind::Texture) {
             if (!r->texUsage) continue;
-            if (s.transient) {
-                // reuse a pooled texture matching this descriptor instead of recreating one. the pool
-                // owns it -> release_resources() leaves it alone and recycles/evicts at end_frame().
-                s.transient->acquire(device, r->resolved, r->format, r->dimension, r->texUsage,
-                                     r->texture, r->view);
-            } else {
-                WGPUTextureDescriptor d{
-                    .label         = r->name,
-                    .usage         = r->texUsage,
-                    .dimension     = r->dimension,
-                    .size          = r->resolved,
-                    .format        = r->format,
-                    .mipLevelCount = 1,
-                    .sampleCount   = 1,
-                };
-                r->texture = wgpuDeviceCreateTexture(device, &d);
-                r->view    = wgpuTextureCreateView(r->texture, nullptr);
-            }
+            // reuse a pooled texture matching this descriptor instead of recreating one. the pool
+            // owns it -> release_resources() leaves it alone and recycles/evicts at end_frame().
+            transient.acquire(device, r->resolved, r->format, r->dimension, r->texUsage,
+                              r->texture, r->view);
         } else {
             // buffers stay on the direct path: the lone transient buffer (scene ubo) is tiny and
             // fully host-overwritten each frame, so pooling it saves nothing.
@@ -1258,14 +1234,12 @@ void RenderGraph::release_resources()
     RenderGraphStorage& s = *storage(this);
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->is_external()) continue;   // pool owns temporal textures; freed on resize/pool destroy
-        // with a transient pool, textures are pool-owned -> drop our borrowed refs, don't release.
-        // buffers are never pooled (see realize), so always release them here.
-        if (s.transient && r->kind == ResourceNode::Kind::Texture) { r->texture = nullptr; r->view = nullptr; continue; }
-        if (r->view)    { wgpuTextureViewRelease(r->view); r->view    = nullptr; }
-        if (r->texture) { wgpuTextureRelease(r->texture);  r->texture = nullptr; }
-        if (r->buffer)  { wgpuBufferRelease(r->buffer);    r->buffer  = nullptr; }
+        // textures are pool-owned -> drop our borrowed refs, don't release. buffers are never pooled
+        // (see realize), so always release them here.
+        if (r->kind == ResourceNode::Kind::Texture) { r->texture = nullptr; r->view = nullptr; continue; }
+        if (r->buffer) { wgpuBufferRelease(r->buffer); r->buffer = nullptr; }
     }
-    if (s.transient) s.transient->end_frame();   // release every claim + evict idle textures
+    s.m_allocator->transient.end_frame();   // release every claim + evict idle textures
 }
 
 // records one access on the pass currently being built: the one primitive every GraphBuilder

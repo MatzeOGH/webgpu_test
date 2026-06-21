@@ -485,7 +485,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: producer declared before its consumer.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("producer"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(x); }, noop);
@@ -495,7 +495,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // ERROR: consumer declared before producer of a transient (both survive -- both write the sink).
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("consumer"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x);  b.color(out); }, noop);
@@ -505,7 +505,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: a transient read but never written by any pass (host-uploaded uniform) -- hasWriter exemption.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto ubo = g->create_buffer(WEBGPU_STR("ubo"), { .size = 16 });
         g->add_pass(WEBGPU_STR("use"), PassKind::Graphics, [&](GraphBuilder& b){ b.uniform(ubo); b.color(out); }, noop);
@@ -514,7 +514,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: an imported resource read before an in-graph write (legal "read then overwrite" WAR).
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto imp = g->import_buffer(WEBGPU_STR("imp"), nullptr);
         g->add_pass(WEBGPU_STR("read.imported"),  PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(imp);  b.color(out); }, noop);
@@ -524,7 +524,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: multi-writer chain (v1 written, read, v2 written, read) -- no false early-read error.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("prepass"), PassKind::Compute,  [&](GraphBuilder& b){ b.storage_write(x); }, noop);                   // x v1
@@ -536,7 +536,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // ERROR: a pass reads then writes the same transient that nothing else produced -> reads uninitialized.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto x   = g->create_buffer(WEBGPU_STR("x"), { .size = 16 });
         g->add_pass(WEBGPU_STR("rmw"), PassKind::Graphics, [&](GraphBuilder& b){ b.storage_read(x); b.storage_write(x); b.color(out); }, noop);
@@ -547,7 +547,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
     // (no write involved). The illegal cases it DOES catch (sampled+storage_write, double write) assert at
     // declaration time, so they can't be exercised here without aborting the run -- verified manually.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto tex = g->create_image(WEBGPU_STR("tex"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("read.twice"), PassKind::Graphics, [&](GraphBuilder& b){ b.sampled(tex); b.sampled(tex); b.color(out); }, noop);
@@ -556,7 +556,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
 
     // OK: read-only depth + sampled of the same texture in one pass (both reads) -- must NOT trip either.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out   = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto depth = g->create_image(WEBGPU_STR("depth"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("depth.ro+sampled"), PassKind::Graphics, [&](GraphBuilder& b){ b.depth_stencil_read_only(depth); b.sampled(depth); b.color(out); }, noop);
@@ -566,7 +566,7 @@ void run_rg_compile_tests(RG::GraphAllocator* alloc)
     // lifetimes: producer writes transient t (pass 0); consumer samples t and writes the sink (pass 1).
     // phase 3 records firstUse/lastUse over the post-cull execution order; the imported sink is excluded.
     {
-        RenderGraph* g = create_render_graph(alloc, nullptr, nullptr);
+        RenderGraph* g = create_render_graph(alloc);
         auto out = g->importe_image(WEBGPU_STR("out"), nullptr, { 1, 1, 1 });
         auto t   = g->create_image(WEBGPU_STR("t"), { .dimension = WGPUTextureDimension_2D, .absolute = { 1, 1, 1 } });
         g->add_pass(WEBGPU_STR("producer"), PassKind::Graphics, [&](GraphBuilder& b){ b.color(t); }, noop);
@@ -778,14 +778,10 @@ int main()
 
     // single persistent arena. create_render_graph() resets it and arena-allocates a fresh
     // RenderGraph (+ all its nodes) from it each frame -> the allocator is the only graph-side
-    // object that lives across frames.
+    // object that lives across frames. It also owns the two resource pools (folded in): the
+    // persistent pool (temporal/history textures, create_temporal_image) and the transient pool
+    // (per-frame gbuffer/lit/shadow textures reused across teardown). Both outlive the frame loop.
     GraphAllocator* allocator = create_allocator();
-    // persistent pool: owns temporal/history textures across the per-frame teardown (create_temporal_image).
-    // lives the whole run alongside the allocator; handed to create_render_graph each frame.
-    PersistentResourcePool* pool = create_persistent_pool();
-    // transient pool: caches this-frame textures (gbuffer/lit/shadow/...) across the teardown so
-    // realize()/release_resources() reuse them instead of recreating every frame. lives the whole run.
-    TransientResourcePool* transient = create_transient_pool();
 
     run_rg_compile_tests(allocator);   // compile()-only edge-case checks (no GPU); next create_render_graph() resets the arena
 
@@ -891,7 +887,7 @@ int main()
         WGPUTextureView view = wgpuTextureCreateView(st.texture, &vd);
 
         // ---- declare the whole graph for THIS frame (immediate mode) ----
-        RenderGraph* rg = create_render_graph(allocator, pool, transient);   // resets the arena, fresh RenderGraph (pools persist)
+        RenderGraph* rg = create_render_graph(allocator);   // resets the arena, fresh RenderGraph (pools persist in the allocator)
 
         // import this frame's swapchain view; its size roots every Relative texture below.
         auto swapchain = rg->importe_image(WEBGPU_STR("swapchain"), view, { cfg.width, cfg.height, 1 });
@@ -1245,7 +1241,7 @@ int main()
             // transient cache proof: toggle a feature off then back on within kRetain frames and the
             // return shows 0 created -> textures were reused from the pool, not reallocated.
             std::printf("transient pool: %zu textures, %u created this frame\n",
-                        transient->entries.size(), transient->createdThisFrame);
+                        allocator->transient.entries.size(), allocator->transient.createdThisFrame);
         }
 
         // host-upload the scene + a slowly rotating directional light. The spheres are packed into a
@@ -1306,6 +1302,6 @@ int main()
     imgui_layer_shutdown();
     SDL_DestroyWindow(window);
     SDL_Quit();
-    // ponytail: the GraphAllocator (1 MB block) is leaked at exit -- one-time, process reclaims it.
+    // ponytail: the GraphAllocator (1 MB block + both resource pools) is leaked at exit -- one-time, process reclaims it.
     return 0;
 }

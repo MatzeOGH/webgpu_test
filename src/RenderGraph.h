@@ -105,9 +105,7 @@ struct GraphBuilder
 
     PassNode* m_new_pass{};
 };
-struct GraphAllocator; // internal allocator
-struct PersistentResourcePool; // owns resources that persist across frames (history/temporal buffers).
-struct TransientResourcePool;  // descriptor-keyed cache of per-frame textures, reused across frames.
+struct GraphAllocator; // internal allocator: bump arena + the two resource pools (persistent + transient)
 
 struct TextureDesc
 {
@@ -137,7 +135,7 @@ struct RenderGraph
     // Temporal (history) resource: a ping-pong pair the PersistentResourcePool rotates each frame, so
     // this frame's `.curr` becomes next frame's `.prev` for free -- no manual ping-pong or caller-owned
     // textures. Write `.curr`, read `.prev`. Survives the per-frame teardown (realize()/release_resources()
-    // defer to the pool), so a pool must be passed to create_render_graph. Writing `.prev` is an authoring
+    // defer to the pool the allocator owns). Writing `.prev` is an authoring
     // error (it backs a future frame's curr): compile() reports it under RG_VALIDATE.
     // ponytail: ping-pong only. N-deep history (checkerboard reconstruction, frame-gen reading 2 frames
     // back) was removed for simplicity; reinstate a `layers` count + indexed accessor if ever needed.
@@ -201,9 +199,7 @@ private:
 };
 
 GraphAllocator* create_allocator();
-PersistentResourcePool* create_persistent_pool();
-TransientResourcePool* create_transient_pool();
-RenderGraph* create_render_graph(GraphAllocator* allocator, PersistentResourcePool* pool, TransientResourcePool* transient);
+RenderGraph* create_render_graph(GraphAllocator* allocator);
 
 // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)
 void debug_print_mermaid(RenderGraph* rg);
