@@ -867,6 +867,11 @@ int main()
 
         imgui_layer_begin_frame();   // NewFrame only; the DAG window is built after compile, Render() in end_frame
 
+        ImGui::Begin("Features");
+        ImGui::Checkbox("SSAO", &ssaoOn);
+        ImGui::Checkbox("TAA", &taaOn);
+        ImGui::End();
+
         WGPUSurfaceTexture st{};
         wgpuSurfaceGetCurrentTexture(surf, &st);
         if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&

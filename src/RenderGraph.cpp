@@ -454,6 +454,7 @@ struct PassNode
     NodeAdjacency* adjacency{};
 
     bool placed{}; // topo sort: already emitted into execution order
+    bool sink{}; // mark a pass as a sink
 
     PassNode* next{}; // ptr to the next pass node of the render graph
 };
@@ -841,7 +842,10 @@ bool RenderGraph::compile()
         uint32_t count = 0;
         for (PassNode* p = s.m_passes; p; p = p->next)
             if (is_sink(p, external))
+            {
+                p->sink = true;
                 topo_visit(p, order, count);          // only reaches passes that feed a sink
+            }
 
         // relink next-pointers to follow topo order; m_passes is now == execution order, and any
         // pass not reachable from a sink was never emitted -> dead, dropped here for free.
