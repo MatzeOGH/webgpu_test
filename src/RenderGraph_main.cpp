@@ -33,6 +33,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>       // SDL_SetMainReady (no main redefinition under SDL_MAIN_HANDLED)
 
+#include "imgui_layer.h"         // ImGui SDL3 + WebGPU backends, driven by main() + the "imgui" pass
+
 double getTime() {
     static const double freq =
         (double)SDL_GetPerformanceFrequency();
@@ -748,9 +750,12 @@ int main()
     double prevTime  = getTime();
     const float kMouseSens = 0.0025f, kMoveSpeed = 4.0f;
 
+    imgui_layer_init(window, dev, kSwapFormat);
+
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT) running = false;
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_ESCAPE) running = false;
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_SPACE) {
@@ -763,7 +768,8 @@ int main()
                 debugMode = (e.key.scancode == SDL_SCANCODE_0) ? 0 : (int)(e.key.scancode - SDL_SCANCODE_1) + 1;
                 std::printf("debug: %s\n", kDebugName[debugMode]);
             }
-            else if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
+            else if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT
+                     && !ImGui::GetIO().WantCaptureMouse) {     // don't start a look-drag on a UI click
                 dragging = true;
                 SDL_SetWindowRelativeMouseMode(window, true);   // capture + hide cursor while looking
             }
@@ -791,13 +797,15 @@ int main()
         float fwd[3]   = { cp * sy, sp, -cp * cy };
         float right[3] = { cy, 0.0f, sy };
         float up[3]    = { -sy * sp, cp, cy * sp };
-        {
+        if (!ImGui::GetIO().WantCaptureKeyboard) {
             auto ks = SDL_GetKeyboardState(nullptr);   // const bool* (SDL3); index with scancodes
             float mv = kMoveSpeed * dt;
             float f = (ks[SDL_SCANCODE_W] ? mv : 0.0f) - (ks[SDL_SCANCODE_S] ? mv : 0.0f);
             float r = (ks[SDL_SCANCODE_D] ? mv : 0.0f) - (ks[SDL_SCANCODE_A] ? mv : 0.0f);
             for (int i = 0; i < 3; ++i) camPos[i] += fwd[i] * f + right[i] * r;
         }
+
+        imgui_layer_new_frame();   // build UI + ImGui::Render(); kept before the skip-frame continues
 
         WGPUSurfaceTexture st{};
         wgpuSurfaceGetCurrentTexture(surf, &st);
@@ -1057,6 +1065,17 @@ int main()
                 });
         }
 
+        // ImGui overlay: last pass. Load keeps the rendered scene; the write to the imported
+        // swapchain makes it a sink, and a WAW edge orders it after present/debug. ctx.render is
+        // the open render-pass encoder execute() hands us.
+        rg->add_pass(WEBGPU_STR("imgui"), PassKind::Graphics,
+            [&](GraphBuilder& b) {
+                b.color(swapchain, WGPULoadOp_Load, WGPUStoreOp_Store);
+            },
+            [](PassContext& ctx) {
+                ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), ctx.render);
+            });
+
         if (!rg->compile()) {
             // ordering error (a transient resource read before its writer); compile() already printed
             // the offending pass/resource. skip this frame's GPU work instead of rendering garbage.
@@ -1131,6 +1150,7 @@ int main()
     wgpuRenderPipelineRelease(lightingPipe);
     wgpuRenderPipelineRelease(shadowPipe);
     wgpuRenderPipelineRelease(gbufferPipe);
+    imgui_layer_shutdown();
     SDL_DestroyWindow(window);
     SDL_Quit();
     // ponytail: the GraphAllocator (1 MB block) is leaked at exit -- one-time, process reclaims it.

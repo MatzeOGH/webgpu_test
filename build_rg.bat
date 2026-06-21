@@ -6,13 +6,22 @@ cd /D "%~dp0"
 where cl >nul 2>&1 || call "%~dp0msvcsetup.bat"
 
 cl /nologo /std:c++20 /EHsc /MD ^
+   /DIMGUI_IMPL_WEBGPU_BACKEND_DAWN ^
    /I build-win\_deps\dawn_native-src\include ^
    /I build-win\_deps\sdl3-src\include ^
+   /I src\extern\imgui ^
+   /I src\extern\imgui\backends ^
    src\RenderGraph.cpp ^
+   src\extern\imgui\imgui.cpp ^
+   src\extern\imgui\imgui_draw.cpp ^
+   src\extern\imgui\imgui_tables.cpp ^
+   src\extern\imgui\imgui_widgets.cpp ^
+   src\extern\imgui\backends\imgui_impl_sdl3.cpp ^
+   src\extern\imgui\backends\imgui_impl_wgpu.cpp ^
    build-win\_deps\dawn_native-src\lib\webgpu_dawn.lib ^
    build-win\_deps\sdl3-src\lib\x64\SDL3.lib ^
    dxguid.lib ^
-   /Fo:build-win\RenderGraph.obj /Fe:build-win\Release\rg.exe ^
+   /Fo:build-win\ /Fe:build-win\Release\rg.exe ^
    /link /DEFAULTLIB:onecore.lib
 
 if errorlevel 1 (

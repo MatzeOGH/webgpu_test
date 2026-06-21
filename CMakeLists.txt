@@ -123,16 +123,31 @@ elseif(WIN32)
     add_executable(nanite_builder src/mainNaniteBuilder.cpp src/ClusteredMesh.cpp)
     target_link_libraries(nanite_builder PRIVATE dawn::webgpu_dawn)
 
+    # Dear ImGui (vendored): core + SDL3 platform + WebGPU(Dawn) renderer backends, each its own
+    # TU -- the same set build_rg.bat compiles. The Dawn backend needs IMGUI_IMPL_WEBGPU_BACKEND_DAWN.
+    set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/src/extern/imgui)
+    set(IMGUI_SOURCES
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_wgpu.cpp
+    )
+
     # RenderGraph standalone smoke test. RenderGraph_main.cpp is #included at the bottom of
-    # RenderGraph.cpp, so this single TU is the whole driver (mirrors build_rg.bat).
-    # Built for Edit & Continue: Debug gets /ZI + incremental link, /MD to match the prebuilt
-    # release Dawn/SDL3. Set rg as the startup project and run Debug to use it.
-    add_executable(rg src/RenderGraph.cpp src/RenderGraph_main.cpp src/RenderGraph.h)
+    # RenderGraph.cpp, so that single TU is the whole driver; the ImGui TUs link alongside it
+    # (mirrors build_rg.bat). Built for Edit & Continue: Debug gets /ZI + incremental link, /MD to
+    # match the prebuilt release Dawn/SDL3. Set rg as the startup project and run Debug to use it.
+    add_executable(rg src/RenderGraph.cpp src/RenderGraph_main.cpp src/RenderGraph.h
+        src/imgui_layer.h ${IMGUI_SOURCES})
     # RenderGraph_main.cpp is #included at the bottom of RenderGraph.cpp; list it (and the header)
     # so they show in Solution Explorer, but HEADER_FILE_ONLY keeps it out of the build so it isn't
     # compiled as a second TU.
     set_source_files_properties(src/RenderGraph_main.cpp PROPERTIES HEADER_FILE_ONLY TRUE)
     target_link_libraries(rg PRIVATE dawn::webgpu_dawn SDL3::SDL3 dxguid onecore)
+    target_include_directories(rg PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+    target_compile_definitions(rg PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
     set_target_properties(rg PROPERTIES
         MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
         MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug>:EditAndContinue>"
