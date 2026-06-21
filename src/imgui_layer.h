@@ -79,72 +79,18 @@ static const char* rg_access_name(AccessType t)
 	}
 	return "?";
 }
-/*
-
-// will become the memory debug view
-struct Task {
-	const char* name;
-	float start;
-	float end;
-	ImU32 color;
-};
-
-static Task tasks[] = {
-	{ "Design",  0.0f, 3.0f, IM_COL32(120,180,255,255) },
-	{ "Coding",  2.0f, 7.0f, IM_COL32(120,255,140,255) },
-	{ "Testing", 6.0f, 9.0f, IM_COL32(255,200,120,255) },
-};
-
-void DrawGantt()
+// colour a resource lifetime bar by kind: textures cool, buffers warm.
+static ImU32 rg_resource_color(ResourceNode::Kind k)
 {
-	ImDrawList* draw = ImGui::GetWindowDrawList();
-
-	float rowHeight = 28.0f;
-	float scale = 80.0f; // pixels per time unit
-
-	ImVec2 canvasPos = ImGui::GetCursorScreenPos();
-	ImVec2 canvasSize(900, 3 * rowHeight);
-
-	draw->AddRectFilled(
-		canvasPos,
-		ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y),
-		IM_COL32(40, 40, 40, 255));
-
-	for (int i = 0; i < IM_ARRAYSIZE(tasks); i++)
-	{
-		const Task& t = tasks[i];
-
-		float y = canvasPos.y + i * rowHeight;
-
-		float x0 = canvasPos.x + t.start * scale;
-		float x1 = canvasPos.x + t.end * scale;
-
-		ImVec2 p0(x0, y + 4);
-		ImVec2 p1(x1, y + rowHeight - 4);
-
-		draw->AddRectFilled(p0, p1, t.color, 4.0f);
-		draw->AddText(
-			ImVec2(canvasPos.x + 5, y + 6),
-			IM_COL32_WHITE,
-			t.name);
-	}
-
-	ImGui::Dummy(canvasSize);
+	return k == ResourceNode::Kind::Texture ? IM_COL32(70, 120, 170, 255)
+	                                        : IM_COL32(170, 120, 60, 255);
 }
-/**/
 
-// Draw the compiled graph: a box per pass, bezier lines for the dependency edges, laid out
-// left-to-right by dependency depth. Reads the .cpp-internal node structs directly. Assumes a
-// compiled, valid graph (realize() has run) -- no hedging, like the other debug dumps.
-static void imgui_layer_draw_graph(RenderGraph* rg)
+// DAG view: a box per pass, bezier lines for the dependency edges, laid out left-to-right by
+// dependency depth. Reads the .cpp-internal node structs directly. Assumes a compiled, valid graph
+// (realize() has run) -- no hedging, like the other debug dumps.
+static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 {
-	RenderGraphStorage& s = *storage(rg);
-
-	ImGui::Begin("RenderGraph");
-	ImGui::Text(" %.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
-	ImGui::Separator();
-
-
 	// layout: column = longest dependency chain to a root, row = stacking slot within the column.
 	// m_passes is topo-sorted, so every predecessor's layer is known before we reach the pass.
 	constexpr int   kMaxNodes = 128;
@@ -246,6 +192,181 @@ static void imgui_layer_draw_graph(RenderGraph* rg)
 	}
 
 	ImGui::EndChild();
+}
+
+// imported/persistent resources are left out of compile()'s firstUse/lastUse (the graph doesn't own
+// their memory), so the lifetimes view recovers their span by walking the pass list -- only to draw a
+// bar, never for aliasing. false if no surviving pass touches the resource.
+static bool rg_external_span(RenderGraphStorage& s, ResourceNode* r, uint32_t& first, uint32_t& last)
+{
+	first = ResourceNode::kNoPass; last = 0;
+	uint32_t idx = 0;
+	for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
+		for (uint32_t i = 0; i < p->accessCount; ++i)
+			if (p->accesses[i].handle.id == r->handle.id) {
+				if (first == ResourceNode::kNoPass) first = idx;
+				last = idx;
+			}
+	return first != ResourceNode::kNoPass;
+}
+
+// Resource-lifetime grid. The top axis is the passes in execution order (named); each resource is a
+// bar across the passes it stays live for -- first touch to last. Transient resources read the
+// firstUse/lastUse the aliasing analysis fills in compile() phase 3. Imported + temporal resources
+// are caller-owned (no aliasing span); the toggle adds them, drawn muted with their span recovered by
+// rg_external_span. Bars that never share a column are aliasing candidates.
+static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
+{
+	constexpr int   kMax = 128;
+	constexpr float kLabelW = 150.0f, kColW = 88.0f, kRowH = 24.0f, kHeaderH = 24.0f;
+
+	static bool showExternal = true;
+	ImGui::Checkbox("show imported / temporal", &showExternal);
+	ImGui::SameLine();
+	ImGui::TextDisabled("(transient solid, imported/temporal muted)");
+
+	PassNode* passAt[kMax];
+	int nPass = 0;
+	for (PassNode* p = s.m_passes; p && nPass < kMax; p = p->next) passAt[nPass++] = p;
+
+	// rows top-to-bottom: live transients, then (if shown) imported/temporal with a span, then the
+	// span-less rows (dead transients, untouched externals) pooled at the bottom.
+	struct Row { ResourceNode* r; uint32_t first, last; bool bar; };
+	Row row[kMax];
+	int nRow = 0;
+	for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next)
+		if (!r->is_external() && r->firstUse != ResourceNode::kNoPass)
+			row[nRow++] = { r, r->firstUse, r->lastUse, true };
+	if (showExternal)
+		for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next) {
+			uint32_t f, l;
+			if (r->is_external() && rg_external_span(s, r, f, l)) row[nRow++] = { r, f, l, true };
+		}
+	for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next)
+		if (!r->is_external() && r->firstUse == ResourceNode::kNoPass)
+			row[nRow++] = { r, 0, 0, false };
+	if (showExternal)
+		for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next) {
+			uint32_t f, l;
+			if (r->is_external() && !rg_external_span(s, r, f, l)) row[nRow++] = { r, 0, 0, false };
+		}
+
+	ImGui::BeginChild("rg_life", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+	const ImVec2 origin = ImGui::GetCursorScreenPos();
+	ImGui::Dummy(ImVec2(kLabelW + nPass * kColW, kHeaderH + nRow * kRowH));   // reserve scroll region
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+
+	const float gridR = origin.x + kLabelW + nPass * kColW;
+	const float gridT = origin.y + kHeaderH;
+	const float gridB = gridT + nRow * kRowH;
+
+	// top axis: one clipped pass name per column + a faint column line; hover a header for the full name.
+	for (int c = 0; c < nPass; ++c) {
+		float x = origin.x + kLabelW + c * kColW;
+		dl->AddLine(ImVec2(x, origin.y), ImVec2(x, gridB), IM_COL32(255, 255, 255, 22));
+		WGPUStringView nm = passAt[c]->name;
+		if (nm.data) {
+			dl->PushClipRect(ImVec2(x + 4, origin.y), ImVec2(x + kColW, gridT), true);
+			dl->AddText(ImVec2(x + 6, origin.y + 5), IM_COL32(225, 225, 225, 255), nm.data, nm.data + nm.length);
+			dl->PopClipRect();
+		}
+		ImGui::SetCursorScreenPos(ImVec2(x, origin.y));
+		ImGui::PushID(c);
+		ImGui::InvisibleButton("h", ImVec2(kColW, kHeaderH));
+		if (ImGui::IsItemHovered()) {
+			ImGui::BeginTooltip();
+			ImGui::Text("P%d  %.*s  [%s]", c, (int)nm.length, nm.data ? nm.data : "", rg_kind_name(passAt[c]->kind));
+			ImGui::EndTooltip();
+		}
+		ImGui::PopID();
+	}
+	dl->AddLine(ImVec2(origin.x, gridT), ImVec2(gridR, gridT), IM_COL32(255, 255, 255, 40));   // axis underline
+
+	// one row per resource: name in the left gutter, a bar spanning [first, last] columns.
+	for (int i = 0; i < nRow; ++i) {
+		ResourceNode* r = row[i].r;
+		const bool ext = r->is_external();
+		const float y = gridT + i * kRowH;
+		if (i & 1) dl->AddRectFilled(ImVec2(origin.x, y), ImVec2(gridR, y + kRowH), IM_COL32(255, 255, 255, 10));
+
+		// name colour doubles as the legend: imported = amber, temporal = violet, transient = white,
+		// span-less = grey. temporal layers share a name, so tag them with their frame index.
+		WGPUStringView nm = r->name;
+		ImU32 nameCol = !row[i].bar   ? IM_COL32(135, 135, 135, 255)
+		              : r->imported   ? IM_COL32(240, 170, 90, 255)
+		              : r->persistent ? IM_COL32(180, 165, 245, 255)
+		              :                 IM_COL32(230, 230, 230, 255);
+		char label[96];
+		if (r->persistent)
+			std::snprintf(label, sizeof label, "%.*s #%u", (int)nm.length, nm.data ? nm.data : "", r->temporalIndex);
+		else
+			std::snprintf(label, sizeof label, "%.*s", (int)nm.length, nm.data ? nm.data : "");
+		dl->PushClipRect(ImVec2(origin.x + 4, y), ImVec2(origin.x + kLabelW - 4, y + kRowH), true);
+		dl->AddText(ImVec2(origin.x + 6, y + 4), nameCol, label);
+		dl->PopClipRect();
+
+		if (!row[i].bar) {   // no surviving pass touched it -> no bar.
+			dl->AddText(ImVec2(origin.x + kLabelW + 6, y + 4), nameCol, ext ? "(unused)" : "(dead)");
+			continue;
+		}
+
+		const float x0 = origin.x + kLabelW + row[i].first * kColW + 3.0f;
+		const float x1 = origin.x + kLabelW + (row[i].last + 1) * kColW - 3.0f;
+		const ImVec2 tl(x0, y + 3.0f), br(x1, y + kRowH - 3.0f);
+
+		ImGui::SetCursorScreenPos(tl);
+		ImGui::PushID(kMax + i);   // keep ids clear of the header buttons
+		ImGui::InvisibleButton("b", ImVec2(x1 - x0, kRowH - 6.0f));
+		const bool hov = ImGui::IsItemHovered();
+		ImGui::PopID();
+
+		// transient = solid kind colour; imported/temporal = muted (caller-owned, not aliasable) with
+		// an accent edge matching the name colour.
+		ImU32 fill = rg_resource_color(r->kind);
+		if (ext) fill = (fill & ~IM_COL32_A_MASK) | ((ImU32)110 << IM_COL32_A_SHIFT);
+		dl->AddRectFilled(tl, br, fill, 4.0f);
+		ImU32 edge = hov ? IM_COL32(255, 255, 255, 255) : ext ? nameCol : IM_COL32(20, 20, 20, 160);
+		dl->AddRect(tl, br, edge, 4.0f, 0, hov ? 2.0f : 1.0f);
+
+		if (hov) {
+			WGPUStringView f = pass_name_at(s.m_passes, row[i].first);
+			WGPUStringView l = pass_name_at(s.m_passes, row[i].last);
+			ImGui::BeginTooltip();
+			ImGui::Text("%s  [%s]", label, r->kind == ResourceNode::Kind::Texture ? "texture" : "buffer");
+			if (r->kind == ResourceNode::Kind::Texture)
+				ImGui::Text("%u x %u", r->resolved.width, r->resolved.height);
+			else
+				ImGui::Text("%llu bytes", (unsigned long long)r->bufferSize);
+			if (r->imported)        ImGui::TextDisabled("imported -- caller-owned, not aliased");
+			else if (r->persistent) ImGui::TextDisabled("temporal layer %u -- pool-owned, not aliased", r->temporalIndex);
+			ImGui::Separator();
+			if (row[i].first == row[i].last)
+				ImGui::Text("alive in %.*s", (int)f.length, f.data ? f.data : "");
+			else
+				ImGui::Text("alive %.*s .. %.*s",
+					(int)f.length, f.data ? f.data : "", (int)l.length, l.data ? l.data : "");
+			ImGui::EndTooltip();
+		}
+	}
+
+	ImGui::EndChild();
+}
+
+// The RenderGraph debug window: FPS readout + a tab bar over the dependency DAG and the resource-
+// lifetime grid. Built after compile()+realize(), so both tabs read a finished graph.
+static void imgui_layer_draw_graph(RenderGraph* rg)
+{
+	RenderGraphStorage& s = *storage(rg);
+
+	ImGui::Begin("RenderGraph");
+	ImGui::Text(" %.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+	ImGui::Separator();
+
+	if (ImGui::BeginTabBar("rg_tabs")) {
+		if (ImGui::BeginTabItem("Graph"))     { rg_draw_dag(rg, s);       ImGui::EndTabItem(); }
+		if (ImGui::BeginTabItem("Lifetimes")) { rg_draw_lifetimes(rg, s); ImGui::EndTabItem(); }
+		ImGui::EndTabBar();
+	}
 	ImGui::End();
 }
 
