@@ -1119,7 +1119,7 @@ int main()
             // history: ping-pong temporal resource. .curr = this frame's write target, .prev = last
             // frame's result (read-only). the pool swaps the two physical textures every frame, so this
             // frame's result becomes next frame's history -- no manual ping-pong.
-            auto history = rg->create_temporal_image(WEBGPU_STR("taa.history"), {
+            auto [historyCurr, historyPrev] = rg->create_temporal_image(WEBGPU_STR("taa.history"), {
                 .dimension = WGPUTextureDimension_2D, .format = kSwapFormat,
                 .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
             });
@@ -1127,14 +1127,14 @@ int main()
             rg->add_pass(WEBGPU_STR("taa"), PassKind::Graphics,
                 [&](GraphBuilder& b) {
                     b.sampled(taaInput);                 // this frame's shaded colour (lit*ao or lit)
-                    b.sampled(history.prev);             // previous frame (rotated in by the pool)
-                    b.color(history.curr, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                    b.sampled(historyPrev);             // previous frame (rotated in by the pool)
+                    b.color(historyCurr, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
                 },
-                [dev, taaPipe, taaInput, history](PassContext& ctx) {
+                [dev, taaPipe, taaInput, historyCurr, historyPrev](PassContext& ctx) {
                     WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(taaPipe, 0);
                     WGPUBindGroupEntry e[2] = {
                         { .binding = 0, .textureView = ctx.view(taaInput) },
-                        { .binding = 1, .textureView = ctx.view(history.prev) },
+                        { .binding = 1, .textureView = ctx.view(historyPrev) },
                     };
                     WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
                     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
@@ -1147,13 +1147,13 @@ int main()
 
             rg->add_pass(WEBGPU_STR("taa.present"), PassKind::Graphics,
                 [&](GraphBuilder& b) {
-                    b.sampled(history.curr);             // this frame's accumulated result
+                    b.sampled(historyCurr);             // this frame's accumulated result
                     b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
                 },
-                [dev, presentPipe, history](PassContext& ctx) {
+                [dev, presentPipe, historyCurr](PassContext& ctx) {
                     WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(presentPipe, 0);
                     WGPUBindGroupEntry e[1] = {
-                        { .binding = 0, .textureView = ctx.view(history.curr) },
+                        { .binding = 0, .textureView = ctx.view(historyCurr) },
                     };
                     WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
                     WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
