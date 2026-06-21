@@ -805,13 +805,14 @@ int main()
             for (int i = 0; i < 3; ++i) camPos[i] += fwd[i] * f + right[i] * r;
         }
 
-        imgui_layer_new_frame();   // build UI + ImGui::Render(); kept before the skip-frame continues
+        imgui_layer_begin_frame();   // NewFrame only; the DAG window is built after compile, Render() in end_frame
 
         WGPUSurfaceTexture st{};
         wgpuSurfaceGetCurrentTexture(surf, &st);
         if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
             st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
             wgpuSurfaceConfigure(surf, &cfg);     // surface went stale (resize/minimize) -> reconfigure, skip frame
+            imgui_layer_end_frame();              // balance begin_frame's NewFrame on the skipped frame
             continue;
         }
 
@@ -1082,9 +1083,13 @@ int main()
             wgpuTextureViewRelease(view);
             wgpuTextureRelease(st.texture);
             instance.ProcessEvents();
+            imgui_layer_end_frame();   // balance begin_frame's NewFrame on the skipped frame
             continue;
         }
         rg->realize(dev);     // creates this frame's gbuffer/shadow/lit/ao textures (+ scene ubo)
+
+        imgui_layer_draw_graph(rg);   // build the DAG window now the graph is compiled + realized
+        imgui_layer_end_frame();      // ImGui::Render(); the "imgui" pass consumes the draw data at execute
 
         // proof the per-frame graph really changes shape: print the order whenever SSAO or debug flips.
         if ((int)ssaoOn != shownSsao || debugMode != shownDebug) {
