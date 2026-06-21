@@ -10,7 +10,7 @@
 #include <cstring>
 #include "AlpUtils.h"
 
-// Graph validation -- the post-cull "reads a resource before any pass writes it" check in compile().
+// Graph validation: the post-cull "reads a resource before any pass writes it" check in compile().
 // It is a per-frame development aid; like assert it is compiled OUT in release builds (NDEBUG), so a
 // shipping build assumes author-valid graphs and compile() always returns true. Predefine RG_VALIDATE
 // to 1/0 to force it on/off independently of NDEBUG.
@@ -24,6 +24,37 @@
 
 
 namespace RG{
+
+// how a pass touches a resource -> read/write (hazards) and WGPU usage flags.
+// comment column = WebGPU internal usage (usage-scope class) -> hazard -> usage bit.
+enum struct AccessType : uint8_t
+{
+    ColorAttachment,         // attachment      write   tex RenderAttachment
+    DepthStencilAttachment,  // attachment      write   tex RenderAttachment  (depth/stencil test + write)
+    DepthStencilReadOnly,    // attachment-read read    tex RenderAttachment  (test only, depthReadOnly; no write hazard)
+    Sampled,                 // constant        read    tex TextureBinding
+    StorageRead,             // storage-read    read    tex StorageBinding / buf Storage
+    StorageWrite,            // storage         write   tex StorageBinding / buf Storage
+    Uniform,                 // constant        read    buf Uniform (+CopyDst host-upload affordance)
+    CopySrc,                 // copy            read    tex/buf CopySrc
+    CopyDst,                 // copy            write   tex/buf CopyDst
+    Vertex,                  // input           read    buf Vertex
+    Index,                   // input           read    buf Index
+    Indirect,                // input           read    buf Indirect
+};
+
+// one recorded access on a pass (PassNode stores a fixed inline array of these).
+struct ResourceAccess
+{
+    ResourceHandle handle{};
+    AccessType     type{};
+
+    // attachment-only (ColorAttachment / DepthStencilAttachment); ignored for other access types.
+    WGPULoadOp  loadOp{};
+    WGPUStoreOp storeOp{};
+    WGPUColor   clearColor{};
+    float       clearDepth{};
+};
 
 // arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
 // permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
@@ -61,7 +92,7 @@ struct GraphAllocator
         return p;
     }
 
-    // Raw aligned allocation from the TOP of the buffer, growing scratchUsed down -- short-lived,
+    // Raw aligned allocation from the TOP of the buffer, growing scratchUsed down. Short-lived,
     // compile()-local scratch. Pair every call site with `defer { <allocator>->reset_scratch(); };`
     // right after the scratch allocations in that scope.
     void* scratch_alloc_raw(size_t size, size_t align)
@@ -195,7 +226,7 @@ struct ResourceNode
     WGPUBuffer       buffer{};                        // imported: the registered buffer
     WGPUExtent3D     resolved = WGPU_EXTENT_3D_INIT;  // imported: registered size (base for future Relative resolution)
     WGPUTextureUsage texUsage{};                      // accumulated in compile() from the access list
-    WGPUBufferUsage  bufUsage{};                      //   "       — WebGPU needs these at create time
+    WGPUBufferUsage  bufUsage{};                      //   "       (WebGPU needs these at create time)
 
     ResourceNode* next{}; // ptr to the next resouce node of the render graph
 };
@@ -299,7 +330,7 @@ static void list_append(T** head, T* newNode)
 
 // the exclusive-write set (WebGPU usage-scope `attachment`/`storage`). everything else is a read
 // (`input`/`constant`/`storage-read`/`attachment-read`). NOTE: DepthStencilReadOnly is deliberately
-// absent -- read-only depth is `attachment-read`, a read; adding it here would reintroduce the false
+// absent: read-only depth is `attachment-read`, a read; adding it here would reintroduce the false
 // write hazard this distinction exists to remove.
 static bool access_is_write(AccessType t)
 {
@@ -312,7 +343,7 @@ static bool access_is_write(AccessType t)
 #if RG_VALIDATE
 // do two accesses to the SAME resource in ONE pass (one usage scope) conflict? read+read never does.
 // the lone read+write exception is StorageRead+StorageWrite: that is how the graph spells a read-modify-
-// write storage binding (var<storage, read_write>) -- one writable-storage usage, not an alias (the
+// write storage binding (var<storage, read_write>). One writable-storage usage, not an alias (the
 // "multi-writer chain" test + the sweep's WAR self-guard depend on it). Any other pairing involving a
 // write is illegal: a read-only binding aliasing a write (e.g. Sampled+StorageWrite, the named case), or
 // two writes the graph can't order within an atomic pass ("multiple unsynchronized writes").
@@ -447,9 +478,9 @@ enum struct HazardKind : uint8_t { RAW, WAW, WAR };
 // (turns each edge into add_dependency) and debug_print_mermaid() (prints it) so the dump can never
 // drift from the real graph. Each write to a resource starts a new "version" (the writing pass IS the
 // version identity); each read binds to the current one. Calls onEdge(dependent, dep, id, kind) per
-// discovered hazard -- RAW (read -> producer), WAW (write -> prev writer), WAR (write -> readers of
+// discovered hazard: RAW (read -> producer), WAW (write -> prev writer), WAR (write -> readers of
 // the version being clobbered); `dependent` is always later in the walk than `dep`. A read seen before
-// any writer of its resource simply binds to "no producer" (no edge) -- detecting that authoring error
+// any writer of its resource simply binds to "no producer" (no edge). Detecting that authoring error
 // is left to compile()'s post-cull pass, which sees the final schedule; the sweep stays edge-only.
 template<typename OnEdge>
 static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_id,
@@ -476,7 +507,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
                 pendingReaders[id]  = nullptr;  // its readers retired (old nodes are arena garbage)
             } else {
                 // RAW: this read depends on the producer of the version it sees. a read before any
-                // writer binds to "no producer" (no edge) -- compile()'s post-cull pass flags it.
+                // writer binds to "no producer" (no edge); compile()'s post-cull pass flags it.
                 if (currentProducer[id] && currentProducer[id] != p)
                     onEdge(p, currentProducer[id], id, HazardKind::RAW);
                 // register as a pending reader of the current version (for a future write's WAR).
@@ -498,7 +529,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
 // and visits the whole graph. We seed this DFS from sinks instead (see compile() phase 2), so
 // recursion only reaches passes a sink transitively depends on -> dead-node removal falls out for
 // free, with no in-degree counters or worklist. The trade-off: Kahn detects cycles for free (it
-// emits < N nodes), this does not -- we assume an author-acyclic graph and would need an `onstack`
+// emits < N nodes), this does not; we assume an author-acyclic graph and would need an `onstack`
 // flag to catch back-edges (also noted in phase 2).
 static void topo_visit(PassNode* p, PassNode** order, uint32_t& count)
 {
@@ -539,7 +570,7 @@ bool RenderGraph::compile()
 
     // phase 1: build adjacency (pass dependency DAG, "depends-on" direction). The versioning sweep
     // (see sweep_resource_versions) discovers every RAW/WAW/WAR hazard in declaration order; here all
-    // three collapse to add_dependency -- its dedup folds multiple hazards between one pass pair into
+    // three collapse to add_dependency; its dedup folds multiple hazards between one pass pair into
     // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
     // before any writer get no edge here; the post-cull pass below turns them into errors.
     sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
@@ -575,17 +606,17 @@ bool RenderGraph::compile()
         if (count) order[count - 1]->next = nullptr;
         s.m_passes = count ? order[0] : nullptr;
 
-        // ponytail: transient array as DFS scratch — can't sort a one-field intrusive list in
+        // ponytail: transient array as DFS scratch; can't sort a one-field intrusive list in
         // place (a dep emitted before the driver reaches it clobbers its `next`, dropping
         // disconnected nodes). recursive DFS, no cycle detection: graph is author-acyclic; add an
         // `onstack` flag (+2 lines) only if a cyclic graph ever needs catching.
     }
 
 #if RG_VALIDATE
-    // post-cull validation (development aid; compiled out when RG_VALIDATE==0 -- e.g. release/NDEBUG --
+    // post-cull validation (development aid; compiled out when RG_VALIDATE==0, e.g. release/NDEBUG,
     // exactly like assert, so a shipping build pays none of this per-frame walk). Over the FINAL schedule
     // (m_passes is now culled + in execution order), a read of a TRANSIENT resource that no earlier pass
-    // has produced is an authoring error -- the reader would sample uninitialized contents (its writer was
+    // has produced is an authoring error: the reader would sample uninitialized contents (its writer was
     // declared after it, or culled). walking the surviving passes makes this culling-correct and catches
     // every surviving reader, not just the first.
     //   imported resources                        -> exempt (their value comes from outside the graph).
@@ -684,8 +715,8 @@ static uint32_t pass_index(PassNode* head, PassNode* target)
 
 // dump the graph as a Mermaid flowchart on stdout. passes are nodes; an edge dep -->|res| Q means Q
 // depends on dep via resource res (data/order flow points dep -> Q). edges come from the SAME
-// versioning sweep compile() uses, so the dump matches the real graph -- RAW (unlabelled), plus WAW
-// and WAR tagged in the edge label -- rather than an approximation. safe before or after compile():
+// versioning sweep compile() uses, so the dump matches the real graph: RAW (unlabelled), plus WAW
+// and WAR tagged in the edge label, rather than an approximation. safe before or after compile():
 // the topo sort preserves the relative order of any two passes touching the same resource, so the
 // rediscovered edges are unchanged. resources with a single touch (imported inputs, unread sinks)
 // produce no pass->pass edge and don't appear.
@@ -856,20 +887,20 @@ void RenderGraph::release_resources()
     }
 }
 
-// records one access on the pass currently being built -- the one primitive every GraphBuilder
+// records one access on the pass currently being built: the one primitive every GraphBuilder
 // helper below wraps. load/store/clear are only meaningful for the two attachment AccessTypes;
 // every other call site leaves them at their (ignored) defaults.
 void GraphBuilder::use(ResourceHandle handle, AccessType type,
                        WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth)
 {
 #if RG_VALIDATE
-    // immediate (declaration-time) usage check -- fires at the exact b.sampled()/b.storage_write() call
+    // immediate (declaration-time) usage check: fires at the exact b.sampled()/b.storage_write() call
     // site, not deferred to compile(). A pass is one WebGPU usage scope; a resource may not be aliased
-    // read+write (e.g. sampled + storage_write -- the named case) or written more than once (the graph
+    // read+write (e.g. sampled + storage_write, the named case) or written more than once (the graph
     // can't order two writes inside an atomic pass). read+read and the StorageRead+StorageWrite RMW pair
-    // are fine -- see in_pass_accesses_conflict.
+    // are fine; see in_pass_accesses_conflict.
     // ponytail: WebGPU itself permits multiple writable-storage uses in one scope; the graph is stricter
-    // because it has no way to synchronize two writes inside a pass -- relax if a shader ever needs it.
+    // because it has no way to synchronize two writes inside a pass; relax if a shader ever needs it.
     if (m_new_pass && handle.id) {
         const bool w = access_is_write(type);
         for (uint32_t i = 0; i < m_new_pass->accessCount; ++i) {
@@ -904,7 +935,7 @@ void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUSto
 
 void GraphBuilder::depth_stencil_read_only(ResourceHandle handle)
 {
-    use(handle, AccessType::DepthStencilReadOnly);   // load/store/clear default Undefined/{} -- required when read-only
+    use(handle, AccessType::DepthStencilReadOnly);   // load/store/clear default Undefined/{}; required when read-only
 }
 
 void GraphBuilder::sampled(ResourceHandle handle)

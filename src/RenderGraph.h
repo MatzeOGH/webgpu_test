@@ -41,35 +41,11 @@ struct ResourceHandle
     uint32_t id{};
 };
 
-// how a pass touches a resource -> read/write (hazards) and WGPU usage flags.
-// comment column = WebGPU internal usage (usage-scope class) -> hazard -> usage bit.
-enum struct AccessType : uint8_t
-{
-    ColorAttachment,         // attachment      write   tex RenderAttachment
-    DepthStencilAttachment,  // attachment      write   tex RenderAttachment  (depth/stencil test + write)
-    DepthStencilReadOnly,    // attachment-read read    tex RenderAttachment  (test only, depthReadOnly; no write hazard)
-    Sampled,                 // constant        read    tex TextureBinding
-    StorageRead,             // storage-read    read    tex StorageBinding / buf Storage
-    StorageWrite,            // storage         write   tex StorageBinding / buf Storage
-    Uniform,                 // constant        read    buf Uniform (+CopyDst host-upload affordance)
-    CopySrc,                 // copy            read    tex/buf CopySrc
-    CopyDst,                 // copy            write   tex/buf CopyDst
-    Vertex,                  // input           read    buf Vertex
-    Index,                   // input           read    buf Index
-    Indirect,                // input           read    buf Indirect
-};
-
-struct ResourceAccess
-{
-    ResourceHandle handle{};
-    AccessType     type{};
-
-    // attachment-only (ColorAttachment / DepthStencilAttachment); ignored for other access types.
-    WGPULoadOp  loadOp{};
-    WGPUStoreOp storeOp{};
-    WGPUColor   clearColor{};
-    float       clearDepth{};
-};
+// how a pass touches a resource (read/write hazards + WGPU usage flags). The enumerators encode
+// WebGPU usage-scope semantics used only by RenderGraph.cpp's hazard/usage passes, so the full
+// definition -- and ResourceAccess, the recorded access -- live there; the header needs just the
+// type name for GraphBuilder::use below.
+enum struct AccessType : uint8_t;
 
 struct ResourceNode;
 struct PassNode;
@@ -102,7 +78,7 @@ struct GraphBuilder
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1});
     // depth stencil attachment
     void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f);
-    // depth stencil attachment, read-only (depth/stencil test, no write -- e.g. lighting depth-testing
+    // depth stencil attachment, read-only (depth/stencil test, no write; e.g. lighting depth-testing
     // a prepass depth). no load/store/clear: WebGPU requires depthLoadOp/StoreOp Undefined when read-only.
     void depth_stencil_read_only(ResourceHandle handle);
     // sampled resouces
@@ -150,7 +126,7 @@ struct RenderGraph
     ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
 
 
-    // CAVEAT -- pass declaration order matters (implicit SSA versioning, def-before-use): declare a
+    // CAVEAT: pass declaration order matters (implicit SSA versioning, def-before-use): declare a
     // resource's WRITER before any pass that reads it. Each write starts a new version; each read
     // binds to the latest version declared so far. Passes that share no resource may be declared in
     // any order. Reading a TRANSIENT resource before any pass writes it is an authoring error:
@@ -170,7 +146,7 @@ struct RenderGraph
 
     // returns false if the graph has an ordering error (see the add_pass CAVEAT above): a pass reads a
     // transient resource before any pass writes it. messages are printed; on false skip this frame.
-    // that check is a dev aid compiled out in release (NDEBUG) like assert -- see RG_VALIDATE in the
+    // that check is a dev aid compiled out in release (NDEBUG) like assert; see RG_VALIDATE in the
     // .cpp; a release build skips the per-frame walk and compile() always returns true.
     bool compile();
 
@@ -181,6 +157,7 @@ struct RenderGraph
     // release graph-created textures/views/buffers (imported resources left alone)
     void release_resources();
     // resolve a handle to its node (linear walk; see ceiling note in .cpp)
+    // TODO: remove this: clients do not need to see the internal structure
     ResourceNode* node(ResourceHandle h);
 
     // No data members: state lives in a .cpp-private RenderGraphStorage (see RenderGraph.cpp).

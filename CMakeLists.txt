@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
+
+# Honor MSVC_DEBUG_INFORMATION_FORMAT so the rg target can pick /ZI (Edit & Continue).
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+
 project(webgpu_app CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -117,26 +123,44 @@ elseif(WIN32)
     add_executable(nanite_builder src/mainNaniteBuilder.cpp src/ClusteredMesh.cpp)
     target_link_libraries(nanite_builder PRIVATE dawn::webgpu_dawn)
 
-    # Copy SDL3.dll, dxil.dll, and dxcompiler.dll next to the exe at runtime.
+    # RenderGraph standalone smoke test. RenderGraph_main.cpp is #included at the bottom of
+    # RenderGraph.cpp, so this single TU is the whole driver (mirrors build_rg.bat).
+    # Built for Edit & Continue: Debug gets /ZI + incremental link, /MD to match the prebuilt
+    # release Dawn/SDL3. Set rg as the startup project and run Debug to use it.
+    add_executable(rg src/RenderGraph.cpp src/RenderGraph_main.cpp src/RenderGraph.h)
+    # RenderGraph_main.cpp is #included at the bottom of RenderGraph.cpp; list it (and the header)
+    # so they show in Solution Explorer, but HEADER_FILE_ONLY keeps it out of the build so it isn't
+    # compiled as a second TU.
+    set_source_files_properties(src/RenderGraph_main.cpp PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_link_libraries(rg PRIVATE dawn::webgpu_dawn SDL3::SDL3 dxguid onecore)
+    set_target_properties(rg PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
+        MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug>:EditAndContinue>"
+        VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:rg>"
+    )
+
+    # Copy SDL3.dll, dxil.dll, and dxcompiler.dll next to each exe at runtime.
     set(DXIL_DIR "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/Redist/D3D/x64")
-    foreach(DLL dxil.dll dxcompiler.dll d3dcompiler_47.dll)
-        add_custom_command(TARGET app POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DXIL_DIR}/${DLL}"
-                "$<TARGET_FILE_DIR:app>/${DLL}"
-            COMMENT "Copying ${DLL}"
-        )
-    endforeach()
     file(GLOB_RECURSE _sdl3_dll "${sdl3_SOURCE_DIR}/SDL3.dll")
     list(FILTER _sdl3_dll INCLUDE REGEX "x64")
     if(NOT _sdl3_dll)
         message(FATAL_ERROR "SDL3.dll (x64) not found under ${sdl3_SOURCE_DIR}")
     endif()
     list(GET _sdl3_dll 0 _sdl3_dll)
-    add_custom_command(TARGET app POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${_sdl3_dll}"
-            "$<TARGET_FILE_DIR:app>/SDL3.dll"
-        COMMENT "Copying SDL3.dll"
-    )
+    foreach(TGT app rg)
+        foreach(DLL dxil.dll dxcompiler.dll d3dcompiler_47.dll)
+            add_custom_command(TARGET ${TGT} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${DXIL_DIR}/${DLL}"
+                    "$<TARGET_FILE_DIR:${TGT}>/${DLL}"
+                COMMENT "Copying ${DLL}"
+            )
+        endforeach()
+        add_custom_command(TARGET ${TGT} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_sdl3_dll}"
+                "$<TARGET_FILE_DIR:${TGT}>/SDL3.dll"
+            COMMENT "Copying SDL3.dll"
+        )
+    endforeach()
 endif()
