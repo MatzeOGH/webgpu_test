@@ -1226,7 +1226,9 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             // (r->texture null, e.g. swapchain) keep their caller-owned registered view.
             // ponytail: rebuilt per pass per frame; cache on the node keyed by subresource if it ever shows
             // up in a profile.
-            WGPUTextureView made[9]{};
+            // attach_view runs at most once per access; sized to the per-pass access ceiling so a
+            // malformed pass (e.g. >1 depth, or 8 color + extra depth) can't overrun before Dawn validates.
+            WGPUTextureView made[PassNode::kMaxAccess]{};
             uint32_t nmade = 0;
             auto attach_view = [&](ResourceNode* r, const ResourceAccess& a) -> WGPUTextureView {
                 if (!r->texture) return r->view;
