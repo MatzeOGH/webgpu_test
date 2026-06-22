@@ -535,9 +535,11 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 	ImGui::Separator();
 
 	// currently held physical textures.
-	if (ImGui::BeginTable("tp_live", 6, tf)) {
+	if (ImGui::BeginTable("tp_live", 8, tf)) {
 		ImGui::TableSetupColumn("#");
 		ImGui::TableSetupColumn("size");
+		ImGui::TableSetupColumn("mips");
+		ImGui::TableSetupColumn("layers");
 		ImGui::TableSetupColumn("format");
 		ImGui::TableSetupColumn("usage");
 		ImGui::TableSetupColumn("mem");
@@ -550,6 +552,8 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 			ImGui::TableNextRow();
 			ImGui::TableNextColumn(); ImGui::Text("%d", idx++);
 			ImGui::TableNextColumn(); ImGui::Text("%ux%u", e.size.width, e.size.height);
+			ImGui::TableNextColumn(); ImGui::Text("%u", e.mipLevelCount);
+			ImGui::TableNextColumn(); ImGui::Text("%u", e.size.depthOrArrayLayers);
 			ImGui::TableNextColumn(); ImGui::Text("%s", rg_format_name(e.format));
 			ImGui::TableNextColumn(); ImGui::Text("%s", ub);
 			ImGui::TableNextColumn();
