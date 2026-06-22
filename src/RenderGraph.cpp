@@ -186,6 +186,20 @@ struct TransientResourcePool
     uint64_t frame            = 0;
     uint32_t createdThisFrame = 0;                   // debug: cache misses this frame (reset each end_frame)
 
+    // debug event log: one record per texture create/evict so a UI can prove steady-state reuse --
+    // no Create records after warmup means the cache hands the same textures back, not new ones. Ring
+    // buffer, newest wraps over oldest; never read by the pool itself.
+    enum class Event : uint8_t { Create, Evict };
+    struct LogRec { uint64_t frame; Event kind; WGPUExtent3D size; WGPUTextureFormat format; };
+    static constexpr uint32_t kLog = 128;
+    LogRec   eventLog[kLog] = {};
+    uint64_t eventCount     = 0;                      // total ever logged; UI shows last min(eventCount, kLog)
+
+    void log_event(Event kind, const Entry& e)
+    {
+        eventLog[eventCount++ % kLog] = { frame, kind, e.size, e.format };
+    }
+
     // hand out a free texture matching the descriptor, else create one. inUse (not the frame stamp)
     // is the claim, so two simultaneously-live same-descriptor resources get two distinct textures.
     void acquire(WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
@@ -218,6 +232,7 @@ struct TransientResourcePool
         e.inUse = true;
         e.lastUsedFrame = frame;
         ++createdThisFrame;
+        log_event(Event::Create, e);
         outTex = e.tex; outView = e.view;
     }
 
@@ -228,6 +243,7 @@ struct TransientResourcePool
             Entry& e = entries[i];
             e.inUse = false;
             if (frame - e.lastUsedFrame >= kRetain) {   // lastUsedFrame <= frame always -> no underflow
+                log_event(Event::Evict, e);
                 destroy(&e);
                 entries[i] = entries.back();
                 entries.pop_back();
