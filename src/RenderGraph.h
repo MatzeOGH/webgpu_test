@@ -78,21 +78,26 @@ struct GraphBuilder
 {
     // single primitive every helper below is a thin wrapper over. load/store/clear/clearDepth only
     // matter for the two attachment AccessTypes; leave them defaulted for every other access.
+    // baseMip/baseLayer pick one texture subresource: for an attachment they choose the view execute()
+    // renders into; for a read (sampled/storage) they only feed the in-pass conflict check (the pass body
+    // builds its own view), so declare the level/layer the body will actually read. default 0 = mip 0 /
+    // layer 0 = today's whole-resource behavior.
     void use(ResourceHandle handle, AccessType type,
              WGPULoadOp load = WGPULoadOp_Undefined, WGPUStoreOp store = WGPUStoreOp_Undefined,
-             WGPUColor clear = {}, float clearDepth = {});
+             WGPUColor clear = {}, float clearDepth = {},
+             uint32_t baseMip = 0, uint32_t baseLayer = 0);
 
     // color attachment
-    void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1});
+    void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1}, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // depth stencil attachment
-    void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f);
+    void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // depth stencil attachment, read-only (depth/stencil test, no write; e.g. lighting depth-testing
     // a prepass depth). no load/store/clear: WebGPU requires depthLoadOp/StoreOp Undefined when read-only.
-    void depth_stencil_read_only(ResourceHandle handle);
+    void depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // sampled resouces
-    void sampled(ResourceHandle handle);
-    void storage_read(ResourceHandle handle);
-    void storage_write(ResourceHandle handle);
+    void sampled(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    void storage_read(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    void storage_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // uniform
     void uniform(ResourceHandle handle);
     // transfer (copy) source / destination
@@ -115,7 +120,11 @@ struct TextureDesc
     SizeKind sizeKind = SizeKind::Absolute;
     float scaleX = 1.0f, scaleY = 1.0f;
     ResourceHandle relativeTo{};
-    WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;
+    WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;   // depthOrArrayLayers = array/cube layers (6 for a cube)
+    uint32_t mipLevelCount = 1;                    // > 1 for a mip chain (bloom, mip-gen); per-mip size is implicit
+    // ponytail: hazards stay whole-resource. a mip chain still serializes right (each step RAW-depends on
+    // the shared handle); independent subresource passes just over-order, which is free here (the graph
+    // topo-sorts, it doesn't emit barriers). go per-(mip,layer) only if that over-ordering ever costs.
 };
 
 struct BufferDesc

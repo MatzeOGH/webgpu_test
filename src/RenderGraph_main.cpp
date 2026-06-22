@@ -10,7 +10,9 @@
 // (and swaps compose<->present) -- the graph reshapes itself, the point of an immediate-mode graph.
 //
 // Camera: WASD to fly, hold left mouse to look around.
-// Keys: SPACE toggles SSAO. 1/2/3/4/5 = debug-blit a single buffer (albedo/normal/roughness/depth/ssao)
+// Keys: SPACE toggles SSAO. T toggles TAA. B toggles bloom (a mip-chain downsample/upsample over one
+// texture -- mip subresource access). C toggles a cubemap (6 faces rendered per array layer, sampled as
+// a cube -- array-layer subresource access). 1/2/3/4/5 = debug-blit a single buffer (albedo/normal/roughness/depth/ssao)
 // straight to the swapchain, 0 = back to the lit image. The debug pass writes the swapchain itself and
 // becomes the only sink, so the graph culls every pass not needed for that one image: views 1-4 leave
 // only gbuffer; view 5 leaves gbuffer+ssao; shadow/lighting/compose drop out.
@@ -81,6 +83,17 @@ WGPUShaderModule make_shader(WGPUDevice dev, WGPUStringView code)
 WGPUShaderModule make_shader(WGPUDevice dev, const std::string& code)
 {
     return make_shader(dev, WGPUStringView{ code.c_str(), code.size() });
+}
+
+// a single-mip 2D view of one texture -- how a pass body samples a chosen mip (the graph resolves the
+// texture via ctx.texture(); the body builds whatever view it needs, no graph-side abstraction).
+WGPUTextureView mip_view_2d(WGPUTexture tex, WGPUTextureFormat fmt, uint32_t mip)
+{
+    WGPUTextureViewDescriptor vd{
+        .format = fmt, .dimension = WGPUTextureViewDimension_2D,
+        .baseMipLevel = mip, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = 1,
+    };
+    return wgpuTextureCreateView(tex, &vd);
 }
 
 // ---- shared WGSL snippets ------------------------------------------------------------------------
@@ -406,6 +419,57 @@ const char* kSkyFs = R"(
     if (textureLoad(gDepth, px, 0) < 1.0) { discard; }       // geometry -> keep the lit result
     let h = clamp(in.ndc.y * 0.5 + 0.5, 0.0, 1.0);           // 0 horizon .. 1 zenith
     return vec4f(mix(vec3f(0.45, 0.55, 0.70), vec3f(0.10, 0.20, 0.45), h), 1.0);
+}
+)";
+
+// ndc (y up, [-1,1]) -> uv (y down, [0,1]) for the sampled-texture passes below.
+const char* kUvHelper = R"(
+fn uv_of(ndc : vec2f) -> vec2f { return vec2f(ndc.x, -ndc.y) * 0.5 + 0.5; }
+)";
+
+// bloom extract: bright-pass litColor into mip 0. soft knee keeps only the over-threshold part.
+const char* kBloomExtractFs = R"(
+@group(0) @binding(0) var src  : texture_2d<f32>;
+@group(0) @binding(1) var samp : sampler;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let c = textureSampleLevel(src, samp, uv_of(in.ndc), 0.0).rgb;
+    let l = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+    return vec4f(c * max(l - 0.6, 0.0) / max(l, 1e-4), 1.0);
+}
+)";
+
+// bloom blit: one bilinear tap from the bound source mip. shared by downsample (write the smaller mip,
+// no blend = box filter) and upsample (write the larger mip, additive blend in the pipeline = tent-ish
+// accumulate). the bound view is a single mip, so sampling level 0 always hits it.
+const char* kBloomBlitFs = R"(
+@group(0) @binding(0) var src  : texture_2d<f32>;
+@group(0) @binding(1) var samp : sampler;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    return textureSampleLevel(src, samp, uv_of(in.ndc), 0.0);
+}
+)";
+
+// bloom composite: lit color + the accumulated bloom (mip 0) -> swapchain.
+const char* kBloomCompositeFs = R"(
+@group(0) @binding(0) var litTex   : texture_2d<f32>;
+@group(0) @binding(1) var bloomTex : texture_2d<f32>;
+@group(0) @binding(2) var samp     : sampler;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let uv = uv_of(in.ndc);
+    let base  = textureSampleLevel(litTex,   samp, uv, 0.0).rgb;
+    let bloom = textureSampleLevel(bloomTex, samp, uv, 0.0).rgb;
+    return vec4f(base + bloom * 0.8, 1.0);
+}
+)";
+
+// cubemap sample: the 6 faces (rendered as array layers) viewed as a cube, looked up by camera ray ->
+// a rotatable skybox. proves per-layer attachment writes + a Cube-dimension view of the same texture.
+const char* kCubeFs = R"(
+@group(0) @binding(1) var cubeTex : texture_cube<f32>;
+@group(0) @binding(2) var samp    : sampler;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let rd = camera_ray(in.ndc, scene.resolution.x / scene.resolution.y);
+    return textureSample(cubeTex, samp, rd);
 }
 )";
 
@@ -776,6 +840,90 @@ int main()
     WGPURenderPipeline debugPipe = wgpuDeviceCreateRenderPipeline(dev, &debugPD);
     wgpuShaderModuleRelease(debugSM);
 
+    // linear/clamp sampler shared by the bloom + cubemap passes (the deferred passes use textureLoad and
+    // need none). filterable because every sampled format here is *Unorm.
+    WGPUSamplerDescriptor linSD{
+        .addressModeU = WGPUAddressMode_ClampToEdge,
+        .addressModeV = WGPUAddressMode_ClampToEdge,
+        .addressModeW = WGPUAddressMode_ClampToEdge,
+        .magFilter    = WGPUFilterMode_Linear,
+        .minFilter    = WGPUFilterMode_Linear,
+        .mipmapFilter = WGPUMipmapFilterMode_Nearest,
+        .maxAnisotropy = 1,
+    };
+    WGPUSampler linSampler = wgpuDeviceCreateSampler(dev, &linSD);
+
+    // bloom (key B): bright-pass extract -> mip-chain downsample -> additive upsample -> composite.
+    // extract + blit target kColorFormat (the bloom texture); composite targets kSwapFormat.
+    WGPUShaderModule bloomExtractSM = make_shader(dev, std::string(kVS) + kUvHelper + kBloomExtractFs);
+    WGPUColorTargetState bloomCT{ .format = kColorFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState bloomExtractFrag{ .module = bloomExtractSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &bloomCT };
+    WGPURenderPipelineDescriptor bloomExtractPD{
+        .label       = WEBGPU_STR("bloom.extract pipeline"),
+        .vertex      = { .module = bloomExtractSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &bloomExtractFrag,
+    };
+    WGPURenderPipeline bloomExtractPipe = wgpuDeviceCreateRenderPipeline(dev, &bloomExtractPD);
+    wgpuShaderModuleRelease(bloomExtractSM);
+
+    // down + up share one fragment shader (a single bilinear tap); only the blend differs.
+    WGPUShaderModule bloomBlitSM = make_shader(dev, std::string(kVS) + kUvHelper + kBloomBlitFs);
+    WGPUFragmentState bloomDownFrag{ .module = bloomBlitSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &bloomCT };
+    WGPURenderPipelineDescriptor bloomDownPD{
+        .label       = WEBGPU_STR("bloom.down pipeline"),
+        .vertex      = { .module = bloomBlitSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &bloomDownFrag,
+    };
+    WGPURenderPipeline bloomDownPipe = wgpuDeviceCreateRenderPipeline(dev, &bloomDownPD);
+
+    // upsample: additive (src*1 + dst*1) so each coarser level accumulates onto the finer one (LoadOp_Load).
+    WGPUBlendState addBlend{
+        .color = { .operation = WGPUBlendOperation_Add, .srcFactor = WGPUBlendFactor_One, .dstFactor = WGPUBlendFactor_One },
+        .alpha = { .operation = WGPUBlendOperation_Add, .srcFactor = WGPUBlendFactor_One, .dstFactor = WGPUBlendFactor_One },
+    };
+    WGPUColorTargetState bloomUpCT{ .format = kColorFormat, .blend = &addBlend, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState bloomUpFrag{ .module = bloomBlitSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &bloomUpCT };
+    WGPURenderPipelineDescriptor bloomUpPD{
+        .label       = WEBGPU_STR("bloom.up pipeline"),
+        .vertex      = { .module = bloomBlitSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &bloomUpFrag,
+    };
+    WGPURenderPipeline bloomUpPipe = wgpuDeviceCreateRenderPipeline(dev, &bloomUpPD);
+    wgpuShaderModuleRelease(bloomBlitSM);
+
+    WGPUShaderModule bloomCompSM = make_shader(dev, std::string(kVS) + kUvHelper + kBloomCompositeFs);
+    WGPUColorTargetState bloomCompCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState bloomCompFrag{ .module = bloomCompSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &bloomCompCT };
+    WGPURenderPipelineDescriptor bloomCompPD{
+        .label       = WEBGPU_STR("bloom.composite pipeline"),
+        .vertex      = { .module = bloomCompSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &bloomCompFrag,
+    };
+    WGPURenderPipeline bloomCompositePipe = wgpuDeviceCreateRenderPipeline(dev, &bloomCompPD);
+    wgpuShaderModuleRelease(bloomCompSM);
+
+    // cubemap (key C): sample the 6-layer cube by camera ray. needs the scene UBO for camera_ray.
+    WGPUShaderModule cubeSM = make_shader(dev, std::string(kVS) + kSceneDecl + kCameraDefs + kCubeFs);
+    WGPUColorTargetState cubeCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState cubeFrag{ .module = cubeSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &cubeCT };
+    WGPURenderPipelineDescriptor cubePD{
+        .label       = WEBGPU_STR("cube.sample pipeline"),
+        .vertex      = { .module = cubeSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &cubeFrag,
+    };
+    WGPURenderPipeline cubeSamplePipe = wgpuDeviceCreateRenderPipeline(dev, &cubePD);
+    wgpuShaderModuleRelease(cubeSM);
+
     // single persistent arena. create_render_graph() resets it and arena-allocates a fresh
     // RenderGraph (+ all its nodes) from it each frame -> the allocator is the only graph-side
     // object that lives across frames. It also owns the two resource pools (folded in): the
@@ -788,6 +936,8 @@ int main()
     // ---- frame loop: declare + compile + realize + execute + release the graph EVERY frame -------
     bool ssaoOn     = true;  // SPACE toggles the SSAO pass (and compose<->present)
     bool taaOn      = true;  // T toggles temporal accumulation (demo of create_temporal_image)
+    bool bloomOn    = false; // B toggles the bloom mip-chain (demo of mip subresource access)
+    bool cubeOn     = false; // C toggles the cubemap render+sample (demo of array-layer subresource access)
     int  debugMode  = 0;     // 0 = lit, 1..4 = blit gbuffer albedo/normal/roughness/depth
     int  shownSsao  = -1;    // last (ssao, debug) state we printed the execution order for
     int  shownDebug = -1;
@@ -817,6 +967,14 @@ int main()
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_T) {
                 taaOn = !taaOn;
                 std::printf("taa %s\n", taaOn ? "ON" : "OFF");
+            }
+            else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_B) {
+                bloomOn = !bloomOn;
+                std::printf("bloom %s\n", bloomOn ? "ON" : "OFF");
+            }
+            else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_C) {
+                cubeOn = !cubeOn;
+                std::printf("cubemap %s\n", cubeOn ? "ON" : "OFF");
             }
             else if (e.type == SDL_EVENT_KEY_DOWN &&
                      (e.key.scancode == SDL_SCANCODE_0 ||
@@ -866,6 +1024,8 @@ int main()
         ImGui::Begin("Features");
         ImGui::Checkbox("SSAO", &ssaoOn);
         ImGui::Checkbox("TAA", &taaOn);
+        ImGui::Checkbox("Bloom (B)", &bloomOn);
+        ImGui::Checkbox("Cubemap (C)", &cubeOn);
         ImGui::End();
 
         WGPUSurfaceTexture st{};
@@ -1085,6 +1245,164 @@ int main()
                     wgpuBindGroupRelease(bg);
                     wgpuBindGroupLayoutRelease(l);
                 });
+        } else if (cubeOn) {
+            // CUBEMAP (array-layer subresource): render 6 faces, one array layer each, into a single cube
+            // texture, then sample it as a Cube by camera ray -> a rotatable skybox. Nothing reads litColor
+            // here, so gbuffer/lighting/sky cull away -- only the 6 faces + sample + imgui survive.
+            auto cube = rg->create_image(WEBGPU_STR("cube"), {
+                .dimension = WGPUTextureDimension_2D, .format = kColorFormat,
+                .sizeKind = SizeKind::Absolute, .absolute = { 256, 256, 6 }, .mipLevelCount = 1,
+            });
+            // WebGPU cube layer order: 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z. Clear-only passes (no draw): the
+            // attachment clear IS the face; execute() builds the single-layer attachment view from baseLayer.
+            const WGPUColor kFace[6] = {
+                {0.80, 0.16, 0.16, 1}, {0.13, 0.55, 0.55, 1}, {0.16, 0.70, 0.20, 1},
+                {0.66, 0.16, 0.66, 1}, {0.16, 0.22, 0.80, 1}, {0.72, 0.66, 0.16, 1},
+            };
+            for (uint32_t f = 0; f < 6; ++f) {
+                rg->add_pass(WEBGPU_STR("cube.face"), PassKind::Graphics,
+                    [&, f](GraphBuilder& b) {
+                        b.color(cube, WGPULoadOp_Clear, WGPUStoreOp_Store, kFace[f], 0, f);   // baseMip 0, layer f
+                    },
+                    [](PassContext&) {});   // clear-only: nothing to record
+            }
+            rg->add_pass(WEBGPU_STR("cube.sample"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.uniform(sceneUbo);     // camera basis for the ray
+                    b.sampled(cube);
+                    b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, cubeSamplePipe, sceneUbo, cube, linSampler](PassContext& ctx) {
+                    WGPUTextureViewDescriptor cvd{
+                        .format = kColorFormat, .dimension = WGPUTextureViewDimension_Cube,
+                        .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = 6,
+                    };
+                    WGPUTextureView cubeView = wgpuTextureCreateView(ctx.texture(cube), &cvd);
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(cubeSamplePipe, 0);
+                    WGPUBindGroupEntry e[3] = {
+                        { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                        { .binding = 1, .textureView = cubeView },
+                        { .binding = 2, .sampler = linSampler },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, cubeSamplePipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                    wgpuTextureViewRelease(cubeView);
+                });
+        } else if (bloomOn) {
+            // BLOOM (mip subresource): bright-pass litColor into a mip chain, progressively downsample
+            // (sample mip i, write mip i+1 of the SAME texture), additively upsample back, composite over
+            // lit. Each down/up pass reads one mip + writes an adjacent one in one pass -- the subresource-
+            // aware in-pass check allows it; the shared-handle RAW/WAW chain serializes the whole pyramid.
+            uint32_t minDim = cfg.width < cfg.height ? cfg.width : cfg.height;
+            uint32_t bloomMips = 1;
+            while (bloomMips < 6 && (1u << bloomMips) <= minDim) ++bloomMips;   // smallest mip stays >= 1px, cap 6
+            auto bloom = rg->create_image(WEBGPU_STR("bloom"), {
+                .dimension = WGPUTextureDimension_2D, .format = kColorFormat,
+                .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+                .mipLevelCount = bloomMips,
+            });
+
+            // extract: bright parts of lit color -> mip 0.
+            rg->add_pass(WEBGPU_STR("bloom.extract"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(litColor);
+                    b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, 0);
+                },
+                [dev, bloomExtractPipe, litColor, linSampler](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomExtractPipe, 0);
+                    WGPUBindGroupEntry e[2] = {
+                        { .binding = 0, .textureView = ctx.view(litColor) },
+                        { .binding = 1, .sampler = linSampler },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, bloomExtractPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
+
+            // downsample: sample mip i, render into mip i+1 (Clear).
+            for (uint32_t i = 0; i + 1 < bloomMips; ++i) {
+                rg->add_pass(WEBGPU_STR("bloom.down"), PassKind::Graphics,
+                    [&, i](GraphBuilder& b) {
+                        b.sampled(bloom, i);
+                        b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, i + 1);
+                    },
+                    [dev, bloomDownPipe, bloom, linSampler, i](PassContext& ctx) {
+                        WGPUTextureView srcView = mip_view_2d(ctx.texture(bloom), kColorFormat, i);
+                        WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomDownPipe, 0);
+                        WGPUBindGroupEntry e[2] = {
+                            { .binding = 0, .textureView = srcView },
+                            { .binding = 1, .sampler = linSampler },
+                        };
+                        WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                        wgpuRenderPassEncoderSetPipeline(ctx.render, bloomDownPipe);
+                        wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                        wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                        wgpuBindGroupRelease(bg);
+                        wgpuBindGroupLayoutRelease(l);
+                        wgpuTextureViewRelease(srcView);
+                    });
+            }
+
+            // upsample: sample mip i (coarser), additively blend into mip i-1 (LoadOp_Load keeps the
+            // finer level the downsample wrote this frame).
+            for (uint32_t i = bloomMips; i-- > 1; ) {
+                rg->add_pass(WEBGPU_STR("bloom.up"), PassKind::Graphics,
+                    [&, i](GraphBuilder& b) {
+                        b.sampled(bloom, i);
+                        b.color(bloom, WGPULoadOp_Load, WGPUStoreOp_Store, WGPUColor{}, i - 1);
+                    },
+                    [dev, bloomUpPipe, bloom, linSampler, i](PassContext& ctx) {
+                        WGPUTextureView srcView = mip_view_2d(ctx.texture(bloom), kColorFormat, i);
+                        WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomUpPipe, 0);
+                        WGPUBindGroupEntry e[2] = {
+                            { .binding = 0, .textureView = srcView },
+                            { .binding = 1, .sampler = linSampler },
+                        };
+                        WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                        wgpuRenderPassEncoderSetPipeline(ctx.render, bloomUpPipe);
+                        wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                        wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                        wgpuBindGroupRelease(bg);
+                        wgpuBindGroupLayoutRelease(l);
+                        wgpuTextureViewRelease(srcView);
+                    });
+            }
+
+            // composite: lit color + accumulated bloom (mip 0) -> swapchain.
+            rg->add_pass(WEBGPU_STR("bloom.composite"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(litColor);
+                    b.sampled(bloom, 0);
+                    b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, bloomCompositePipe, litColor, bloom, linSampler](PassContext& ctx) {
+                    WGPUTextureView mip0 = mip_view_2d(ctx.texture(bloom), kColorFormat, 0);
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomCompositePipe, 0);
+                    WGPUBindGroupEntry e[3] = {
+                        { .binding = 0, .textureView = ctx.view(litColor) },
+                        { .binding = 1, .textureView = mip0 },
+                        { .binding = 2, .sampler = linSampler },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, bloomCompositePipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                    wgpuTextureViewRelease(mip0);
+                });
         } else if (taaOn) {
             // Run TAA on the FINAL shaded colour, not raw lit -- otherwise it bypasses the lit*ao compose
             // and swallows SSAO. With SSAO on, compose lit*ao into an intermediate first and accumulate
@@ -1290,6 +1608,12 @@ int main()
     }
 
     // ---- teardown --------------------------------------------------------------------------------
+    wgpuSamplerRelease(linSampler);
+    wgpuRenderPipelineRelease(cubeSamplePipe);
+    wgpuRenderPipelineRelease(bloomCompositePipe);
+    wgpuRenderPipelineRelease(bloomUpPipe);
+    wgpuRenderPipelineRelease(bloomDownPipe);
+    wgpuRenderPipelineRelease(bloomExtractPipe);
     wgpuRenderPipelineRelease(debugPipe);
     wgpuRenderPipelineRelease(skyPipe);
     wgpuRenderPipelineRelease(taaPipe);

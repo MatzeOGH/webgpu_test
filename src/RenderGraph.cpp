@@ -55,6 +55,11 @@ struct ResourceAccess
     WGPUStoreOp storeOp{};
     WGPUColor   clearColor{};
     float       clearDepth{};
+
+    // subresource this access touches. for an attachment, the single mip/layer execute() renders into;
+    // for a read, the level/layer the body samples (drives only the in-pass conflict check). 0 = mip 0/layer 0.
+    uint32_t baseMip{};
+    uint32_t baseLayer{};
 };
 
 // length of a (possibly WGPU_STRLEN-sentinel) string view, measured like copy_string.
@@ -85,6 +90,7 @@ struct PersistentResourcePool
         WGPUExtent3D         size          = {};
         WGPUTextureFormat    format        = WGPUTextureFormat_Undefined;
         WGPUTextureDimension dim           = WGPUTextureDimension_2D;
+        uint32_t             mipLevelCount = 1;
         WGPUTextureUsage     usage         = {};  // running union of every layer's usage
         WGPUTextureUsage     usageAtCreate = {};
     };
@@ -121,15 +127,16 @@ struct PersistentResourcePool
     // (re)create the two textures when missing or the descriptor changed (lazy: needs the device + the
     // usage union, both known only at realize()).
     void realize_entry(Entry* e, WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
-                       WGPUTextureDimension dim)
+                       WGPUTextureDimension dim, uint32_t mipLevelCount)
     {
         bool same = e->created
             && e->size.width == size.width && e->size.height == size.height
             && e->size.depthOrArrayLayers == size.depthOrArrayLayers
-            && e->format == format && e->dim == dim && e->usageAtCreate == e->usage;
+            && e->format == format && e->dim == dim && e->mipLevelCount == mipLevelCount
+            && e->usageAtCreate == e->usage;
         if (same) return;
         destroy(e);
-        e->size = size; e->format = format; e->dim = dim; e->usageAtCreate = e->usage;
+        e->size = size; e->format = format; e->dim = dim; e->mipLevelCount = mipLevelCount; e->usageAtCreate = e->usage;
         for (uint32_t i = 0; i < kLayers; ++i) {
             WGPUTextureDescriptor d{
                 .label         = WGPUStringView{ e->name.c_str(), e->name.size() },
@@ -137,7 +144,7 @@ struct PersistentResourcePool
                 .dimension     = dim,
                 .size          = size,
                 .format        = format,
-                .mipLevelCount = 1,
+                .mipLevelCount = mipLevelCount,
                 .sampleCount   = 1,
             };
             e->tex[i]  = wgpuDeviceCreateTexture(device, &d);
@@ -174,6 +181,7 @@ struct TransientResourcePool
         WGPUExtent3D         size   = {};
         WGPUTextureFormat    format = WGPUTextureFormat_Undefined;
         WGPUTextureDimension dim    = WGPUTextureDimension_2D;
+        uint32_t             mipLevelCount = 1;
         WGPUTextureUsage     usage  = {};
 
         WGPUTexture          tex    = {};
@@ -189,11 +197,12 @@ struct TransientResourcePool
     // hand out a free texture matching the descriptor, else create one. inUse (not the frame stamp)
     // is the claim, so two simultaneously-live same-descriptor resources get two distinct textures.
     void acquire(WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
-                 WGPUTextureDimension dim, WGPUTextureUsage usage,
+                 WGPUTextureDimension dim, uint32_t mipLevelCount, WGPUTextureUsage usage,
                  WGPUTexture& outTex, WGPUTextureView& outView)
     {
         for (Entry& e : entries) {
             if (!e.inUse && e.format == format && e.dim == dim && e.usage == usage
+                && e.mipLevelCount == mipLevelCount
                 && e.size.width == size.width && e.size.height == size.height
                 && e.size.depthOrArrayLayers == size.depthOrArrayLayers) {
                 e.inUse = true;
@@ -204,13 +213,13 @@ struct TransientResourcePool
         }
         entries.emplace_back();
         Entry& e = entries.back();
-        e.size = size; e.format = format; e.dim = dim; e.usage = usage;
+        e.size = size; e.format = format; e.dim = dim; e.mipLevelCount = mipLevelCount; e.usage = usage;
         WGPUTextureDescriptor d{
             .usage         = usage,
             .dimension     = dim,
             .size          = size,
             .format        = format,
-            .mipLevelCount = 1,
+            .mipLevelCount = mipLevelCount,
             .sampleCount   = 1,
         };
         e.tex  = wgpuDeviceCreateTexture(device, &d);
@@ -416,6 +425,7 @@ struct ResourceNode
     float scaleX = 1.0f, scaleY = 1.0f;
     ResourceHandle relativeToHandle{};
     WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;
+    uint32_t mipLevelCount = 1;   // > 1 = mip chain; created once, per-mip views built at bind/attach time
 
     // buffer fields
     uint64_t bufferSize{};
@@ -542,13 +552,19 @@ static bool access_is_write(AccessType t)
 
 #if RG_VALIDATE
 // do two accesses to the SAME resource in ONE pass (one usage scope) conflict? read+read never does.
-// the lone read+write exception is StorageRead+StorageWrite: that is how the graph spells a read-modify-
-// write storage binding (var<storage, read_write>). One writable-storage usage, not an alias (the
-// "multi-writer chain" test + the sweep's WAR self-guard depend on it). Any other pairing involving a
-// write is illegal: a read-only binding aliasing a write (e.g. Sampled+StorageWrite, the named case), or
-// two writes the graph can't order within an atomic pass ("multiple unsynchronized writes").
-static bool in_pass_accesses_conflict(AccessType a, AccessType b)
+// disjoint subresources never do either: WebGPU usage scopes are per-(mip,layer), so sampling mip i while
+// rendering into mip j!=i is legal (the bloom downsample pattern). the lone same-subresource read+write
+// exception is StorageRead+StorageWrite: that is how the graph spells a read-modify-write storage binding
+// (var<storage, read_write>). One writable-storage usage, not an alias (the "multi-writer chain" test +
+// the sweep's WAR self-guard depend on it). Any other same-subresource pairing involving a write is
+// illegal: a read-only binding aliasing a write (e.g. Sampled+StorageWrite, the named case), or two writes
+// the graph can't order within an atomic pass ("multiple unsynchronized writes").
+// ponytail: each access is one (mip,layer) point, so a wide sampled range overlapping a written mip slips
+// past here -- WebGPU validation is the backstop.
+static bool in_pass_accesses_conflict(AccessType a, uint32_t aMip, uint32_t aLayer,
+                                      AccessType b, uint32_t bMip, uint32_t bLayer)
 {
+    if (aMip != bMip || aLayer != bLayer) return false;
     if (!access_is_write(a) && !access_is_write(b)) return false;
     if ((a == AccessType::StorageRead  && b == AccessType::StorageWrite) ||
         (a == AccessType::StorageWrite && b == AccessType::StorageRead)) return false;
@@ -572,6 +588,7 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
     resouce->scaleY = desc.scaleY;
     resouce->relativeToHandle = desc.relativeTo;
     resouce->absolute = desc.absolute;
+    resouce->mipLevelCount = desc.mipLevelCount ? desc.mipLevelCount : 1;
 
     list_append(&s.m_resouces, resouce);
 
@@ -792,7 +809,9 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
     if (r->sizeKind == SizeKind::Absolute) return r->resolved = r->absolute;
     ResourceNode* base = byId[r->relativeToHandle.id];
     WGPUExtent3D b = base ? resolve_size(base, byId) : WGPUExtent3D{};
-    return r->resolved = { (uint32_t)(b.width * r->scaleX), (uint32_t)(b.height * r->scaleY), 1 };
+    // scale only width/height; layer count (cube/array) is the node's own, not the base's.
+    uint32_t layers = r->absolute.depthOrArrayLayers ? r->absolute.depthOrArrayLayers : 1;
+    return r->resolved = { (uint32_t)(b.width * r->scaleX), (uint32_t)(b.height * r->scaleY), layers };
 }
 
 bool RenderGraph::compile()
@@ -1130,7 +1149,7 @@ void RenderGraph::realize(WGPUDevice device)
         if (!r->persistent || !r->texUsage) continue;
         PersistentResourcePool::Entry* e = pool.find(r->name);
         if (!e) continue;
-        pool.realize_entry(e, device, r->resolved, r->format, r->dimension);
+        pool.realize_entry(e, device, r->resolved, r->format, r->dimension, r->mipLevelCount);
         uint32_t sl = pool.slot(*e, r->temporalIndex);
         r->texture = e->tex[sl];
         r->view    = e->view[sl];
@@ -1142,7 +1161,7 @@ void RenderGraph::realize(WGPUDevice device)
             if (!r->texUsage) continue;
             // reuse a pooled texture matching this descriptor instead of recreating one. the pool
             // owns it -> release_resources() leaves it alone and recycles/evicts at end_frame().
-            transient.acquire(device, r->resolved, r->format, r->dimension, r->texUsage,
+            transient.acquire(device, r->resolved, r->format, r->dimension, r->mipLevelCount, r->texUsage,
                               r->texture, r->view);
         } else {
             // buffers stay on the direct path: the lone transient buffer (scene ubo) is tiny and
@@ -1185,13 +1204,32 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             WGPURenderPassDepthStencilAttachment depth{};
             bool hasDepth = false;
 
+            // an attachment view is exactly one subresource. a graph-created texture may be a mip chain or
+            // array (its default full view spans many subresources -> illegal here), so build the single
+            // (baseMip, baseLayer) slice the access named and release it after the pass. imported textures
+            // (r->texture null, e.g. swapchain) keep their caller-owned registered view.
+            // ponytail: rebuilt per pass per frame; cache on the node keyed by subresource if it ever shows
+            // up in a profile.
+            WGPUTextureView made[9]{};
+            uint32_t nmade = 0;
+            auto attach_view = [&](ResourceNode* r, const ResourceAccess& a) -> WGPUTextureView {
+                if (!r->texture) return r->view;
+                WGPUTextureViewDescriptor vd{
+                    .format          = r->format,
+                    .dimension       = WGPUTextureViewDimension_2D,
+                    .baseMipLevel    = a.baseMip,   .mipLevelCount   = 1,
+                    .baseArrayLayer  = a.baseLayer, .arrayLayerCount = 1,
+                };
+                return made[nmade++] = wgpuTextureCreateView(r->texture, &vd);
+            };
+
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 const ResourceAccess& a = p->accesses[i];
                 ResourceNode* r = node(a.handle);
                 if (!r) continue;
                 if (a.type == AccessType::ColorAttachment && nc < 8) {
                     color[nc++] = WGPURenderPassColorAttachment{
-                        .view       = r->view,
+                        .view       = attach_view(r, a),
                         .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
                         .loadOp     = a.loadOp,
                         .storeOp    = a.storeOp,
@@ -1199,7 +1237,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                     };
                 } else if (a.type == AccessType::DepthStencilAttachment || a.type == AccessType::DepthStencilReadOnly) {
                     depth = WGPURenderPassDepthStencilAttachment{
-                        .view            = r->view,
+                        .view            = attach_view(r, a),
                         .depthLoadOp     = a.loadOp,
                         .depthStoreOp    = a.storeOp,
                         .depthClearValue = a.clearDepth,
@@ -1220,6 +1258,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
             wgpuRenderPassEncoderEnd(ctx.render);
             wgpuRenderPassEncoderRelease(ctx.render);
+            for (uint32_t i = 0; i < nmade; ++i) wgpuTextureViewRelease(made[i]);   // attachment views are pass-scoped
         }
         else { // Transfer / None: body records straight onto the encoder
             if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
@@ -1246,7 +1285,8 @@ void RenderGraph::release_resources()
 // helper below wraps. load/store/clear are only meaningful for the two attachment AccessTypes;
 // every other call site leaves them at their (ignored) defaults.
 void GraphBuilder::use(ResourceHandle handle, AccessType type,
-                       WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth)
+                       WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth,
+                       uint32_t baseMip, uint32_t baseLayer)
 {
 #if RG_VALIDATE
     // immediate (declaration-time) usage check: fires at the exact b.sampled()/b.storage_write() call
@@ -1260,7 +1300,9 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
         const bool w = access_is_write(type);
         for (uint32_t i = 0; i < m_new_pass->accessCount; ++i) {
             if (m_new_pass->accesses[i].handle.id != handle.id) continue;
-            if (in_pass_accesses_conflict(type, m_new_pass->accesses[i].type)) {
+            if (in_pass_accesses_conflict(type, baseMip, baseLayer,
+                                          m_new_pass->accesses[i].type,
+                                          m_new_pass->accesses[i].baseMip, m_new_pass->accesses[i].baseLayer)) {
                 std::printf("[RenderGraph] error: pass \"%.*s\" uses resource id %u %s in one pass -- a "
                             "written resource must be its only use in the pass.\n",
                             (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "",
@@ -1274,38 +1316,39 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
 #endif
 
     if (m_new_pass && m_new_pass->accessCount < PassNode::kMaxAccess)
-        m_new_pass->accesses[m_new_pass->accessCount++] = { handle, type, load, store, clear, clearDepth };
+        m_new_pass->accesses[m_new_pass->accessCount++] = { handle, type, load, store, clear, clearDepth, baseMip, baseLayer };
     // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it
 }
 
-void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear)
+void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::ColorAttachment, load, store, clear);
+    use(handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth)
+void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth);
+    use(handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer);
 }
 
-void GraphBuilder::depth_stencil_read_only(ResourceHandle handle)
+void GraphBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::DepthStencilReadOnly);   // load/store/clear default Undefined/{}; required when read-only
+    // load/store/clear default Undefined/{}; required when read-only
+    use(handle, AccessType::DepthStencilReadOnly, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::sampled(ResourceHandle handle)
+void GraphBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::Sampled);
+    use(handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::storage_read(ResourceHandle handle)
+void GraphBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::StorageRead);
+    use(handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::storage_write(ResourceHandle handle)
+void GraphBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::StorageWrite);
+    use(handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::uniform(ResourceHandle handle)
