@@ -51,6 +51,7 @@ constexpr WGPUTextureFormat kColorFormat = WGPUTextureFormat_RGBA8Unorm;   // gb
 constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth32Float; // gbuffer depth + shadow map
 constexpr WGPUTextureFormat kAOFormat    = WGPUTextureFormat_RGBA8Unorm;   // ssao output (rgba8unorm = core storage format)
 constexpr uint32_t          kShadowSize  = 1024;                           // shadow map is a fixed square
+constexpr uint32_t          kNumCascades = 3;                              // CSM: layers in the shadow array
 constexpr uint32_t          kMaxSpheres  = 8;
 
 // One uniform buffer feeds gbuffer + shadow + lighting. Layout matches the WGSL `Scene` struct below
@@ -102,12 +103,13 @@ WGPUTextureView mip_view_2d(WGPUTexture tex, WGPUTextureFormat fmt, uint32_t mip
 
 // fullscreen triangle; `ndc` is clip-space xy in [-1,1] (y up) -> the per-pixel ray + reconstruct uv.
 const char* kVS = R"(
-struct VsOut { @builtin(position) pos : vec4f, @location(0) ndc : vec2f };
-@vertex fn vs(@builtin(vertex_index) vid : u32) -> VsOut {
+struct VsOut { @builtin(position) pos : vec4f, @location(0) ndc : vec2f, @location(1) @interpolate(flat) casc : u32 };
+@vertex fn vs(@builtin(vertex_index) vid : u32, @builtin(instance_index) iid : u32) -> VsOut {
     var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
     var o : VsOut;
     o.pos = vec4f(p[vid], 0.0, 1.0);
     o.ndc = p[vid];
+    o.casc = iid;                                  // shadow draws one instance per cascade; every other pass draws instance 0
     return o;
 }
 )";
@@ -134,9 +136,18 @@ struct Scene {
 const char* kCameraDefs = R"(
 const FAR         : f32 = 24.0;
 const FOV         : f32 = 1.0;                  // vertical, radians
-const SCENE_CENTER: vec3f = vec3f(0.0, 0.0, 0.0);
-const LIGHT_ORTHO : f32 = 5.0;                  // half-extent of the shadow ortho frustum
-const LIGHT_DIST  : f32 = 12.0;                 // light "camera" distance from scene center
+const LIGHT_DIST  : f32 = 12.0;                 // light "camera" distance from the shadow center
+// CSM cascades follow the viewer: center the ortho frustums on the camera, not a fixed world point,
+// so the tight near cascade tracks where you're looking. shadow pass + lighting both call this, so
+// they agree on the same per-frame center. ponytail: + scene.camFwd.xyz * k to bias the budget ahead
+// of the view; add per-cascade texel snapping if the shadow edges shimmer while moving.
+fn shadow_center() -> vec3f { return scene.camPos.xyz; }
+const NUM_CASCADES: u32 = 3u;
+// per-cascade ortho half-extent, near -> far. local var (not module const) so a dynamic index is legal, as in kVS.
+fn csm_ortho(c : u32) -> f32 {
+    var e = array<f32, 3>(3.0, 6.0, 12.0);
+    return e[c];
+}
 
 // per-pixel primary ray from the UBO camera basis (CPU drives pos/fwd/right/up from WASD + mouse).
 fn camera_ray(ndc : vec2f, aspect : f32) -> vec3f {
@@ -157,12 +168,13 @@ fn light_basis(dir : vec3f) -> mat3x3f {
     let u = cross(f, r);
     return mat3x3f(r, u, f);
 }
-// world -> light space: xy in [-1,1] across the frustum, z in [0,1] matching what the shadow pass writes.
-fn light_space(wp : vec3f, dir : vec3f) -> vec3f {
+// world -> light space for a cascade of half-extent `ortho`: xy in [-1,1] across the frustum,
+// z in [0,1] matching what the shadow pass writes (z normalization is shared by all cascades).
+fn light_space(wp : vec3f, dir : vec3f, ortho : f32) -> vec3f {
     let B   = light_basis(dir);
-    let rel = wp - SCENE_CENTER;
-    return vec3f(dot(rel, B[0]) / LIGHT_ORTHO,
-                 dot(rel, B[1]) / LIGHT_ORTHO,
+    let rel = wp - shadow_center();
+    return vec3f(dot(rel, B[0]) / ortho,
+                 dot(rel, B[1]) / ortho,
                  (dot(rel, B[2]) + LIGHT_DIST) / (2.0 * LIGHT_DIST));
 }
 )";
@@ -237,10 +249,11 @@ struct GOut {
 // shadow fragment: raymarch the same SDF from the light's ortho camera, depth only (no color targets).
 const char* kShadowFs = R"(
 @fragment fn fs(in : VsOut) -> @builtin(frag_depth) f32 {
+    let ortho = csm_ortho(in.casc);                    // this cascade's frustum half-extent (firstInstance -> in.casc)
     let B = light_basis(scene.lightDir.xyz);
-    let origin = SCENE_CENTER - B[2] * LIGHT_DIST
-               + B[0] * (in.ndc.x * LIGHT_ORTHO)
-               + B[1] * (in.ndc.y * LIGHT_ORTHO);
+    let origin = shadow_center() - B[2] * LIGHT_DIST
+               + B[0] * (in.ndc.x * ortho)
+               + B[1] * (in.ndc.y * ortho);
     let t = raymarch(origin, B[2], 2.0 * LIGHT_DIST);  // parallel rays along the light direction
     if (t < 0.0) { discard; }
     return t / (2.0 * LIGHT_DIST);
@@ -253,16 +266,22 @@ const char* kLightingFs = R"(
 @group(0) @binding(2) var gNormal   : texture_2d<f32>;
 @group(0) @binding(3) var gRough    : texture_2d<f32>;
 @group(0) @binding(4) var gDepth    : texture_depth_2d;
-@group(0) @binding(5) var shadowMap : texture_depth_2d;
+@group(0) @binding(5) var shadowMap : texture_depth_2d_array;
 
+struct Shadow { factor : f32, cascade : i32 };   // factor: 1 lit / 0 shadowed; cascade: chosen layer, -1 = none
 // ponytail: single tap -> hard edges; add a 3x3 PCF loop here if the shadow edges look too crunchy.
-fn sample_shadow(wp : vec3f) -> f32 {
-    let ls = light_space(wp, scene.lightDir.xyz);
-    if (abs(ls.x) > 1.0 || abs(ls.y) > 1.0 || ls.z > 1.0 || ls.z < 0.0) { return 1.0; }   // outside -> lit
-    let dim = vec2f(textureDimensions(shadowMap));
-    let tx  = vec2i(i32((ls.x * 0.5 + 0.5) * dim.x), i32((0.5 - ls.y * 0.5) * dim.y));     // flip y for texel space
-    let stored = textureLoad(shadowMap, tx, 0);
-    return select(1.0, 0.0, ls.z - 0.004 > stored);                                        // bias against acne
+// pick the tightest cascade (smallest ortho extent) that contains wp -> highest available shadow resolution.
+fn sample_shadow(wp : vec3f) -> Shadow {
+    let dir = scene.lightDir.xyz;
+    for (var c = 0u; c < NUM_CASCADES; c = c + 1u) {
+        let ls = light_space(wp, dir, csm_ortho(c));
+        if (abs(ls.x) > 1.0 || abs(ls.y) > 1.0 || ls.z > 1.0 || ls.z < 0.0) { continue; }   // not in this cascade
+        let dim = vec2f(textureDimensions(shadowMap));
+        let tx  = vec2i(i32((ls.x * 0.5 + 0.5) * dim.x), i32((0.5 - ls.y * 0.5) * dim.y));   // flip y for texel space
+        let stored = textureLoad(shadowMap, tx, i32(c), 0);
+        return Shadow(select(1.0, 0.0, ls.z - 0.004 > stored), i32(c));                      // bias against acne
+    }
+    return Shadow(1.0, -1);                                                                  // outside all cascades -> lit
 }
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
     let px  = vec2i(in.pos.xy);
@@ -279,9 +298,17 @@ fn sample_shadow(wp : vec3f) -> f32 {
     let ndl  = max(dot(n, L), 0.0);
     let sh   = sample_shadow(wp);
     let spec = pow(max(dot(n, H), 0.0), mix(4.0, 64.0, 1.0 - rough)) * (1.0 - rough);
-    let direct  = (ndl + spec) * sh * scene.lightColor.rgb;
+    let direct  = (ndl + spec) * sh.factor * scene.lightColor.rgb;
     let ambient = 0.12;
-    return vec4f(albedo * (ambient + direct), 1.0);
+    var col = albedo * (ambient + direct);
+    if (scene.debugMode == 6u) {                                                            // CSM debug: tint by cascade
+        var tint = vec3f(0.35);                                                             // outside all cascades = grey
+        if      (sh.cascade == 0) { tint = vec3f(1.0, 0.4, 0.4); }
+        else if (sh.cascade == 1) { tint = vec3f(0.4, 1.0, 0.4); }
+        else if (sh.cascade == 2) { tint = vec3f(0.4, 0.6, 1.0); }
+        col = col * tint;
+    }
+    return vec4f(col, 1.0);
 }
 )";
 
@@ -942,7 +969,7 @@ int main()
     int  shownSsao  = -1;    // last (ssao, debug) state we printed the execution order for
     int  shownDebug = -1;
     bool running    = true;
-    const char* kDebugName[] = { "off", "albedo", "normal", "roughness", "depth", "ssao" };
+    const char* kDebugName[] = { "off", "albedo", "normal", "roughness", "depth", "ssao", "csm cascades" };
 
     // free-fly camera: WASD moves, left-drag rotates (yaw/pitch). Inits to the old fixed view.
     float  camPos[3] = { 0.0f, 1.9f, 5.5f };
@@ -978,7 +1005,7 @@ int main()
             }
             else if (e.type == SDL_EVENT_KEY_DOWN &&
                      (e.key.scancode == SDL_SCANCODE_0 ||
-                      (e.key.scancode >= SDL_SCANCODE_1 && e.key.scancode <= SDL_SCANCODE_5))) {
+                      (e.key.scancode >= SDL_SCANCODE_1 && e.key.scancode <= SDL_SCANCODE_6))) {
                 debugMode = (e.key.scancode == SDL_SCANCODE_0) ? 0 : (int)(e.key.scancode - SDL_SCANCODE_1) + 1;
                 std::printf("debug: %s\n", kDebugName[debugMode]);
             }
@@ -1064,9 +1091,9 @@ int main()
         auto gRough  = screenTex("gbuffer.rough",  kColorFormat);
         auto gDepth  = screenTex("gbuffer.depth",  kDepthFormat);
         auto litColor = screenTex("lighting.color", kColorFormat);
-        auto shadowMap = rg->create_image(WEBGPU_STR("shadow.map"), {
+        auto csm = rg->create_image(WEBGPU_STR("shadow.csm"), {
             .dimension = WGPUTextureDimension_2D, .format = kDepthFormat,
-            .sizeKind = SizeKind::Absolute, .absolute = { kShadowSize, kShadowSize, 1 },
+            .sizeKind = SizeKind::Absolute, .absolute = { kShadowSize, kShadowSize, kNumCascades },
         });
         auto sceneUbo = rg->create_buffer(WEBGPU_STR("scene.ubo"), { .size = sizeof(SceneUBO) });
         ResourceHandle aoTex{};   // only on the SSAO path
@@ -1094,25 +1121,31 @@ int main()
                 wgpuBindGroupLayoutRelease(l);
             });
 
-        // 2) shadow: raymarch the same SDF from the directional light -> depth-only shadow map.
-        rg->add_pass(WEBGPU_STR("shadow"), PassKind::Graphics,
-            [&](GraphBuilder& b) {
-                b.depth_stencil(shadowMap, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f);
-                b.uniform(sceneUbo);
-            },
-            [dev, shadowPipe, sceneUbo](PassContext& ctx) {
-                WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(shadowPipe, 0);
-                WGPUBindGroupEntry e[1] = {
-                    { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
-                };
-                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
-                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
-                wgpuRenderPassEncoderSetPipeline(ctx.render, shadowPipe);
-                wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
-                wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
-                wgpuBindGroupRelease(bg);
-                wgpuBindGroupLayoutRelease(l);
-            });
+        // 2) shadow cascades: raymarch the same SDF from the directional light at kNumCascades concentric
+        // ortho extents, each into one layer of a 2D-array depth texture (per-layer attachment via baseLayer).
+        // firstInstance = c carries the cascade index to the shader (instance_index -> csm_ortho(c)). The 3
+        // writes share the handle, so the graph serializes them (WAW) and lighting RAW-depends on all -- same
+        // shape as the 6 cube.face passes feeding cube.sample.
+        for (uint32_t c = 0; c < kNumCascades; ++c) {
+            rg->add_pass(WEBGPU_STR("shadow.cascade"), PassKind::Graphics,
+                [&, c](GraphBuilder& b) {
+                    b.depth_stencil(csm, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f, 0, c);   // baseMip 0, layer c
+                    b.uniform(sceneUbo);
+                },
+                [dev, shadowPipe, sceneUbo, c](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(shadowPipe, 0);
+                    WGPUBindGroupEntry e[1] = {
+                        { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, shadowPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, c);   // firstInstance = c -> @builtin(instance_index)
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
+        }
 
         // 3) ssao (optional): screen-space AO from gbuffer depth + normal -> aoTex. Also forced on when
         // its debug view (key 5) is selected, so there's an AO buffer to blit.
@@ -1151,11 +1184,18 @@ int main()
                 b.sampled(gNormal);
                 b.sampled(gRough);
                 b.sampled(gDepth);
-                b.sampled(shadowMap);
+                b.sampled(csm);
                 b.uniform(sceneUbo);
                 b.color(litColor, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
             },
-            [dev, lightingPipe, sceneUbo, gAlbedo, gNormal, gRough, gDepth, shadowMap](PassContext& ctx) {
+            [dev, lightingPipe, sceneUbo, gAlbedo, gNormal, gRough, gDepth, csm](PassContext& ctx) {
+                // the body builds its own array view (graph resolves the texture; no graph-side abstraction),
+                // mirroring cube.sample below -- binds all kNumCascades layers as a single texture_depth_2d_array.
+                WGPUTextureViewDescriptor avd{
+                    .format = kDepthFormat, .dimension = WGPUTextureViewDimension_2DArray,
+                    .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = kNumCascades,
+                };
+                WGPUTextureView csmView = wgpuTextureCreateView(ctx.texture(csm), &avd);
                 WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(lightingPipe, 0);
                 WGPUBindGroupEntry e[6] = {
                     { .binding = 0, .buffer = ctx.buffer(sceneUbo), .offset = 0, .size = sizeof(SceneUBO) },
@@ -1163,7 +1203,7 @@ int main()
                     { .binding = 2, .textureView = ctx.view(gNormal) },
                     { .binding = 3, .textureView = ctx.view(gRough) },
                     { .binding = 4, .textureView = ctx.view(gDepth) },
-                    { .binding = 5, .textureView = ctx.view(shadowMap) },
+                    { .binding = 5, .textureView = csmView },
                 };
                 WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 6, .entries = e };
                 WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
@@ -1172,6 +1212,7 @@ int main()
                 wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
                 wgpuBindGroupRelease(bg);
                 wgpuBindGroupLayoutRelease(l);
+                wgpuTextureViewRelease(csmView);
             });
 
         // 4b) sky: 2nd writer of litColor (LoadOp_Load, background pixels only) -> WAW edge after lighting.
@@ -1581,7 +1622,7 @@ int main()
         sb.spheres[6][0] = 0.0f;                                 // capstone nestled on top, gentle bob
         sb.spheres[6][1] = gy + 1.9f + sinf(t * 1.5f) * 0.12f;
         sb.spheres[6][2] = 0.0f; sb.spheres[6][3] = 0.5f;
-        float la = t * 0.25f;
+        float la = 0.8f;                                         // frozen: static light dir -> shadow map stops sweeping
         float lx = cosf(la) * 0.5f, ly = -1.0f, lz = sinf(la) * 0.5f;
         float ln = sqrtf(lx * lx + ly * ly + lz * lz);
         sb.lightDir[0] = lx / ln; sb.lightDir[1] = ly / ln; sb.lightDir[2] = lz / ln;

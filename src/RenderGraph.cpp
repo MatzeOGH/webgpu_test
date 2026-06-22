@@ -1206,14 +1206,14 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
         ctx.graph = this;
         ctx.queue = queue;
 
-        if (p->kind == PassKind::Compute) {
+        if (p->kind == PassKind::Compute && p->exec_fn) {
             WGPUComputePassDescriptor cd{ .label = p->name };
             ctx.compute = wgpuCommandEncoderBeginComputePass(encoder, &cd);
-            if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
+            p->exec_fn(p->exec_obj, ctx);
             wgpuComputePassEncoderEnd(ctx.compute);
             wgpuComputePassEncoderRelease(ctx.compute);
         }
-        else if (p->kind == PassKind::Graphics) {
+        else if (p->kind == PassKind::Graphics && p->exec_fn) {
             // gather declared attachments from the access list -> WebGPU render pass descriptor
             WGPURenderPassColorAttachment color[8]{};
             uint32_t nc = 0;
@@ -1273,7 +1273,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                 .depthStencilAttachment = hasDepth ? &depth : nullptr,
             };
             ctx.render = wgpuCommandEncoderBeginRenderPass(encoder, &rd);
-            if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
+            p->exec_fn(p->exec_obj, ctx);
             wgpuRenderPassEncoderEnd(ctx.render);
             wgpuRenderPassEncoderRelease(ctx.render);
             for (uint32_t i = 0; i < nmade; ++i) wgpuTextureViewRelease(made[i]);   // attachment views are pass-scoped
