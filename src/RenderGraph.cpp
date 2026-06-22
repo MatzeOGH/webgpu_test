@@ -285,6 +285,9 @@ struct GraphAllocator
     size_t capacity{};
     // Offset from the top of the buffer to the next free scratch byte (grows downward).
     size_t scratchUsed{};
+    // High-water mark of scratchUsed within the frame. scratch is rewound to 0 per scope, so by the
+    // time the debug UI reads the arena the live value is back to 0 -- this keeps the peak for it.
+    size_t scratchHighWater{};
 
     // resource pools folded in. reset() below only rewinds the bump cursors -- it leaves these be,
     // because they cache GPU textures across frames on purpose (history ping-pong + transient reuse).
@@ -334,6 +337,7 @@ struct GraphAllocator
         }
 
         scratchUsed = newScratchUsed;
+        if (scratchUsed > scratchHighWater) scratchHighWater = scratchUsed;
         return base + rawTop;
     }
 
@@ -404,6 +408,7 @@ struct GraphAllocator
     {
         used = 0;
         scratchUsed = 0;
+        scratchHighWater = 0;
     }
 
     void reset_scratch()

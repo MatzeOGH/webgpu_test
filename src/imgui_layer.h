@@ -117,6 +117,48 @@ static void rg_usage_str(WGPUTextureUsage u, char* out, size_t n)
 		(u & WGPUTextureUsage_CopyDst)          ? "w" : "");
 }
 
+// bytes per texel for the formats this sample makes; unknown -> 0 so the UI shows "?" instead of
+// inventing a number. tracks the set rg_format_name covers.
+static uint32_t rg_format_bytes(WGPUTextureFormat f)
+{
+	switch (f) {
+	case WGPUTextureFormat_R8Unorm:      return 1;
+	case WGPUTextureFormat_R16Float:     return 2;
+	case WGPUTextureFormat_RG16Float:    return 4;
+	case WGPUTextureFormat_R32Float:     return 4;
+	case WGPUTextureFormat_RGBA8Unorm:   return 4;
+	case WGPUTextureFormat_BGRA8Unorm:   return 4;
+	case WGPUTextureFormat_Depth32Float: return 4;
+	case WGPUTextureFormat_RGBA16Float:  return 8;
+	default: return 0;
+	}
+}
+
+// one pool entry's footprint: every mip level, times array layers. ponytail: layers stays constant
+// across mips -- right for 2D / 2D-array (all this sample makes), over-counts a true 3D texture whose
+// depth also halves each level.
+static uint64_t rg_entry_bytes(const TransientResourcePool::Entry& e)
+{
+	const uint64_t bpp = rg_format_bytes(e.format);
+	if (!bpp) return 0;
+	const uint32_t layers = e.size.depthOrArrayLayers ? e.size.depthOrArrayLayers : 1;
+	uint64_t total = 0;
+	for (uint32_t m = 0; m < e.mipLevelCount; ++m) {
+		const uint32_t w = (e.size.width  >> m) ? (e.size.width  >> m) : 1u;   // max(1, ..) without <algorithm>
+		const uint32_t h = (e.size.height >> m) ? (e.size.height >> m) : 1u;
+		total += (uint64_t)w * h * layers * bpp;
+	}
+	return total;
+}
+
+// byte count -> short human string. ponytail: no GB tier, a transient pool is a few MB.
+static void rg_bytes_str(uint64_t bytes, char* out, size_t n)
+{
+	if      (bytes >= (1u << 20)) std::snprintf(out, n, "%.1f MB", bytes / (1024.0 * 1024.0));
+	else if (bytes >= (1u << 10)) std::snprintf(out, n, "%.1f KB", bytes / 1024.0);
+	else                          std::snprintf(out, n, "%llu B",  (unsigned long long)bytes);
+}
+
 // DAG view: a box per pass, bezier lines for the dependency edges, laid out left-to-right by
 // dependency depth. Reads the .cpp-internal node structs directly. Assumes a compiled, valid graph
 // (realize() has run) -- no hedging, like the other debug dumps.
@@ -437,7 +479,12 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 	TransientResourcePool& tp = s.m_allocator->transient;
 
 	int held = (int)tp.entries.size(), inUse = 0;
-	for (const TransientResourcePool::Entry& e : tp.entries) if (e.inUse) ++inUse;
+	uint64_t totalBytes = 0, inUseBytes = 0;
+	for (const TransientResourcePool::Entry& e : tp.entries) {
+		const uint64_t b = rg_entry_bytes(e);
+		totalBytes += b;
+		if (e.inUse) { ++inUse; inUseBytes += b; }
+	}
 
 	ImGui::Text("frame %llu  --  %d held, %d in use", (unsigned long long)tp.frame, held, inUse);
 	ImGui::SameLine();
@@ -445,27 +492,69 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 		ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "  --  0 created (reused from pool)");
 	else
 		ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1), "  --  %u created this frame", tp.createdThisFrame);
+
+	char tb[24], ib[24], idb[24];
+	rg_bytes_str(totalBytes, tb, sizeof tb);
+	rg_bytes_str(inUseBytes, ib, sizeof ib);
+	rg_bytes_str(totalBytes - inUseBytes, idb, sizeof idb);   // in use is a subset sum -> no underflow
+	ImGui::Text("VRAM %s total  --  %s in use, %s idle", tb, ib, idb);
+
 	ImGui::TextDisabled("usage A=attach T=sampled S=storage r=copy-src w=copy-dst   |   evict after %llu idle frames",
 		(unsigned long long)TransientResourcePool::kRetain);
 	ImGui::Separator();
 
-	// currently held physical textures.
 	const ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
-	if (ImGui::BeginTable("tp_live", 5, tf)) {
+
+	// memory by format -- which texture types the pool spends its bytes on.
+	ImGui::TextDisabled("by format");
+	{
+		struct FmtAgg { WGPUTextureFormat fmt; int count; uint64_t bytes; };
+		FmtAgg agg[16]; int nAgg = 0;
+		for (const TransientResourcePool::Entry& e : tp.entries) {
+			int j = 0;
+			for (; j < nAgg; ++j) if (agg[j].fmt == e.format) break;
+			if (j == nAgg) { if (nAgg == 16) continue; agg[nAgg++] = { e.format, 0, 0 }; }   // 17th+ format folded away
+			agg[j].count++;
+			agg[j].bytes += rg_entry_bytes(e);
+		}
+		if (ImGui::BeginTable("tp_fmt", 3, tf)) {
+			ImGui::TableSetupColumn("format");
+			ImGui::TableSetupColumn("count");
+			ImGui::TableSetupColumn("bytes");
+			ImGui::TableHeadersRow();
+			for (int j = 0; j < nAgg; ++j) {
+				char bb[24]; rg_bytes_str(agg[j].bytes, bb, sizeof bb);
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn(); ImGui::Text("%s", rg_format_name(agg[j].fmt));
+				ImGui::TableNextColumn(); ImGui::Text("%d", agg[j].count);
+				ImGui::TableNextColumn(); ImGui::Text("%s", bb);
+			}
+			ImGui::EndTable();
+		}
+	}
+	ImGui::Separator();
+
+	// currently held physical textures.
+	if (ImGui::BeginTable("tp_live", 6, tf)) {
 		ImGui::TableSetupColumn("#");
 		ImGui::TableSetupColumn("size");
 		ImGui::TableSetupColumn("format");
 		ImGui::TableSetupColumn("usage");
+		ImGui::TableSetupColumn("mem");
 		ImGui::TableSetupColumn("state");
 		ImGui::TableHeadersRow();
 		int idx = 0;
 		for (const TransientResourcePool::Entry& e : tp.entries) {
 			char ub[8]; rg_usage_str(e.usage, ub, sizeof ub);
+			const uint64_t eb = rg_entry_bytes(e);
 			ImGui::TableNextRow();
 			ImGui::TableNextColumn(); ImGui::Text("%d", idx++);
 			ImGui::TableNextColumn(); ImGui::Text("%ux%u", e.size.width, e.size.height);
 			ImGui::TableNextColumn(); ImGui::Text("%s", rg_format_name(e.format));
 			ImGui::TableNextColumn(); ImGui::Text("%s", ub);
+			ImGui::TableNextColumn();
+			if (eb) { char mb[24]; rg_bytes_str(eb, mb, sizeof mb); ImGui::Text("%s", mb); }
+			else    ImGui::TextDisabled("?");
 			ImGui::TableNextColumn();
 			if (e.inUse) ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1), "in use");
 			else         ImGui::TextDisabled("idle %lluf", (unsigned long long)(tp.frame - e.lastUsedFrame));
@@ -489,14 +578,69 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 	ImGui::EndChild();
 }
 
-// The RenderGraph debug window: FPS readout + a tab bar over the dependency DAG and the resource-
-// lifetime grid. Built after compile()+realize(), so both tabs read a finished graph.
+// The per-frame bump arena (GraphAllocator) as a dual-ended usage bar. One fixed buffer backs the
+// RenderGraph object, every resource/pass node, the type-erased execute closures and the strings
+// copied in: `used` grows up from the base (cool, drawn from the left) and is what the frame holds.
+// compile()'s scratch grows down from the top (warm, drawn from the right); it's rewound to 0 before
+// we draw, so the bar uses its tracked per-frame peak. The ends can't overlap -- used + scratch peak
+// is the worst-case occupancy that decides whether 1 MB is enough (in the hover).
+static void rg_draw_arena(GraphAllocator& a)
+{
+	const double kib         = 1024.0;
+	const double cap         = a.capacity ? (double)a.capacity : 1.0;
+	const float  usedFrac    = (float)((double)a.used / cap);
+	const float  scratchFrac = (float)((double)(a.scratchHighWater) / cap);
+
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextUnformatted("arena");
+	ImGui::SameLine();
+
+	const ImVec2 p0 = ImGui::GetCursorScreenPos();
+	float        w  = ImGui::GetContentRegionAvail().x;
+	if (w < 1.0f) w = 1.0f;                                   // collapsed window -> keep InvisibleButton happy
+	const float  h  = ImGui::GetFrameHeight();
+	const ImVec2 p1(p0.x + w, p0.y + h);
+
+	ImGui::InvisibleButton("arena_bar", ImVec2(w, h));
+	const bool  hov = ImGui::IsItemHovered();
+	ImDrawList* dl  = ImGui::GetWindowDrawList();
+
+	dl->AddRectFilled(p0, p1, IM_COL32(28, 28, 28, 255), 3.0f);                       // track
+	dl->AddRectFilled(p0, ImVec2(p0.x + w * usedFrac, p1.y), kRGRead, 0.0f);          // used, from the left
+	if (scratchFrac > 0.0f)                                                            // scratch peak, from the right
+		dl->AddRectFilled(ImVec2(p1.x - w * scratchFrac, p0.y), p1, kRGWrite, 0.0f);
+	dl->AddRect(p0, p1, hov ? IM_COL32(255, 255, 255, 255) : IM_COL32(20, 20, 20, 180), 3.0f);
+
+	char ov[64];
+	std::snprintf(ov, sizeof ov, "%.1f / %.0f KB  (%.2f%%)", a.used / kib, a.capacity / kib, usedFrac * 100.0);
+	const ImVec2 ts = ImGui::CalcTextSize(ov);
+	dl->AddText(ImVec2(p0.x + (w - ts.x) * 0.5f, p0.y + (h - ts.y) * 0.5f), IM_COL32(235, 235, 235, 255), ov);
+
+	if (hov) {
+		ImGui::BeginTooltip();
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGRead),  "front used   %llu B  (%.2f KB)",
+			(unsigned long long)a.used, a.used / kib);
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGWrite), "scratch peak %llu B  (%.2f KB)",
+			(unsigned long long)a.scratchHighWater, a.scratchHighWater / kib);
+		ImGui::Text("free         %llu B  (%.2f KB)",
+			(unsigned long long)(a.capacity - a.used), (a.capacity - a.used) / kib);
+		ImGui::Separator();
+		ImGui::Text("capacity     %.0f KB", a.capacity / kib);
+		ImGui::Text("worst case   %.2f%%  (used + scratch peak)", (usedFrac + scratchFrac) * 100.0);
+		ImGui::EndTooltip();
+	}
+}
+
+// The RenderGraph debug window: an FPS + arena-usage header, then a tab bar over the dependency DAG,
+// the resource-lifetime grid and the transient pool. Built after compile()+realize(), so it all reads
+// a finished graph.
 static void imgui_layer_draw_graph(RenderGraph* rg)
 {
 	RenderGraphStorage& s = *storage(rg);
 
 	ImGui::Begin("RenderGraph");
 	ImGui::Text(" %.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+	rg_draw_arena(*s.m_allocator);
 	ImGui::Separator();
 
 	if (ImGui::BeginTabBar("rg_tabs")) {
