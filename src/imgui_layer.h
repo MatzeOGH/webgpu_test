@@ -210,11 +210,28 @@ static bool rg_external_span(RenderGraphStorage& s, ResourceNode* r, uint32_t& f
 	return first != ResourceNode::kNoPass;
 }
 
+// what `p` does to resource `id`: bit 1 = reads, bit 2 = writes (0 = doesn't touch it this pass).
+static int rg_pass_access(PassNode* p, uint32_t id)
+{
+	int a = 0;
+	for (uint32_t i = 0; i < p->accessCount; ++i)
+		if (p->accesses[i].handle.id == id)
+			a |= access_is_write(p->accesses[i].type) ? 2 : 1;
+	return a;
+}
+
+static ImU32 rg_with_alpha(ImU32 c, ImU32 a) { return (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT); }
+
+// per-pass access tint inside a lifetime bar: write warm, read cool -- so produce vs consume reads at a glance.
+static constexpr ImU32 kRGWrite = IM_COL32(232, 145, 64, 255);
+static constexpr ImU32 kRGRead  = IM_COL32(74, 158, 206, 255);
+
 // Resource-lifetime grid. The top axis is the passes in execution order (named); each resource is a
-// bar across the passes it stays live for -- first touch to last. Transient resources read the
-// firstUse/lastUse the aliasing analysis fills in compile() phase 3. Imported + temporal resources
-// are caller-owned (no aliasing span); the toggle adds them, drawn muted with their span recovered by
-// rg_external_span. Bars that never share a column are aliasing candidates.
+// bar across the passes it stays live for -- first touch to last. The bar is split per pass: a column
+// where a pass writes the resource is warm, a column it only reads is cool, read+write splits the
+// cell, and a faint kind-tinted band shows passes that merely keep it alive. Transient resources read
+// the firstUse/lastUse the aliasing analysis fills in compile() phase 3; imported + temporal are
+// caller-owned (toggle adds them, muted). Bars that never share a column are aliasing candidates.
 static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 {
 	constexpr int   kMax = 128;
@@ -223,7 +240,11 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 	static bool showExternal = true;
 	ImGui::Checkbox("show imported / temporal", &showExternal);
 	ImGui::SameLine();
-	ImGui::TextDisabled("(transient solid, imported/temporal muted)");
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGWrite), "write");
+	ImGui::SameLine(0, 4);
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGRead), "read");
+	ImGui::SameLine();
+	ImGui::TextDisabled("(band = held alive)");
 
 	PassNode* passAt[kMax];
 	int nPass = 0;
@@ -320,13 +341,29 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 		const bool hov = ImGui::IsItemHovered();
 		ImGui::PopID();
 
-		// transient = solid kind colour; imported/temporal = muted (caller-owned, not aliasable) with
-		// an accent edge matching the name colour.
-		ImU32 fill = rg_resource_color(r->kind);
-		if (ext) fill = (fill & ~IM_COL32_A_MASK) | ((ImU32)110 << IM_COL32_A_SHIFT);
-		dl->AddRectFilled(tl, br, fill, 4.0f);
+		// base band = the lifetime itself, faintly kind-tinted so texture/buffer stays legible; held
+		// columns show only this. imported/temporal sit fainter still.
+		dl->AddRectFilled(tl, br, rg_with_alpha(rg_resource_color(r->kind), ext ? 32 : 60), 0.0f);
+
+		// per-pass cells on top: warm = write, cool = read, split = both. externals dimmed a touch.
+		const ImU32 wcol = rg_with_alpha(kRGWrite, ext ? 175 : 255);
+		const ImU32 rcol = rg_with_alpha(kRGRead,  ext ? 175 : 255);
+		for (uint32_t c = row[i].first; c <= row[i].last; ++c) {
+			int acc = rg_pass_access(passAt[c], r->handle.id);
+			if (!acc) continue;   // held this pass -> band shows through
+			float sx0 = (c == row[i].first) ? x0 : origin.x + kLabelW + c * kColW;
+			float sx1 = (c == row[i].last)  ? x1 : origin.x + kLabelW + (c + 1) * kColW;
+			if (acc == 3) {   // read + write -> split top (write) / bottom (read)
+				float mid = (tl.y + br.y) * 0.5f;
+				dl->AddRectFilled(ImVec2(sx0, tl.y), ImVec2(sx1, mid), wcol, 0.0f);
+				dl->AddRectFilled(ImVec2(sx0, mid), ImVec2(sx1, br.y), rcol, 0.0f);
+			} else
+				dl->AddRectFilled(ImVec2(sx0, tl.y), ImVec2(sx1, br.y), acc == 2 ? wcol : rcol, 0.0f);
+		}
+
+		// outline marks transient vs imported/temporal (accent edge); white on hover.
 		ImU32 edge = hov ? IM_COL32(255, 255, 255, 255) : ext ? nameCol : IM_COL32(20, 20, 20, 160);
-		dl->AddRect(tl, br, edge, 4.0f, 0, hov ? 2.0f : 1.0f);
+		dl->AddRect(tl, br, edge, 0.0f, 0, hov ? 2.0f : 1.0f);
 
 		if (hov) {
 			WGPUStringView f = pass_name_at(s.m_passes, row[i].first);
@@ -345,6 +382,13 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 			else
 				ImGui::Text("alive %.*s .. %.*s",
 					(int)f.length, f.data ? f.data : "", (int)l.length, l.data ? l.data : "");
+			for (uint32_t c = row[i].first; c <= row[i].last; ++c) {   // per-pass read/write breakdown
+				int a = rg_pass_access(passAt[c], r->handle.id);
+				if (!a) continue;
+				WGPUStringView pn = passAt[c]->name;
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(a == 1 ? kRGRead : kRGWrite),
+					"  %s %.*s", a == 3 ? "rw" : a == 2 ? " w" : " r", (int)pn.length, pn.data ? pn.data : "");
+			}
 			ImGui::EndTooltip();
 		}
 	}
