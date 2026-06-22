@@ -1436,7 +1436,7 @@ int main()
 
             // history: ping-pong temporal resource. .curr = this frame's write target, .prev = last
             // frame's result (read-only). the pool swaps the two physical textures every frame, so this
-            // frame's result becomes next frame's history -- no manual ping-pong.
+            // frame's result becomes next frame's history
             auto [historyCurr, historyPrev] = rg->create_temporal_image(WEBGPU_STR("taa.history"), {
                 .dimension = WGPUTextureDimension_2D, .format = kSwapFormat,
                 .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,

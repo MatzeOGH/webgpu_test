@@ -86,6 +86,37 @@ static ImU32 rg_resource_color(ResourceNode::Kind k)
 	                                        : IM_COL32(170, 120, 60, 255);
 }
 
+// short format label for the transient-pool view. Covers the formats this sample creates; anything
+// else falls back to the raw enum so an unexpected recreate still shows something legible.
+static const char* rg_format_name(WGPUTextureFormat f)
+{
+	switch (f) {
+	case WGPUTextureFormat_BGRA8Unorm:   return "BGRA8";
+	case WGPUTextureFormat_RGBA8Unorm:   return "RGBA8";
+	case WGPUTextureFormat_RGBA16Float:  return "RGBA16F";
+	case WGPUTextureFormat_RG16Float:    return "RG16F";
+	case WGPUTextureFormat_R16Float:     return "R16F";
+	case WGPUTextureFormat_R8Unorm:      return "R8";
+	case WGPUTextureFormat_R32Float:     return "R32F";
+	case WGPUTextureFormat_Depth32Float: return "D32F";
+	default: break;
+	}
+	static char buf[16];
+	std::snprintf(buf, sizeof buf, "fmt#%d", (int)f);
+	return buf;
+}
+
+// usage bits the pool keys on, as a short flag string (legend drawn in the pane header).
+static void rg_usage_str(WGPUTextureUsage u, char* out, size_t n)
+{
+	std::snprintf(out, n, "%s%s%s%s%s",
+		(u & WGPUTextureUsage_RenderAttachment) ? "A" : "",
+		(u & WGPUTextureUsage_TextureBinding)   ? "T" : "",
+		(u & WGPUTextureUsage_StorageBinding)   ? "S" : "",
+		(u & WGPUTextureUsage_CopySrc)          ? "r" : "",
+		(u & WGPUTextureUsage_CopyDst)          ? "w" : "");
+}
+
 // DAG view: a box per pass, bezier lines for the dependency edges, laid out left-to-right by
 // dependency depth. Reads the .cpp-internal node structs directly. Assumes a compiled, valid graph
 // (realize() has run) -- no hedging, like the other debug dumps.
@@ -396,6 +427,68 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 	ImGui::EndChild();
 }
 
+// TransientResourcePool view: the live cache contents + a create/evict event log. The point is to
+// verify the pool reuses textures across frames -- after warmup the "created this frame" count should
+// sit at 0 and the log should stop growing, proving realize() hands back cached textures instead of
+// recreating them. Drawn after realize() (claims set, createdThisFrame still this frame's misses) and
+// before end_frame() releases the claims, so "in use" reflects what this frame actually held.
+static void rg_draw_transient_pool(RenderGraphStorage& s)
+{
+	TransientResourcePool& tp = s.m_allocator->transient;
+
+	int held = (int)tp.entries.size(), inUse = 0;
+	for (const TransientResourcePool::Entry& e : tp.entries) if (e.inUse) ++inUse;
+
+	ImGui::Text("frame %llu  --  %d held, %d in use", (unsigned long long)tp.frame, held, inUse);
+	ImGui::SameLine();
+	if (tp.createdThisFrame == 0)
+		ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "  --  0 created (reused from pool)");
+	else
+		ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1), "  --  %u created this frame", tp.createdThisFrame);
+	ImGui::TextDisabled("usage A=attach T=sampled S=storage r=copy-src w=copy-dst   |   evict after %llu idle frames",
+		(unsigned long long)TransientResourcePool::kRetain);
+	ImGui::Separator();
+
+	// currently held physical textures.
+	const ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit;
+	if (ImGui::BeginTable("tp_live", 5, tf)) {
+		ImGui::TableSetupColumn("#");
+		ImGui::TableSetupColumn("size");
+		ImGui::TableSetupColumn("format");
+		ImGui::TableSetupColumn("usage");
+		ImGui::TableSetupColumn("state");
+		ImGui::TableHeadersRow();
+		int idx = 0;
+		for (const TransientResourcePool::Entry& e : tp.entries) {
+			char ub[8]; rg_usage_str(e.usage, ub, sizeof ub);
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn(); ImGui::Text("%d", idx++);
+			ImGui::TableNextColumn(); ImGui::Text("%ux%u", e.size.width, e.size.height);
+			ImGui::TableNextColumn(); ImGui::Text("%s", rg_format_name(e.format));
+			ImGui::TableNextColumn(); ImGui::Text("%s", ub);
+			ImGui::TableNextColumn();
+			if (e.inUse) ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.0f, 1), "in use");
+			else         ImGui::TextDisabled("idle %lluf", (unsigned long long)(tp.frame - e.lastUsedFrame));
+		}
+		ImGui::EndTable();
+	}
+
+	ImGui::Spacing();
+	ImGui::Text("events (newest first)");
+	ImGui::BeginChild("tp_log", ImVec2(0, 0), true);
+	const uint64_t total = tp.eventCount;
+	const uint64_t shown = total < TransientResourcePool::kLog ? total : TransientResourcePool::kLog;
+	for (uint64_t k = 0; k < shown; ++k) {
+		const TransientResourcePool::LogRec& r = tp.eventLog[(total - 1 - k) % TransientResourcePool::kLog];
+		const bool create = r.kind == TransientResourcePool::Event::Create;
+		ImGui::TextColored(create ? ImVec4(0.95f, 0.70f, 0.30f, 1) : ImVec4(0.60f, 0.60f, 0.60f, 1),
+			"f%-6llu  %-6s  %ux%u  %s", (unsigned long long)r.frame, create ? "CREATE" : "evict",
+			r.size.width, r.size.height, rg_format_name(r.format));
+	}
+	if (shown == 0) ImGui::TextDisabled("(no events yet)");
+	ImGui::EndChild();
+}
+
 // The RenderGraph debug window: FPS readout + a tab bar over the dependency DAG and the resource-
 // lifetime grid. Built after compile()+realize(), so both tabs read a finished graph.
 static void imgui_layer_draw_graph(RenderGraph* rg)
@@ -407,8 +500,9 @@ static void imgui_layer_draw_graph(RenderGraph* rg)
 	ImGui::Separator();
 
 	if (ImGui::BeginTabBar("rg_tabs")) {
-		if (ImGui::BeginTabItem("Graph"))     { rg_draw_dag(rg, s);       ImGui::EndTabItem(); }
-		if (ImGui::BeginTabItem("Lifetimes")) { rg_draw_lifetimes(rg, s); ImGui::EndTabItem(); }
+		if (ImGui::BeginTabItem("Graph"))     { rg_draw_dag(rg, s);            ImGui::EndTabItem(); }
+		if (ImGui::BeginTabItem("Lifetimes")) { rg_draw_lifetimes(rg, s);      ImGui::EndTabItem(); }
+		if (ImGui::BeginTabItem("Pool"))      { rg_draw_transient_pool(s);     ImGui::EndTabItem(); }
 		ImGui::EndTabBar();
 	}
 	ImGui::End();
