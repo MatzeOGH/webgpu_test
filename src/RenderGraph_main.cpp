@@ -50,6 +50,7 @@ constexpr WGPUTextureFormat kSwapFormat  = WGPUTextureFormat_BGRA8Unorm;   // ma
 constexpr WGPUTextureFormat kColorFormat = WGPUTextureFormat_RGBA8Unorm;   // gbuffer albedo/normal/rough + lit color
 constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth32Float; // gbuffer depth + shadow map
 constexpr WGPUTextureFormat kAOFormat    = WGPUTextureFormat_RGBA8Unorm;   // ssao output (rgba8unorm = core storage format)
+constexpr WGPUTextureFormat kPtAccumFormat = WGPUTextureFormat_RGBA16Float; // path-tracer HDR accumulation (renderable + sampleable in core)
 constexpr uint32_t          kShadowSize  = 1024;                           // shadow map is a fixed square
 constexpr uint32_t          kNumCascades = 3;                              // CSM: layers in the shadow array
 constexpr uint32_t          kMaxSpheres  = 8;
@@ -71,6 +72,21 @@ struct SceneUBO {
     uint32_t _pad[3];                   // round up to a 16-byte multiple    (offset 244)
 };
 static_assert(sizeof(SceneUBO) == 256, "SceneUBO must match the std140 WGSL Scene layout");
+
+// Path-tracer uniforms: just the camera basis + the running sample count. The SDF scene lives in the
+// shader, so nothing else needs to cross. Layout matches the WGSL `Pt` struct.
+struct PtUBO {
+    float    camPos[4];      // xyz
+    float    camFwd[4];      // xyz (unit)
+    float    camRight[4];    // xyz (unit)
+    float    camUp[4];       // xyz (unit)
+    float    resolution[2];  // pixel size: aspect + per-pixel AA jitter
+    uint32_t accumFrame;     // frames blended so far; doubles as the RNG seed. 0 = reset
+    uint32_t maxBounces;     // path depth cap (Russian roulette may cut it short sooner)
+    uint32_t spp;            // samples per pixel PER FRAME (more = fewer frames to converge)
+    uint32_t _pad[3];        // round up to a 16-byte multiple
+};
+static_assert(sizeof(PtUBO) == 96, "PtUBO must match the std140 WGSL Pt layout");
 
 // same shape as Renderer.cpp::createShaderModule
 WGPUShaderModule make_shader(WGPUDevice dev, WGPUStringView code)
@@ -497,6 +513,181 @@ const char* kCubeFs = R"(
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
     let rd = camera_ray(in.ndc, scene.resolution.x / scene.resolution.y);
     return textureSample(cubeTex, samp, rd);
+}
+)";
+
+// ---- path tracer (F2) ----------------------------------------------------------------------------
+// A self-contained SDF path tracer, independent of the deferred scene above: its own UBO, its own
+// scene baked into the shader. Each frame casts one cosine-sampled path per pixel and folds the
+// result into a running mean held in a ping-ponged HDR texture, so the image refines over time.
+
+// path-tracer guts; concatenated after kVS, shared by trace + (the present fs reads only the result).
+const char* kPtCommon = R"(
+struct Pt {
+    camPos     : vec4f,
+    camFwd     : vec4f,
+    camRight   : vec4f,
+    camUp      : vec4f,
+    resolution : vec2f,
+    accumFrame : u32,
+    maxBounces : u32,
+    spp        : u32,
+    pad0 : u32, pad1 : u32, pad2 : u32,
+};
+@group(0) @binding(0) var<uniform> pt : Pt;
+@group(0) @binding(1) var prevTex : texture_2d<f32>;
+
+const PT_PI    = 3.14159265;
+const PT_FAR   = 60.0;
+const PT_FOV   = 1.0;              // vertical radians -- same lens as the deferred camera
+const PT_RR_MIN = 2u;             // bounces taken before Russian roulette may cull a path
+const PT_CLAMP = 16.0;            // per-path radiance cap: kills RR fireflies (slight bias, much cleaner)
+
+// PCG hash RNG: advance state, return a float in [0,1).
+fn pt_rand(state : ptr<function, u32>) -> f32 {
+    var s = *state;
+    s = s * 747796405u + 2891336453u;
+    let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    *state = s;
+    return f32((word >> 22u) ^ word) / 4294967296.0;
+}
+
+fn pt_ray(ndc : vec2f, aspect : f32) -> vec3f {
+    let t = tan(0.5 * PT_FOV);
+    return normalize(pt.camFwd.xyz + pt.camRight.xyz * (ndc.x * aspect * t)
+                                   + pt.camUp.xyz    * (ndc.y * t));
+}
+
+fn pt_sphere(p : vec3f, c : vec3f, r : f32) -> f32 { return length(p - c) - r; }
+
+// scene -> (distance, material id). ground = 0; diffuse spheres = 1,2; emissive lights = 3,4.
+fn pt_map(p : vec3f) -> vec2f {
+    var d  = p.y + 1.5;                                                                     // ground plane
+    var id = 0.0;
+    let s1 = pt_sphere(p, vec3f(-1.3, -0.6,  0.2), 0.9); if (s1 < d) { d = s1; id = 1.0; }  // red
+    let s2 = pt_sphere(p, vec3f( 1.4, -0.7, -0.3), 0.8); if (s2 < d) { d = s2; id = 2.0; }  // blue
+    let l1 = pt_sphere(p, vec3f( 0.0,  2.6,  1.0), 0.7); if (l1 < d) { d = l1; id = 3.0; }  // warm light
+    let l2 = pt_sphere(p, vec3f(-2.6,  0.4, -1.6), 0.4); if (l2 < d) { d = l2; id = 4.0; }  // cool light
+    return vec2f(d, id);
+}
+
+fn pt_normal(p : vec3f) -> vec3f {
+    let e = vec2f(0.0015, 0.0);
+    return normalize(vec3f(pt_map(p + e.xyy).x - pt_map(p - e.xyy).x,
+                           pt_map(p + e.yxy).x - pt_map(p - e.yxy).x,
+                           pt_map(p + e.yyx).x - pt_map(p - e.yyx).x));
+}
+
+fn pt_albedo(id : f32) -> vec3f {
+    if (id < 0.5) { return vec3f(0.62, 0.62, 0.64); }   // ground
+    if (id < 1.5) { return vec3f(0.85, 0.32, 0.22); }   // red sphere
+    if (id < 2.5) { return vec3f(0.25, 0.45, 0.85); }   // blue sphere
+    return vec3f(0.0);                                   // lights don't reflect
+}
+
+fn pt_emission(id : f32) -> vec3f {
+    if (id > 3.5) { return vec3f(4.0, 6.0, 12.0); }      // cool light
+    if (id > 2.5) { return vec3f(16.0, 12.0, 8.0); }     // warm light
+    return vec3f(0.0);
+}
+
+fn pt_raymarch(ro : vec3f, rd : vec3f) -> vec2f {
+    var t = 0.02;
+    for (var i = 0; i < 160; i = i + 1) {
+        let h = pt_map(ro + rd * t);
+        if (h.x < 0.001) { return vec2f(t, h.y); }
+        t = t + h.x;
+        if (t > PT_FAR) { break; }
+    }
+    return vec2f(-1.0, 0.0);                             // miss
+}
+
+// branchless orthonormal basis around n (Duff et al. 2017); columns: tangent, bitangent, n.
+fn pt_onb(n : vec3f) -> mat3x3f {
+    let s = select(-1.0, 1.0, n.z >= 0.0);
+    let a = -1.0 / (s + n.z);
+    let b = n.x * n.y * a;
+    return mat3x3f(vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x),
+                   vec3f(b, s + n.y * n.y * a, -n.y),
+                   n);
+}
+
+// cosine-weighted hemisphere direction around n.
+fn pt_cosine_dir(n : vec3f, seed : ptr<function, u32>) -> vec3f {
+    let u1  = pt_rand(seed);
+    let u2  = pt_rand(seed);
+    let r   = sqrt(u1);
+    let phi = 2.0 * PT_PI * u2;
+    let local = vec3f(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u1)));
+    return normalize(pt_onb(n) * local);
+}
+
+fn pt_sky(rd : vec3f) -> vec3f {
+    let h = 0.5 * (rd.y + 1.0);
+    return mix(vec3f(0.20, 0.24, 0.32), vec3f(0.55, 0.68, 0.92), h) * 0.5;   // dim fill so shadows aren't black
+}
+
+// one diffuse path: accumulate emission scaled by the throughput surviving each bounce.
+fn pt_trace(ro0 : vec3f, rd0 : vec3f, seed : ptr<function, u32>) -> vec3f {
+    var ro = ro0;
+    var rd = rd0;
+    var throughput = vec3f(1.0);
+    var radiance   = vec3f(0.0);
+    for (var b = 0u; b < pt.maxBounces; b = b + 1u) {
+        let hit = pt_raymarch(ro, rd);
+        if (hit.x < 0.0) { radiance += throughput * pt_sky(rd); break; }
+        let p = ro + rd * hit.x;
+        let n = pt_normal(p);
+        radiance += throughput * pt_emission(hit.y);
+        throughput *= pt_albedo(hit.y);                 // cosine pdf cancels the lambert term -> just *albedo
+        // Russian roulette: past a few bounces, kill dim paths with prob (1 - q) and rescale the
+        // survivors by 1/q so the estimator stays unbiased -- spends rays where they still matter.
+        if (b >= PT_RR_MIN) {
+            let q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
+            if (pt_rand(seed) > q) { break; }
+            throughput /= q;
+        }
+        rd = pt_cosine_dir(n, seed);
+        ro = p + n * 0.003;
+    }
+    return min(radiance, vec3f(PT_CLAMP));              // clamp fireflies the RR rescale can spike
+}
+)";
+
+// trace fs: average spp fresh samples this frame, fold the mean into the history read from prevTex.
+const char* kPtTraceFs = R"(
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px   = vec2u(u32(in.pos.x), u32(in.pos.y));
+    var seed = (px.x * 1973u) + (px.y * 9277u) + (pt.accumFrame * 26699u) + 1u;
+    let aspect = pt.resolution.x / pt.resolution.y;
+    let spp = max(pt.spp, 1u);
+    var sample = vec3f(0.0);
+    for (var s = 0u; s < spp; s = s + 1u) {
+        let jitter = (vec2f(pt_rand(&seed), pt_rand(&seed)) - 0.5) * (2.0 / pt.resolution);   // sub-pixel AA
+        let rd     = pt_ray(in.ndc + jitter, aspect);
+        sample += pt_trace(pt.camPos.xyz, rd, &seed);
+    }
+    sample /= f32(spp);
+
+    let prev = textureLoad(prevTex, vec2i(px), 0).rgb;
+    let n    = f32(pt.accumFrame);
+    let avg  = select(sample, (prev * n + sample) / (n + 1.0), pt.accumFrame > 0u);
+    return vec4f(avg, 1.0);
+}
+)";
+
+// present fs: tonemap + gamma-encode the HDR accumulation into the (non-sRGB) swapchain.
+const char* kPtPresentFs = R"(
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+fn pt_aces(x : vec3f) -> vec3f {
+    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
+}
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px     = vec2i(i32(in.pos.x), i32(in.pos.y));
+    let hdr    = textureLoad(srcTex, px, 0).rgb;
+    let mapped = pt_aces(hdr);
+    return vec4f(pow(mapped, vec3f(1.0 / 2.2)), 1.0);
 }
 )";
 
@@ -951,6 +1142,34 @@ int main()
     WGPURenderPipeline cubeSamplePipe = wgpuDeviceCreateRenderPipeline(dev, &cubePD);
     wgpuShaderModuleRelease(cubeSM);
 
+    // path tracer (F2): trace one sample into the HDR accumulation target.
+    WGPUShaderModule ptTraceSM = make_shader(dev, std::string(kVS) + kPtCommon + kPtTraceFs);
+    WGPUColorTargetState ptAccumCT{ .format = kPtAccumFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState ptTraceFrag{ .module = ptTraceSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &ptAccumCT };
+    WGPURenderPipelineDescriptor ptTracePD{
+        .label       = WEBGPU_STR("pt.trace pipeline"),
+        .vertex      = { .module = ptTraceSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &ptTraceFrag,
+    };
+    WGPURenderPipeline ptTracePipe = wgpuDeviceCreateRenderPipeline(dev, &ptTracePD);
+    wgpuShaderModuleRelease(ptTraceSM);
+
+    // path tracer (F2): tonemap the accumulation into the swapchain.
+    WGPUShaderModule ptPresentSM = make_shader(dev, std::string(kVS) + kPtPresentFs);
+    WGPUColorTargetState ptSwapCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState ptPresentFrag{ .module = ptPresentSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &ptSwapCT };
+    WGPURenderPipelineDescriptor ptPresentPD{
+        .label       = WEBGPU_STR("pt.present pipeline"),
+        .vertex      = { .module = ptPresentSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment    = &ptPresentFrag,
+    };
+    WGPURenderPipeline ptPresentPipe = wgpuDeviceCreateRenderPipeline(dev, &ptPresentPD);
+    wgpuShaderModuleRelease(ptPresentSM);
+
     // single persistent arena. create_render_graph() resets it and arena-allocates a fresh
     // RenderGraph (+ all its nodes) from it each frame -> the allocator is the only graph-side
     // object that lives across frames. It also owns the two resource pools (folded in): the
@@ -979,6 +1198,18 @@ int main()
     double prevTime  = getTime();
     const float kMouseSens = 0.0025f, kMoveSpeed = 4.0f;
 
+    // path tracer (F1 = original scene, F2 = path tracer). Accumulation resets whenever the view
+    // changes, so the image only converges while the camera holds still.
+    bool     pathTracerOn = false;       // F1 = original deferred scene, F2 = path tracer
+    bool     ptWasOn      = false;       // detect mode entry -> reset the running mean
+    uint32_t ptAccum      = 0;           // samples folded in so far; 0 means "start over"
+    float    ptLastCam[5] = {};          // px,py,pz,yaw,pitch snapshot to spot camera motion
+    uint32_t ptLastW = 0, ptLastH = 0;   // resolution snapshot (resize rebuilds the accum texture)
+    int      ptMaxBounces = 5;           // ImGui slider: path depth cap
+    int      ptSpp        = 1;           // ImGui slider: samples per pixel per frame
+    int      ptLastBounces = 5;          // changing bounce depth changes the estimator -> reset accum
+    ResourceHandle ptUbo{};              // hoisted so the post-realize upload can reach it
+
     imgui_layer_init(window, dev, kSwapFormat);
 
     while (running) {
@@ -1002,6 +1233,14 @@ int main()
             else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_C) {
                 cubeOn = !cubeOn;
                 std::printf("cubemap %s\n", cubeOn ? "ON" : "OFF");
+            }
+            else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F1) {
+                pathTracerOn = false;
+                std::printf("mode: original scene\n");
+            }
+            else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F2) {
+                pathTracerOn = true;
+                std::printf("mode: path tracer\n");
             }
             else if (e.type == SDL_EVENT_KEY_DOWN &&
                      (e.key.scancode == SDL_SCANCODE_0 ||
@@ -1046,13 +1285,38 @@ int main()
             for (int i = 0; i < 3; ++i) camPos[i] += fwd[i] * f + right[i] * r;
         }
 
+        // path-tracer accumulation counter: reset on mode entry, camera motion, resize, or a bounce-depth
+        // change (that shifts the estimator's mean); otherwise climb so the trace shader weights each new
+        // sample less. spp changes need no reset -- they don't change what the average converges to. Exact
+        // float compare is fine -- the camera state is bit-identical frame to frame when nothing moved it.
+        if (pathTracerOn) {
+            bool moved = !ptWasOn
+                || camPos[0] != ptLastCam[0] || camPos[1] != ptLastCam[1] || camPos[2] != ptLastCam[2]
+                || camYaw != ptLastCam[3] || camPitch != ptLastCam[4]
+                || cfg.width != ptLastW || cfg.height != ptLastH
+                || ptMaxBounces != ptLastBounces;
+            ptAccum = moved ? 0u : ptAccum + 1u;
+            ptLastCam[0] = camPos[0]; ptLastCam[1] = camPos[1]; ptLastCam[2] = camPos[2];
+            ptLastCam[3] = camYaw;    ptLastCam[4] = camPitch;
+            ptLastW = cfg.width;      ptLastH = cfg.height;
+            ptLastBounces = ptMaxBounces;
+        }
+        ptWasOn = pathTracerOn;
+
         imgui_layer_begin_frame();   // NewFrame only; the DAG window is built after compile, Render() in end_frame
 
         ImGui::Begin("Features");
-        ImGui::Checkbox("SSAO", &ssaoOn);
-        ImGui::Checkbox("TAA", &taaOn);
-        ImGui::Checkbox("Bloom (B)", &bloomOn);
-        ImGui::Checkbox("Cubemap (C)", &cubeOn);
+        ImGui::Checkbox("Path Tracer (F1/F2)", &pathTracerOn);
+        if (pathTracerOn) {
+            ImGui::Text("samples: %u", ptAccum + 1u);          // frames blended (x spp = total paths/pixel)
+            ImGui::SliderInt("Max bounces", &ptMaxBounces, 1, 12);
+            ImGui::SliderInt("SPP / frame", &ptSpp, 1, 16);
+        } else {
+            ImGui::Checkbox("SSAO", &ssaoOn);
+            ImGui::Checkbox("TAA", &taaOn);
+            ImGui::Checkbox("Bloom (B)", &bloomOn);
+            ImGui::Checkbox("Cubemap (C)", &cubeOn);
+        }
         ImGui::End();
 
         WGPUSurfaceTexture st{};
@@ -1079,6 +1343,11 @@ int main()
         // import this frame's swapchain view; its size roots every Relative texture below.
         auto swapchain = rg->importe_image(WEBGPU_STR("swapchain"), view, { cfg.width, cfg.height, 1 });
 
+        ResourceHandle sceneUbo{};   // hoisted out of the branch below for the post-realize upload
+
+        // ===== F1: original deferred renderer (declared only when the path tracer is off) =====
+        if (!pathTracerOn) {
+
         // helper for a swapchain-sized offscreen texture (WGPU_STRLEN -> copy_string measures it).
         auto screenTex = [&](const char* name, WGPUTextureFormat fmt) {
             return rg->create_image(WGPUStringView{ name, WGPU_STRLEN }, {
@@ -1095,7 +1364,7 @@ int main()
             .dimension = WGPUTextureDimension_2D, .format = kDepthFormat,
             .sizeKind = SizeKind::Absolute, .absolute = { kShadowSize, kShadowSize, kNumCascades },
         });
-        auto sceneUbo = rg->create_buffer(WEBGPU_STR("scene.ubo"), { .size = sizeof(SceneUBO) });
+        sceneUbo = rg->create_buffer(WEBGPU_STR("scene.ubo"), { .size = sizeof(SceneUBO) });
         ResourceHandle aoTex{};   // only on the SSAO path
 
         // 1) gbuffer: raymarch the SDF -> albedo / normal / roughness (MRT) + linear depth.
@@ -1562,6 +1831,57 @@ int main()
                     wgpuBindGroupRelease(bg);
                     wgpuBindGroupLayoutRelease(l);
                 });
+        }   // close the present-selection chain (debug / cubemap / bloom / taa / compose / present)
+        }   // ===== end original deferred renderer (closes `if (!pathTracerOn)`) =====
+        else {   // ===== F2: SDF path tracer =====
+            // ping-ponged HDR target: write curr, read prev (last frame's accumulated mean).
+            auto accum = rg->create_temporal_image(WEBGPU_STR("pt.accum"), {
+                .dimension = WGPUTextureDimension_2D, .format = kPtAccumFormat,
+                .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+            });
+            ptUbo = rg->create_buffer(WEBGPU_STR("pt.ubo"), { .size = sizeof(PtUBO) });
+
+            // trace one new sample, fold it into the running mean carried in prev.
+            rg->add_pass(WEBGPU_STR("pt.trace"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.uniform(ptUbo);
+                    b.sampled(accum.prev);
+                    b.color(accum.curr, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, ptTracePipe, ptUbo, accum](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(ptTracePipe, 0);
+                    WGPUBindGroupEntry e[2] = {
+                        { .binding = 0, .buffer = ctx.buffer(ptUbo), .offset = 0, .size = sizeof(PtUBO) },
+                        { .binding = 1, .textureView = ctx.view(accum.prev) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, ptTracePipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
+
+            // tonemap the accumulated HDR result into the swapchain.
+            rg->add_pass(WEBGPU_STR("pt.present"), PassKind::Graphics,
+                [&](GraphBuilder& b) {
+                    b.sampled(accum.curr);
+                    b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+                },
+                [dev, ptPresentPipe, accum](PassContext& ctx) {
+                    WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(ptPresentPipe, 0);
+                    WGPUBindGroupEntry e[1] = {
+                        { .binding = 0, .textureView = ctx.view(accum.curr) },
+                    };
+                    WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                    wgpuRenderPassEncoderSetPipeline(ctx.render, ptPresentPipe);
+                    wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                    wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                    wgpuBindGroupRelease(bg);
+                    wgpuBindGroupLayoutRelease(l);
+                });
         }
 
         // ImGui overlay: last pass. Load keeps the rendered scene; the write to the imported
@@ -1607,6 +1927,7 @@ int main()
         // pile resting ON the ground (centers within a radius of each other) so they overlap into tight
         // concave necks and sit in ground contact -- that's where SSAO actually darkens. Spread them
         // out and the AO has nothing to occlude.
+        if (!pathTracerOn) {
         SceneUBO sb{};
         float t = (float)getTime();
         const float gy = -1.5f;                                  // ground plane height (matches map())
@@ -1632,6 +1953,16 @@ int main()
         sb.time = t;
         sb.debugMode = (uint32_t)debugMode;
         wgpuQueueWriteBuffer(q, rg->node(sceneUbo)->buffer, 0, &sb, sizeof(sb));
+        } else {
+            // path-tracer uniforms: camera basis + accumulation/quality knobs (scene lives in the shader).
+            PtUBO ptu{};
+            for (int i = 0; i < 3; ++i) { ptu.camPos[i] = camPos[i]; ptu.camFwd[i] = fwd[i]; ptu.camRight[i] = right[i]; ptu.camUp[i] = up[i]; }
+            ptu.resolution[0] = (float)cfg.width; ptu.resolution[1] = (float)cfg.height;
+            ptu.accumFrame = ptAccum;
+            ptu.maxBounces = (uint32_t)ptMaxBounces;
+            ptu.spp        = (uint32_t)ptSpp;
+            wgpuQueueWriteBuffer(q, rg->node(ptUbo)->buffer, 0, &ptu, sizeof(ptu));
+        }
 
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev, nullptr);
         rg->execute(enc, q);
@@ -1650,6 +1981,8 @@ int main()
 
     // ---- teardown --------------------------------------------------------------------------------
     wgpuSamplerRelease(linSampler);
+    wgpuRenderPipelineRelease(ptPresentPipe);
+    wgpuRenderPipelineRelease(ptTracePipe);
     wgpuRenderPipelineRelease(cubeSamplePipe);
     wgpuRenderPipelineRelease(bloomCompositePipe);
     wgpuRenderPipelineRelease(bloomUpPipe);
