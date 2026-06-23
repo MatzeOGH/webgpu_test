@@ -75,7 +75,7 @@ static size_t sv_length(WGPUStringView s)
 }
 
 // Owns GPU resources that must outlive the per-frame graph teardown -- today, temporal/history textures
-// (TAA, accumulation, ping-pong). One Entry per logical temporal resource, keyed by name content (the
+// (temporal accumulation, history feedback). One Entry per logical temporal resource, keyed by name content (the
 // graph copies names into the per-frame arena, so the pointers don't survive between frames). Each Entry
 // holds two physical textures the graph ping-pongs: layer 0 (current) maps to the opposite slot each
 // frame, so last frame's "current" is this frame's "previous" for free.
@@ -302,6 +302,46 @@ struct GraphAllocator
     // because they cache GPU textures across frames on purpose (history ping-pong + transient reuse).
     PersistentResourcePool pool;        // name-keyed temporal/history textures
     TransientResourcePool  transient;   // descriptor-keyed per-frame texture cache
+
+    // 1x1 identity textures backing kNullTexture reads (PassContext::view_or_default): the feature-off
+    // value for an optional sampled input (e.g. 1.0/white for a no-op multiply, 0.0/black for a no-op
+    // add). keyed by (dim, sampleType, identity), lazily created, cached across frames, leaked at
+    // shutdown like the rest of the allocator. Float sampleType only today -> a 1x1 RGBA8Unorm texture;
+    // extend if a depth/cube default is ever needed.
+    struct DefaultView { WGPUTextureViewDimension dim; WGPUTextureSampleType st; float identity; WGPUTextureView view; };
+    DefaultView defaultViews[8]{};
+    uint32_t    defaultViewCount{};
+
+    WGPUTextureView default_view(WGPUDevice device, WGPUQueue queue,
+                                 WGPUTextureViewDimension dim, WGPUTextureSampleType st, float identity)
+    {
+        for (uint32_t i = 0; i < defaultViewCount; ++i)
+            if (defaultViews[i].dim == dim && defaultViews[i].st == st && defaultViews[i].identity == identity)
+                return defaultViews[i].view;
+
+        WGPUTextureDescriptor td{
+            .usage         = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
+            .dimension     = WGPUTextureDimension_2D,
+            .size          = { 1, 1, 1 },
+            .format        = WGPUTextureFormat_RGBA8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount   = 1,
+        };
+        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
+        const uint8_t v = (uint8_t)(identity * 255.0f);
+        const uint8_t px[4] = { v, v, v, 255 };
+        WGPUTexelCopyTextureInfo dst{ .texture = tex, .mipLevel = 0, .origin = { 0, 0, 0 }, .aspect = WGPUTextureAspect_All };
+        WGPUTexelCopyBufferLayout layout{ .offset = 0, .bytesPerRow = 4, .rowsPerImage = 1 };
+        WGPUExtent3D ext{ 1, 1, 1 };
+        wgpuQueueWriteTexture(queue, &dst, px, sizeof(px), &layout, &ext);
+        WGPUTextureViewDescriptor vd{
+            .format = WGPUTextureFormat_RGBA8Unorm, .dimension = dim,
+            .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = 1,
+        };
+        WGPUTextureView view = wgpuTextureCreateView(tex, &vd);
+        if (defaultViewCount < 8) defaultViews[defaultViewCount++] = { dim, st, identity, view };
+        return view;
+    }
 
     // alignment must be a power of two
     static constexpr size_t align_up(size_t value, size_t alignment)
@@ -585,7 +625,7 @@ static bool access_is_write(AccessType t)
 #if RG_VALIDATE
 // do two accesses to the SAME resource in ONE pass (one usage scope) conflict? read+read never does.
 // disjoint subresources never do either: WebGPU usage scopes are per-(mip,layer), so sampling mip i while
-// rendering into mip j!=i is legal (the bloom downsample pattern). the lone same-subresource read+write
+// rendering into mip j!=i is legal (a mip-chain downsample/upsample pass). the lone same-subresource read+write
 // exception is StorageRead+StorageWrite: that is how the graph spells a read-modify-write storage binding
 // (var<storage, read_write>). One writable-storage usage, not an alias (the "multi-writer chain" test +
 // the sweep's WAR self-guard depend on it). Any other same-subresource pairing involving a write is
@@ -708,6 +748,9 @@ TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const Text
         resouce->absolute = desc.absolute;
         resouce->mipLevelCount = desc.mipLevelCount ? desc.mipLevelCount : 1;
         resouce->sampleCount = desc.sampleCount ? desc.sampleCount : 1;
+        // ponytail: a multisampled history layer is creatable but prev can only be an attachment/resolve
+        // target -- sampling an MSAA texture is illegal (Dawn rejects it) and reading prev is the whole
+        // point of history. left to Dawn rather than forbidden here.
         list_append(&s.m_resouces, resouce);
         if (i == 0) out.curr = resouce->handle; else out.prev = resouce->handle;
     }
@@ -1152,6 +1195,16 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
     return graph->node(h)->view;
 }
 
+// resolve h to its view, or -- for kNullTexture -- a cached 1x1 identity view of the requested shape.
+// lets an always-on pass bind an optional sampled input without a separate "feature off" pipeline.
+WGPUTextureView PassContext::view_or_default(ResourceHandle h, WGPUTextureViewDimension dim,
+                                             WGPUTextureSampleType sampleType, float identity) const
+{
+    if (h.id) return graph->node(h)->view;
+    RenderGraphStorage& s = *storage(graph);
+    return s.m_allocator->default_view(s.m_device, queue, dim, sampleType, identity);
+}
+
 WGPUTexture PassContext::texture(ResourceHandle h) const
 {
     return graph->node(h)->texture;
@@ -1345,6 +1398,7 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
                        uint32_t baseMip, uint32_t baseLayer,
                        WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
+    if (!handle.id) return;   // kNullTexture: record nothing -- no dependency, no usage bit, no view lookup later
 #if RG_VALIDATE
     // immediate (declaration-time) usage check: fires at the exact b.sampled()/b.storage_write() call
     // site, not deferred to compile(). A pass is one WebGPU usage scope; a resource may not be aliased
@@ -1387,6 +1441,29 @@ void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t bas
 {
     // single-sample target the preceding color() resolves into; execute() pairs it with the most recent
     // color() by order. load/store/clear are unused (a resolve has no load op of its own).
+#if RG_VALIDATE
+    // pairing is positional, so a resolve() before any color(), or a second resolve() on a color that
+    // already has one, is silently dropped in execute() -- the access never reaches Dawn, so Dawn can't
+    // catch it. assert at the bad call instead. scan back to whichever came last: a color (this resolve
+    // pairs with it) or another resolve (that color is already resolved).
+    bool pairedColor = false, doubleResolve = false;
+    for (uint32_t i = m_new_pass->accessCount; i-- > 0; ) {
+        AccessType t = m_new_pass->accesses[i].type;
+        if (t == AccessType::ColorAttachment)   { pairedColor   = true; break; }
+        if (t == AccessType::ResolveAttachment) { doubleResolve = true; break; }
+    }
+    if (doubleResolve) {
+        std::printf("[RenderGraph] error: pass \"%.*s\" calls resolve() twice for one color() -- one "
+                    "resolve target per color attachment.\n",
+                    (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "");
+        assert(false && "RenderGraph: resolve() called twice for one color() in a pass");
+    } else if (!pairedColor) {
+        std::printf("[RenderGraph] error: pass \"%.*s\" calls resolve() with no preceding color() -- a "
+                    "resolve target pairs with the color() declared just before it.\n",
+                    (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "");
+        assert(false && "RenderGraph: resolve() with no preceding color() in a pass");
+    }
+#endif
     use(handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 

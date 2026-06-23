@@ -460,9 +460,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	//   * temporal: create_temporal_image makes two resource nodes sharing a name -- curr (temporalIndex 0,
 	//     written THIS frame for next) and prev (temporalIndex 1, read this frame = LAST frame's curr; the
 	//     pool rotates two physical textures). cross-frame, so no in-frame edge joins the pair.
-	//   * external input: an IMPORTED resource read with no in-graph writer (importe_image'd, value from
-	//     outside the frame). host-uploaded transient buffers (uniforms) also lack a writer but are skipped --
-	//     they're read almost everywhere, so a node per use site swamps the view.
+	//   * external input: an IMPORTED texture read with no in-graph writer (importe_image'd, value from
+	//     outside the frame). buffers are skipped wholesale (the Kind::Buffer guard below) -- uniforms get
+	//     import_buffer'd and read almost everywhere, so a node per use site would swamp the view.
 	//   * present: an imported resource that IS written -- the swapchain, whose final value leaves to display.
 	struct TNode { bool isRead; int passBox, pin; ResourceNode* res; int col; float w, h; const char* cap; ImU32 tint; int li; };
 	static std::vector<TNode> tnodes; tnodes.clear();

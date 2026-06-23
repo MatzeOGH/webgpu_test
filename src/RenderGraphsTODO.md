@@ -15,7 +15,7 @@
 ## Medium Priority
 
 [] resource type validation: surface ResourceNode::Kind (Texture/Buffer) at the API layer and reject mismatched access (e.g. vertex_buffer() on a texture handle, sampled() on a buffer)
-[] MSAA support: sampleCount on TextureDesc + resolve attachment wiring in execute() (realize() currently hardcodes sampleCount=1, mipLevelCount=1)
+[x] MSAA support: sampleCount on TextureDesc (threaded through both pools + realize()) + resolve attachment wiring (b.resolve() -> AccessType::ResolveAttachment -> WGPURenderPassColorAttachment.resolveTarget). depth/stencil attachment now also carries stencil load/store/clear ops. see docs/rendergraph-attachments.md
 [] add instrumentation to measure compile() time
 [] camera-cut null-reset for temporal/persistent resources: on a camera cut (or first frame) the history read is stale garbage -- a way to flag a temporal resource's prev as invalid so the pass clears/ignores it instead of smearing. see docs/rendergraph-null-textures.md
 
