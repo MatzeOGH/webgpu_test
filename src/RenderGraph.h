@@ -89,6 +89,10 @@ struct GraphBuilder
 
     // color attachment
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1}, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    // MSAA resolve target for the preceding color() (positional: call right after the color() it resolves).
+    // the target must be single-sample, same format + size as that multisample color; Dawn validates. the
+    // target may be imported (e.g. resolve a multisample color straight into the swapchain).
+    void resolve(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // depth stencil attachment
     void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // depth stencil attachment, read-only (depth/stencil test, no write; e.g. lighting depth-testing
@@ -122,6 +126,9 @@ struct TextureDesc
     ResourceHandle relativeTo{};
     WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;   // depthOrArrayLayers = array/cube layers (6 for a cube)
     uint32_t mipLevelCount = 1;                    // > 1 for a mip chain (bloom, mip-gen); per-mip size is implicit
+    uint32_t sampleCount = 1;                      // > 1 = MSAA (multisampled attachment)
+    // ponytail: sampleCount > 1 implies a 2D, mipLevelCount-1, non-storage texture and every attachment in
+    // a pass must share it; not enforced here -- Dawn validates at texture/render-pass creation.
     // ponytail: hazards stay whole-resource. a mip chain still serializes right (each step RAW-depends on
     // the shared handle); independent subresource passes just over-order, which is free here (the graph
     // topo-sorts, it doesn't emit barriers). go per-(mip,layer) only if that over-ordering ever costs.

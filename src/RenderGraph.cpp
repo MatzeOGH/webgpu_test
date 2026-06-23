@@ -33,6 +33,7 @@ enum struct AccessType : uint8_t
     ColorAttachment,         // attachment      write   tex RenderAttachment
     DepthStencilAttachment,  // attachment      write   tex RenderAttachment  (depth/stencil test + write)
     DepthStencilReadOnly,    // attachment-read read    tex RenderAttachment  (test only, depthReadOnly; no write hazard)
+    ResolveAttachment,       // attachment      write   tex RenderAttachment  (single-sample target an MSAA color resolves into)
     Sampled,                 // constant        read    tex TextureBinding
     StorageRead,             // storage-read    read    tex StorageBinding / buf Storage
     StorageWrite,            // storage         write   tex StorageBinding / buf Storage
@@ -91,6 +92,7 @@ struct PersistentResourcePool
         WGPUTextureFormat    format        = WGPUTextureFormat_Undefined;
         WGPUTextureDimension dim           = WGPUTextureDimension_2D;
         uint32_t             mipLevelCount = 1;
+        uint32_t             sampleCount   = 1;
         WGPUTextureUsage     usage         = {};  // running union of every layer's usage
         WGPUTextureUsage     usageAtCreate = {};
     };
@@ -127,16 +129,17 @@ struct PersistentResourcePool
     // (re)create the two textures when missing or the descriptor changed (lazy: needs the device + the
     // usage union, both known only at realize()).
     void realize_entry(Entry* e, WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
-                       WGPUTextureDimension dim, uint32_t mipLevelCount)
+                       WGPUTextureDimension dim, uint32_t mipLevelCount, uint32_t sampleCount)
     {
         bool same = e->created
             && e->size.width == size.width && e->size.height == size.height
             && e->size.depthOrArrayLayers == size.depthOrArrayLayers
             && e->format == format && e->dim == dim && e->mipLevelCount == mipLevelCount
+            && e->sampleCount == sampleCount
             && e->usageAtCreate == e->usage;
         if (same) return;
         destroy(e);
-        e->size = size; e->format = format; e->dim = dim; e->mipLevelCount = mipLevelCount; e->usageAtCreate = e->usage;
+        e->size = size; e->format = format; e->dim = dim; e->mipLevelCount = mipLevelCount; e->sampleCount = sampleCount; e->usageAtCreate = e->usage;
         for (uint32_t i = 0; i < kLayers; ++i) {
             WGPUTextureDescriptor d{
                 .label         = WGPUStringView{ e->name.c_str(), e->name.size() },
@@ -145,7 +148,7 @@ struct PersistentResourcePool
                 .size          = size,
                 .format        = format,
                 .mipLevelCount = mipLevelCount,
-                .sampleCount   = 1,
+                .sampleCount   = sampleCount,
             };
             e->tex[i]  = wgpuDeviceCreateTexture(device, &d);
             e->view[i] = wgpuTextureCreateView(e->tex[i], nullptr);
@@ -182,6 +185,7 @@ struct TransientResourcePool
         WGPUTextureFormat    format = WGPUTextureFormat_Undefined;
         WGPUTextureDimension dim    = WGPUTextureDimension_2D;
         uint32_t             mipLevelCount = 1;
+        uint32_t             sampleCount   = 1;
         WGPUTextureUsage     usage  = {};
 
         WGPUTexture          tex    = {};
@@ -211,12 +215,12 @@ struct TransientResourcePool
     // hand out a free texture matching the descriptor, else create one. inUse (not the frame stamp)
     // is the claim, so two simultaneously-live same-descriptor resources get two distinct textures.
     void acquire(WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
-                 WGPUTextureDimension dim, uint32_t mipLevelCount, WGPUTextureUsage usage,
+                 WGPUTextureDimension dim, uint32_t mipLevelCount, uint32_t sampleCount, WGPUTextureUsage usage,
                  WGPUTexture& outTex, WGPUTextureView& outView)
     {
         for (Entry& e : entries) {
             if (!e.inUse && e.format == format && e.dim == dim && e.usage == usage
-                && e.mipLevelCount == mipLevelCount
+                && e.mipLevelCount == mipLevelCount && e.sampleCount == sampleCount
                 && e.size.width == size.width && e.size.height == size.height
                 && e.size.depthOrArrayLayers == size.depthOrArrayLayers) {
                 e.inUse = true;
@@ -227,14 +231,14 @@ struct TransientResourcePool
         }
         entries.emplace_back();
         Entry& e = entries.back();
-        e.size = size; e.format = format; e.dim = dim; e.mipLevelCount = mipLevelCount; e.usage = usage;
+        e.size = size; e.format = format; e.dim = dim; e.mipLevelCount = mipLevelCount; e.sampleCount = sampleCount; e.usage = usage;
         WGPUTextureDescriptor d{
             .usage         = usage,
             .dimension     = dim,
             .size          = size,
             .format        = format,
             .mipLevelCount = mipLevelCount,
-            .sampleCount   = 1,
+            .sampleCount   = sampleCount,
         };
         e.tex  = wgpuDeviceCreateTexture(device, &d);
         e.view = wgpuTextureCreateView(e.tex, nullptr);
@@ -447,6 +451,7 @@ struct ResourceNode
     ResourceHandle relativeToHandle{};
     WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;
     uint32_t mipLevelCount = 1;   // > 1 = mip chain; created once, per-mip views built at bind/attach time
+    uint32_t sampleCount = 1;     // > 1 = MSAA (multisampled attachment)
 
     // buffer fields
     uint64_t bufferSize{};
@@ -567,6 +572,7 @@ static bool access_is_write(AccessType t)
 {
     return t == AccessType::ColorAttachment
         || t == AccessType::DepthStencilAttachment
+        || t == AccessType::ResolveAttachment   // the resolve writes its single-sample target
         || t == AccessType::StorageWrite
         || t == AccessType::CopyDst;
 }
@@ -610,6 +616,7 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
     resouce->relativeToHandle = desc.relativeTo;
     resouce->absolute = desc.absolute;
     resouce->mipLevelCount = desc.mipLevelCount ? desc.mipLevelCount : 1;
+    resouce->sampleCount = desc.sampleCount ? desc.sampleCount : 1;
 
     list_append(&s.m_resouces, resouce);
 
@@ -694,6 +701,8 @@ TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const Text
         resouce->scaleY = desc.scaleY;
         resouce->relativeToHandle = desc.relativeTo;
         resouce->absolute = desc.absolute;
+        resouce->mipLevelCount = desc.mipLevelCount ? desc.mipLevelCount : 1;
+        resouce->sampleCount = desc.sampleCount ? desc.sampleCount : 1;
         list_append(&s.m_resouces, resouce);
         if (i == 0) out.curr = resouce->handle; else out.prev = resouce->handle;
     }
@@ -969,7 +978,8 @@ bool RenderGraph::compile()
                 switch (p->accesses[i].type) {
                   case AccessType::ColorAttachment:
                   case AccessType::DepthStencilAttachment:
-                  case AccessType::DepthStencilReadOnly:   r->texUsage |= WGPUTextureUsage_RenderAttachment; break;
+                  case AccessType::DepthStencilReadOnly:
+                  case AccessType::ResolveAttachment:      r->texUsage |= WGPUTextureUsage_RenderAttachment; break;
                   case AccessType::Sampled:                r->texUsage |= WGPUTextureUsage_TextureBinding;  break;
                   case AccessType::StorageRead:
                   case AccessType::StorageWrite:
@@ -1170,7 +1180,7 @@ void RenderGraph::realize(WGPUDevice device)
         if (!r->persistent || !r->texUsage) continue;
         PersistentResourcePool::Entry* e = pool.find(r->name);
         if (!e) continue;
-        pool.realize_entry(e, device, r->resolved, r->format, r->dimension, r->mipLevelCount);
+        pool.realize_entry(e, device, r->resolved, r->format, r->dimension, r->mipLevelCount, r->sampleCount);
         uint32_t sl = pool.slot(*e, r->temporalIndex);
         r->texture = e->tex[sl];
         r->view    = e->view[sl];
@@ -1182,7 +1192,7 @@ void RenderGraph::realize(WGPUDevice device)
             if (!r->texUsage) continue;
             // reuse a pooled texture matching this descriptor instead of recreating one. the pool
             // owns it -> release_resources() leaves it alone and recycles/evicts at end_frame().
-            transient.acquire(device, r->resolved, r->format, r->dimension, r->mipLevelCount, r->texUsage,
+            transient.acquire(device, r->resolved, r->format, r->dimension, r->mipLevelCount, r->sampleCount, r->texUsage,
                               r->texture, r->view);
         } else {
             // buffers stay on the direct path: the lone transient buffer (scene ubo) is tiny and
@@ -1222,6 +1232,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             // gather declared attachments from the access list -> WebGPU render pass descriptor
             WGPURenderPassColorAttachment color[8]{};
             uint32_t nc = 0;
+            uint32_t lastColorSlot = ~0u;   // slot of the most recent color() -> a following resolve() patches its resolveTarget
             WGPURenderPassDepthStencilAttachment depth{};
             bool hasDepth = false;
 
@@ -1251,13 +1262,20 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                 ResourceNode* r = node(a.handle);
                 if (!r) continue;
                 if (a.type == AccessType::ColorAttachment && nc < 8) {
-                    color[nc++] = WGPURenderPassColorAttachment{
-                        .view       = attach_view(r, a),
-                        .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
-                        .loadOp     = a.loadOp,
-                        .storeOp    = a.storeOp,
-                        .clearValue = a.clearColor,
+                    color[nc] = WGPURenderPassColorAttachment{
+                        .view          = attach_view(r, a),
+                        .depthSlice    = WGPU_DEPTH_SLICE_UNDEFINED,
+                        .resolveTarget = nullptr,   // patched below if a resolve() in this pass targets this slot
+                        .loadOp        = a.loadOp,
+                        .storeOp       = a.storeOp,
+                        .clearValue    = a.clearColor,
                     };
+                    lastColorSlot = nc++;
+                } else if (a.type == AccessType::ResolveAttachment) {
+                    // resolve target for the most recent color() (positional pairing). attach_view builds the
+                    // right single-sample view -- sample count is a texture property, not in the view
+                    // descriptor -- or returns the caller-owned view for an imported target (e.g. swapchain).
+                    if (lastColorSlot != ~0u) color[lastColorSlot].resolveTarget = attach_view(r, a);
                 } else if (a.type == AccessType::DepthStencilAttachment || a.type == AccessType::DepthStencilReadOnly) {
                     depth = WGPURenderPassDepthStencilAttachment{
                         .view            = attach_view(r, a),
@@ -1265,7 +1283,9 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                         .depthStoreOp    = a.storeOp,
                         .depthClearValue = a.clearDepth,
                         .depthReadOnly   = a.type == AccessType::DepthStencilReadOnly,
-                        // stencil ops left Undefined -> depth-only formats (e.g. Depth32Float)
+                        // ponytail: stencil ops left Undefined -> depth-only formats (e.g. Depth32Float) only.
+                        // for a depth+stencil format add stencilLoadOp/StoreOp/clear to ResourceAccess + optional
+                        // depth_stencil() params and set them on this struct.
                     };
                     hasDepth = true;
                 }
@@ -1346,6 +1366,13 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
 void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
 {
     use(handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
+}
+
+void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+{
+    // single-sample target the preceding color() resolves into; execute() pairs it with the most recent
+    // color() by order. load/store/clear are unused (a resolve has no load op of its own).
+    use(handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer)
