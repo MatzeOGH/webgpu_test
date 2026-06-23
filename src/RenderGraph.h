@@ -207,7 +207,9 @@ private:
     void end_pass(GraphBuilder& builder);
 };
 
-GraphAllocator* create_allocator();
+// Creates an instance of the `GraphAllocator` with a given areana size
+// default to to 1MB 
+GraphAllocator* create_allocator(size_t arenaSize = 1u << 20);
 RenderGraph* create_render_graph(GraphAllocator* allocator);
 
 // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)

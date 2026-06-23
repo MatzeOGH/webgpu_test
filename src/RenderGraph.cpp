@@ -521,9 +521,9 @@ static RenderGraphStorage* storage(RenderGraph* rg)
         + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
 }
 
-GraphAllocator* create_allocator(){
+GraphAllocator* create_allocator(size_t arenaSize){
     GraphAllocator* allocator = new GraphAllocator;
-    size_t capacity = 1u << 20;// alloc 1 MB
+    size_t capacity = arenaSize;
     allocator->base = (uint8_t*)malloc(capacity);
     allocator->capacity = capacity;
     return allocator;
@@ -751,8 +751,7 @@ enum struct HazardKind : uint8_t { RAW, WAW, WAR };
 // any writer of its resource simply binds to "no producer" (no edge). Detecting that authoring error
 // is left to compile()'s post-cull pass, which sees the final schedule; the sweep stays edge-only.
 template<typename OnEdge>
-static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_id,
-                                    OnEdge&& onEdge)
+static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_id, OnEdge&& onEdge)
 {
     // per resource id (1..next_id-1): the pass holding the current version, and the readers of that
     // version not yet retired by a newer write.
@@ -1320,7 +1319,7 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
     // are fine; see in_pass_accesses_conflict.
     // ponytail: WebGPU itself permits multiple writable-storage uses in one scope; the graph is stricter
     // because it has no way to synchronize two writes inside a pass; relax if a shader ever needs it.
-    if (m_new_pass && handle.id) {
+    if (handle.id) {
         const bool w = access_is_write(type);
         for (uint32_t i = 0; i < m_new_pass->accessCount; ++i) {
             if (m_new_pass->accesses[i].handle.id != handle.id) continue;
@@ -1339,7 +1338,7 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
     }
 #endif
 
-    if (m_new_pass && m_new_pass->accessCount < PassNode::kMaxAccess)
+    if (m_new_pass->accessCount < PassNode::kMaxAccess)
         m_new_pass->accesses[m_new_pass->accessCount++] = { handle, type, load, store, clear, clearDepth, baseMip, baseLayer };
     // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it
 }
