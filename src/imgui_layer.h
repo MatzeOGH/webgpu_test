@@ -182,6 +182,8 @@ static void rg_bytes_str(uint64_t bytes, char* out, size_t n)
 static ImU32 rg_with_alpha(ImU32 c, ImU32 a) { return (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT); }
 static constexpr ImU32 kRGWrite = IM_COL32(232, 145, 64, 255);   // write / output pin
 static constexpr ImU32 kRGRead = IM_COL32(74, 158, 206, 255);   // read / input pin
+static constexpr ImU32 kRGExt = IM_COL32(118, 196, 132, 255);   // external-input source node (imported read)
+static constexpr ImU32 kRGPresent = IM_COL32(196, 122, 214, 255);   // present / display sink node (imported output)
 
 // DAG view -----------------------------------------------------------------------------------------
 // node-graph layout: one box per pass in dependency columns, one pin per resource access (reads left,
@@ -260,6 +262,16 @@ static int rg_out_slot(PassNode* p, uint32_t id)
 	return -1;
 }
 
+// input-pin slot index of resource id on pass p (reads only), mirroring rg_out_slot. matches the
+// encounter-order slot the pin loop assigns, so it lands on the right pin centre.
+static int rg_in_slot(PassNode* p, uint32_t id)
+{
+	int slot = 0;
+	for (uint32_t k = 0; k < p->accessCount; ++k)
+		if (rg_access_reads(p->accesses[k])) { if (p->accesses[k].handle.id == id) return slot; ++slot; }
+	return -1;
+}
+
 // mark seed + everything it transitively depends on (the upstream producer cone): DFS over predecessor
 // edges. iterative -- a long pass chain would overflow a recursive stack.
 static void rg_mark_cone(const RgDagBox* box, int n, int seed, bool* inCone)
@@ -308,11 +320,70 @@ static float rg_seg_d2(ImVec2 p, ImVec2 a, ImVec2 b)
 	return dx * dx + dy * dy;
 }
 
+// true graph output for the halo: writes an *imported* resource (swapchain) whose value leaves the
+// frame to be presented. compile()'s p->sink also fires for passes that only write a temporal/history
+// layer (persistent, read next frame) -- those keep the pass alive but aren't graph outputs, so the
+// halo skips them.
+static bool rg_pass_is_sink(RenderGraph* rg, PassNode* p)
+{
+	for (uint32_t i = 0; i < p->accessCount; ++i) {
+		if (!access_is_write(p->accesses[i].type)) continue;
+		ResourceNode* r = rg->node(p->accesses[i].handle);
+		if (r && r->imported) return true;
+	}
+	return false;
+}
+
+// one pin glyph: round for textures, square for buffers. filled = normal, hollow = external input (no
+// in-graph producer). square half-extent == circle radius, so the hover/lock ring (kPinR + 3) still
+// frames either shape.
+static void rg_draw_pin(ImDrawList* dl, ImVec2 c, float r, ImU32 col, bool filled, bool buffer)
+{
+	if (buffer) {
+		ImVec2 a(c.x - r, c.y - r), b(c.x + r, c.y + r);
+		if (filled) dl->AddRectFilled(a, b, col, 1.5f);
+		else        dl->AddRect(a, b, col, 1.5f, 0, 2.0f);
+	}
+	else {
+		if (filled) dl->AddCircleFilled(c, r, col, 12);
+		else        dl->AddCircle(c, r, col, 12, 2.0f);
+	}
+}
+
+// dashed cubic bezier -- ImDrawList has no dashed stroke, so sample the curve and draw every other span.
+// used by the temporal feedback links so they read as cross-frame, distinct from the solid data edges.
+static void rg_dashed_cubic(ImDrawList* dl, ImVec2 p0, ImVec2 p1, ImVec2 p2, ImVec2 p3, ImU32 col, float th)
+{
+	constexpr int kSeg = 24;
+	ImVec2 prev = p0;
+	for (int i = 1; i <= kSeg; ++i) {
+		float t = (float)i / kSeg, u = 1 - t, w0 = u*u*u, w1 = 3*u*u*t, w2 = 3*u*t*t, w3 = t*t*t;
+		ImVec2 q(w0*p0.x + w1*p1.x + w2*p2.x + w3*p3.x, w0*p0.y + w1*p1.y + w2*p2.y + w3*p3.y);
+		if (i & 1) dl->AddLine(prev, q, col, th);   // every other span = a dash
+		prev = q;
+	}
+}
+
+// little filled arrowhead at `tip`, pointing along (tip - from). marks the read end of a feedback link.
+static void rg_arrowhead(ImDrawList* dl, ImVec2 from, ImVec2 tip, ImU32 col, float sz)
+{
+	float dx = tip.x - from.x, dy = tip.y - from.y, L = std::sqrt(dx*dx + dy*dy);
+	if (L < 1e-3f) return;
+	dx /= L; dy /= L;
+	ImVec2 a(tip.x - dx*sz - dy*sz*0.5f, tip.y - dy*sz + dx*sz*0.5f);
+	ImVec2 b(tip.x - dx*sz + dy*sz*0.5f, tip.y - dy*sz - dx*sz*0.5f);
+	dl->AddTriangleFilled(tip, a, b, col);
+}
+
 static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 {
 	constexpr float kBoxW = 190.0f, kColGap = 64.0f, kRowGap = 20.0f;
 	constexpr float kHeaderH = 22.0f, kFooterH = 14.0f, kPinRowH = 18.0f, kMinBodyH = 12.0f;
 	constexpr float kPinR = 5.0f, kPinHit = 8.0f;
+
+	// virtual nodes (frame-boundary endpoints: temporal read/write so far) -- toggled from the toolbar.
+	// read before the layout pass so disabling them also drops their layout influence (no reserved columns).
+	static bool showVirtual = true;
 
 	// ---- layout pass (sink-anchored, Sugiyama-style). columns place each pass left of what depends on
 	// it: column = longest distance TO a sink over the FULL dependency graph, so sinks land rightmost and
@@ -381,13 +452,57 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	for (int i = 0; i < n; ++i) colOf[i] = remap[colOf[i]];
 	maxDist = nextCol ? nextCol - 1 : 0;
 
+	// ---- virtual nodes: frame-boundary endpoints drawn as real DAG nodes so the column/barycenter/y code
+	// below places them like any pass (no bespoke overlay). each attaches to ONE pass pin -- a read node one
+	// column BEFORE its reader, a write node one column AFTER its writer -- so a widely-read resource gets a
+	// small node at each use site (like repeated power symbols) instead of one node fanning edges everywhere.
+	// three kinds, all gated by the toolbar toggle:
+	//   * temporal: create_temporal_image makes two resource nodes sharing a name -- curr (temporalIndex 0,
+	//     written THIS frame for next) and prev (temporalIndex 1, read this frame = LAST frame's curr; the
+	//     pool rotates two physical textures). cross-frame, so no in-frame edge joins the pair.
+	//   * external input: an IMPORTED resource read with no in-graph writer (importe_image'd, value from
+	//     outside the frame). host-uploaded transient buffers (uniforms) also lack a writer but are skipped --
+	//     they're read almost everywhere, so a node per use site swamps the view.
+	//   * present: an imported resource that IS written -- the swapchain, whose final value leaves to display.
+	struct TNode { bool isRead; int passBox, pin; ResourceNode* res; int col; float w, h; const char* cap; ImU32 tint; int li; };
+	static std::vector<TNode> tnodes; tnodes.clear();
+	auto push_tnode = [&](bool isRead, int passBox, int pin, ResourceNode* res, const char* cap, ImU32 tint) {
+		char b[48]; std::snprintf(b, sizeof b, "%.*s", (int)res->name.length, res->name.data ? res->name.data : "?");
+		ImVec2 ns = ImGui::CalcTextSize(b), cs = ImGui::CalcTextSize(cap);
+		float w = (ns.x > cs.x ? ns.x : cs.x) + 16, h = ns.y + cs.y + 10;
+		tnodes.push_back({ isRead, passBox, pin, res, isRead ? colOf[passBox] - 1 : colOf[passBox] + 1, w, h, cap, tint, -1 });
+	};
+	if (showVirtual)
+		for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+			if (r->persistent) {   // temporal: write node at the curr writer, read node at each prev reader
+				bool curr = r->temporalIndex == 0;
+				for (int i = 0; i < n; ++i) {
+					int sl = curr ? rg_out_slot(box[i].p, r->handle.id) : rg_in_slot(box[i].p, r->handle.id);
+					if (sl >= 0) push_tnode(!curr, i, sl, r, curr ? "next frame" : "last frame", curr ? kRGWrite : kRGRead);
+				}
+				continue;
+			}
+			int lwb = -1, lws = -1;   // last writer, if any
+			for (int i = 0; i < n; ++i) { int sl = rg_out_slot(box[i].p, r->handle.id); if (sl >= 0) { lwb = i; lws = sl; } }
+			if (lwb < 0) {             // no in-graph writer
+				if (r->imported)       // external input: imported, read from outside -> source node at each reader pin
+					for (int i = 0; i < n; ++i) { int sl = rg_in_slot(box[i].p, r->handle.id); if (sl >= 0) push_tnode(true, i, sl, r, "imported", kRGExt); }
+			}
+			else if (r->imported)      // present: imported + written -> sink node at the last writer
+				push_tnode(false, lwb, lws, r, "present", kRGPresent);
+		}
+	// keep columns in [0, maxDist]: shift everything right if a read node landed left of 0, extend for writes.
+	int tmin = 0; for (TNode& t : tnodes) if (t.col < tmin) tmin = t.col;
+	if (tmin < 0) { for (int i = 0; i < n; ++i) colOf[i] -= tmin; maxDist -= tmin; for (TNode& t : tnodes) t.col -= tmin; }
+	for (TNode& t : tnodes) if (t.col > maxDist) maxDist = t.col;
+
 	// ===== layered routing: real boxes + dummy waypoints. an edge that skips columns gets a dummy in each
 	// crossed column, reserving a lane there so it never hides behind a box (Sugiyama virtual nodes).
-	struct LNode { int col, box; float x, y; };          // box == -1 => dummy; x,y = canvas-local routing point
+	struct LNode { int col, box, tn; float x, y; };       // box == -1 => dummy/temporal; tn >= 0 => temporal node
 	struct REdge { int src, dst, sOut, dIn; uint32_t id; int chainN, chain[kRgDagMax]; };
 	static std::vector<LNode> lnode; lnode.clear();
 	static std::vector<REdge> edge;  edge.clear();
-	for (int i = 0; i < n; ++i) lnode.push_back({ colOf[i], i, 0, 0 });   // reals: lnode index == box index
+	for (int i = 0; i < n; ++i) lnode.push_back({ colOf[i], i, -1, 0, 0 });   // reals: lnode index == box index
 
 	// drawn edges (a read pin fed by its producer + parallel-writer siblings), each with a dummy chain
 	// through the columns it skips.
@@ -403,13 +518,16 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 				int sOut = rg_out_slot(box[w].p, id);
 				if (sOut < 0) continue;
 				REdge e{ w, i, sOut, dIn, id, 0, {} };
-				for (int c = colOf[w] + 1; c < colOf[i]; ++c) { e.chain[e.chainN++] = (int)lnode.size(); lnode.push_back({ c, -1, 0, 0 }); }
+				for (int c = colOf[w] + 1; c < colOf[i]; ++c) { e.chain[e.chainN++] = (int)lnode.size(); lnode.push_back({ c, -1, -1, 0, 0 }); }
 				edge.push_back(e);
 			}
 		}
 	}
 
-	// per-column members (reals + dummies) + left/right neighbour lists for the barycenter.
+	// temporal nodes join the layered list as their own (box == -1, tn >= 0) layered nodes.
+	for (int ti = 0; ti < (int)tnodes.size(); ++ti) { tnodes[ti].li = (int)lnode.size(); lnode.push_back({ tnodes[ti].col, -1, ti, 0, 0 }); }
+
+	// per-column members (reals + dummies + temporal) + left/right neighbour lists for the barycenter.
 	const int LN = (int)lnode.size();
 	static std::vector<int> lcol[kRgDagMax];
 	for (int c = 0; c <= maxDist; ++c) lcol[c].clear();
@@ -420,6 +538,11 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		for (int t = 0; t < e.chainN; ++t) { lright[prev].push_back(e.chain[t]); lleft[e.chain[t]].push_back(prev); prev = e.chain[t]; }
 		lright[prev].push_back(e.dst); lleft[e.dst].push_back(prev);
 	}
+	// temporal adjacency: read node sits left of its reader, write node right of its writer. one link each,
+	// enough for the barycenter to order them and y-relax to align them to the pass's row.
+	for (TNode& t : tnodes)
+		if (t.isRead) { lright[t.li].push_back(t.passBox); lleft[t.passBox].push_back(t.li); }
+		else          { lright[t.passBox].push_back(t.li); lleft[t.li].push_back(t.passBox); }
 
 	// barycenter crossing reduction over the layered nodes; from the sinks back, then settle.
 	static std::vector<int> lrank; lrank.assign(LN, 0);
@@ -442,7 +565,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// (within column order + min separation) so edges -- the dummy chains especially -- run straight rather
 	// than zig-zag. x is just the column.
 	const float kLane = 16.0f;
-	auto slotH = [&](int li) { return lnode[li].box >= 0 ? box[lnode[li].box].h : kLane; };
+	auto slotH = [&](int li) { int b = lnode[li].box; if (b >= 0) return box[b].h; int t = lnode[li].tn; return t >= 0 ? tnodes[t].h : kLane; };
 	static std::vector<float> cy; cy.assign(LN, 0.0f);
 	for (int c = 0; c <= maxDist; ++c) { float y = 0; for (int li : lcol[c]) { cy[li] = y + slotH(li) * 0.5f; y += slotH(li) + kRowGap; } }
 	for (int it = 0; it < 8; ++it)
@@ -470,7 +593,16 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 				if (cx < gxMin) gxMin = cx; if (cx + box[b].w > gxMax) gxMax = cx + box[b].w;
 				if (box[b].tl.y < gyMin) gyMin = box[b].tl.y; if (box[b].tl.y + box[b].h > gyMax) gyMax = box[b].tl.y + box[b].h;
 			}
-			else { lnode[li].x = cx; lnode[li].y = cy[li]; }   // x = column left edge, y = lane centre
+			else {
+				lnode[li].x = cx; lnode[li].y = cy[li];   // dummy: column left edge + lane centre
+				int t = lnode[li].tn;
+				if (t >= 0) {   // temporal node: centre in the column slot, include in the view bbox
+					float ctr = cx + kBoxW * 0.5f, hw = tnodes[t].w * 0.5f, hh = tnodes[t].h * 0.5f;
+					lnode[li].x = ctr;
+					if (ctr - hw < gxMin) gxMin = ctr - hw; if (ctr + hw > gxMax) gxMax = ctr + hw;
+					if (cy[li] - hh < gyMin) gyMin = cy[li] - hh; if (cy[li] + hh > gyMax) gyMax = cy[li] + hh;
+				}
+			}
 		}
 	}
 	if (gxMax < gxMin) { gxMin = gyMin = gxMax = gyMax = 0; }   // empty graph
@@ -480,6 +612,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	bool doReset = ImGui::Button("Reset view");
 	ImGui::SameLine(); ImGui::SetNextItemWidth(180);
 	ImGui::InputTextWithHint("##rgfilter", "filter passes...", filter, sizeof filter);
+	ImGui::SameLine(); ImGui::Checkbox("virtual nodes", &showVirtual);
 	const bool filterActive = filter[0] != 0;
 
 	// pannable canvas: a static scroll offset (drag left/middle to pan) + a grid, after the imgui node-
@@ -672,8 +805,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		dl->AddRect(tl, br, edgec, 5.0f, 0, (up || dn) ? 2.5f : 1.0f);
 		dl->AddLine(ImVec2(tl.x, tl.y + kHeaderH), ImVec2(br.x, tl.y + kHeaderH), IM_COL32(255, 255, 255, dim ? 18 : 40));
 
-		// sinks: red halo.
-		if (box[i].p->sink)
+		// sinks: red halo. imported writers only -- temporal/history writers are sinks to the culler
+		// (compile sets p->sink) but aren't graph outputs, so they don't get the halo.
+		if (rg_pass_is_sink(rg, box[i].p))
 			for (int e = 3; e >= 1; --e)
 				dl->AddRect(ImVec2(tl.x - e, tl.y - e), ImVec2(br.x + e, br.y + e), IM_COL32(255, 100, 0, dim ? 80 : 200), 6.0f, 0, 1.0f);
 
@@ -702,12 +836,12 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			char lbl[48]; std::snprintf(lbl, sizeof lbl, "%.*s", (int)rn.length, rn.data ? rn.data : "?");
 			ImVec2 ls = ImGui::CalcTextSize(lbl);
 			const ImU32 lc = dim ? IM_COL32(190, 190, 190, 110) : IM_COL32(230, 230, 230, 255);
+			const bool isBuf = r && r->kind == ResourceNode::Kind::Buffer;   // square pin vs round (texture)
 
 			if (rg_access_reads(acc)) {   // input pin (left); hollow if no in-graph producer (external input)
 				int slot = inS++; ImVec2 c = inPin(i, slot);
 				ImU32 base = dim ? rg_with_alpha(kRGRead, 70) : kRGRead;
-				if (rg_producer_of(box, n, p, acc.handle.id) < 0) dl->AddCircle(c, kPinR, base, 12, 2.0f);
-				else                                              dl->AddCircleFilled(c, kPinR, base, 12);
+				rg_draw_pin(dl, c, kPinR, base, rg_producer_of(box, n, p, acc.handle.id) >= 0, isBuf);
 				if (lockB == i && !lockWrite && slot == lockSlot) dl->AddCircle(c, kPinR + 3.0f, IM_COL32(90, 200, 230, 255), 16, 2.0f);
 				if (i == hovB && !hovWrite && slot == hovSlot) dl->AddCircle(c, kPinR + 3.0f, IM_COL32(255, 255, 255, 255), 16, 2.0f);
 				dl->PushClipRect(ImVec2(c.x + kPinR + 3, c.y - kPinRowH * 0.5f), ImVec2(mid, c.y + kPinRowH * 0.5f), true);
@@ -717,7 +851,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			if (access_is_write(acc.type)) {   // output pin (right)
 				int slot = outS++; ImVec2 c = outPin(i, slot);
 				ImU32 base = dim ? rg_with_alpha(kRGWrite, 70) : kRGWrite;
-				dl->AddCircleFilled(c, kPinR, base, 12);
+				rg_draw_pin(dl, c, kPinR, base, true, isBuf);
 				if (lockB == i && lockWrite && slot == lockSlot) dl->AddCircle(c, kPinR + 3.0f, IM_COL32(90, 200, 230, 255), 16, 2.0f);
 				if (i == hovB && hovWrite && slot == hovSlot) dl->AddCircle(c, kPinR + 3.0f, IM_COL32(255, 255, 255, 255), 16, 2.0f);
 				dl->PushClipRect(ImVec2(mid, c.y - kPinRowH * 0.5f), ImVec2(c.x - kPinR - 3, c.y + kPinRowH * 0.5f), true);
@@ -725,6 +859,28 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 				dl->PopClipRect();
 			}
 		}
+	}
+
+	// ---- virtual endpoint nodes + dashed links, drawn from the layout positions computed above. each node
+	// attaches to one pass pin in the adjacent column: a read/source node feeds an input pin from the left,
+	// a write/sink node is fed by an output pin from the left. tint + caption come from the node's kind.
+	for (TNode& t : tnodes) {
+		if (fout(t.passBox)) continue;
+		ImVec2 c(origin.x + lnode[t.li].x, origin.y + lnode[t.li].y);
+		ImVec2 a(c.x - t.w * 0.5f, c.y - t.h * 0.5f), b(c.x + t.w * 0.5f, c.y + t.h * 0.5f);
+		ImVec2 p, q;
+		if (t.isRead) { q = inPin(t.passBox, t.pin); p = ImVec2(b.x, c.y); }    // node -> reader input pin
+		else          { p = outPin(t.passBox, t.pin); q = ImVec2(a.x, c.y); }   // writer output pin -> node
+		float dx = (q.x - p.x) * 0.5f;
+		rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, t.tint, 2.0f);
+		rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, t.tint, 7.0f);
+
+		char nm[48]; std::snprintf(nm, sizeof nm, "%.*s", (int)t.res->name.length, t.res->name.data ? t.res->name.data : "?");
+		dl->AddRectFilled(a, b, IM_COL32(32, 30, 40, 240), 4.0f);
+		dl->AddRect(a, b, t.tint, 4.0f, 0, 1.5f);
+		ImVec2 ns = ImGui::CalcTextSize(nm), cs = ImGui::CalcTextSize(t.cap);
+		dl->AddText(ImVec2(c.x - ns.x * 0.5f, a.y + 3), IM_COL32(238, 236, 242, 255), nm);
+		dl->AddText(ImVec2(c.x - cs.x * 0.5f, b.y - cs.y - 3), rg_with_alpha(t.tint, 220), t.cap);
 	}
 
 	// ---- tooltip: hovered pin wins; else fall back to the per-pass reads/writes list.
