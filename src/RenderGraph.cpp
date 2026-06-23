@@ -763,6 +763,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
     for (PassNode* p = head; p; p = p->next)
         for (uint32_t i = 0; i < p->accessCount; ++i) {
             uint32_t id = p->accesses[i].handle.id;
+            if (!id) continue;   // invalid/default handle: nothing to version (post-cull check skips id 0 too)
             if (access_is_write(p->accesses[i].type)) {
                 // WAW: order this write after the previous writer. without it two writers of one
                 // resource have no edge -> undefined order -> corruption.
@@ -853,7 +854,7 @@ bool RenderGraph::compile()
     {
         // sinks = passes writing an imported resource. accesses store only handle.id, so flatten
         // the imported flags into an id-indexed table first (same scratch_alloc-over-next_id trick
-        // as phase 1's lastWriter).
+        // as phase 1's currentProducer).
         // external = imported OR persistent (temporal). both are output sinks when written (their value
         // leaves the frame) and exempt from the read-before-write check (value comes from outside the frame).
         bool* external = s.m_allocator->scratch_alloc<bool>(s.next_id);

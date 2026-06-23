@@ -74,9 +74,11 @@ now moot for this code path.
   (`currentProducer` / `pendingReaders`, from the scratch arena; `pendingReaders` nodes reuse
   `NodeAdjacency` via `scratch_make<>()`). It emits hazard edges only — it does **not** track early reads.
 - The early-read check is a **post-phase-2 pass** in `compile()`. Over the culled, execution-ordered
-  `m_passes` it walks accesses in order keeping three scratch bitmaps over `next_id`: `hasWriter[id]`
-  (some surviving pass writes it), `produced[id]` (written so far in execution order), and `imported[id]`.
-  A read of `id` is an error iff `!imported[id] && hasWriter[id] && !produced[id]` (writes mark `produced`
+  `m_passes` it walks accesses in order keeping four scratch bitmaps over `next_id`: `hasWriter[id]`
+  (some surviving pass writes it), `produced[id]` (written so far in execution order), `external[id]`
+  (imported OR persistent/temporal — value comes from outside the frame), and `prevLayer[id]` (a
+  temporal layer k>0, read-only this frame). A read of `id` is an error iff
+  `!external[id] && hasWriter[id] && !produced[id]` (writes mark `produced`
   as they are walked, so a pass's own earlier write satisfies its later read). On any error it returns
   `false` before phase 3, so the caller never realizes/executes a misordered graph; `compile()`'s return
   type is `bool`. This lives in `compile()`, not the sweep, because it must see the *final* schedule
