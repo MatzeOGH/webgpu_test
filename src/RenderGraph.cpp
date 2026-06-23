@@ -56,6 +56,11 @@ struct ResourceAccess
     WGPUStoreOp storeOp{};
     WGPUColor   clearColor{};
     float       clearDepth{};
+    // stencil aspect of a DepthStencilAttachment: set for a depth+stencil format (e.g. Depth24PlusStencil8),
+    // leave Undefined/0 for a depth-only format (e.g. Depth32Float). ignored for non-attachment accesses.
+    WGPULoadOp  stencilLoadOp{};
+    WGPUStoreOp stencilStoreOp{};
+    uint32_t    stencilClear{};
 
     // subresource this access touches. for an attachment, the single mip/layer execute() renders into;
     // for a read, the level/layer the body samples (drives only the in-pass conflict check). 0 = mip 0/layer 0.
@@ -1278,14 +1283,22 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                     if (lastColorSlot != ~0u) color[lastColorSlot].resolveTarget = attach_view(r, a);
                 } else if (a.type == AccessType::DepthStencilAttachment || a.type == AccessType::DepthStencilReadOnly) {
                     depth = WGPURenderPassDepthStencilAttachment{
-                        .view            = attach_view(r, a),
-                        .depthLoadOp     = a.loadOp,
-                        .depthStoreOp    = a.storeOp,
-                        .depthClearValue = a.clearDepth,
-                        .depthReadOnly   = a.type == AccessType::DepthStencilReadOnly,
-                        // ponytail: stencil ops left Undefined -> depth-only formats (e.g. Depth32Float) only.
-                        // for a depth+stencil format add stencilLoadOp/StoreOp/clear to ResourceAccess + optional
-                        // depth_stencil() params and set them on this struct.
+                        .view              = attach_view(r, a),
+                        .depthLoadOp       = a.loadOp,
+                        .depthStoreOp      = a.storeOp,
+                        .depthClearValue   = a.clearDepth,
+                        .depthReadOnly     = a.type == AccessType::DepthStencilReadOnly,
+                        // stencil aspect: non-default only when the caller passed stencil ops (depth+stencil
+                        // format). depth-only formats keep these Undefined/0, matching the old behavior.
+                        // ponytail: depth + stencil share one read-only flag (DepthStencilReadOnly = both).
+                        // depth-write + stencil-gate (portals/mirrors/masked regions) needs no flag -- use a
+                        // writable depth_stencil() and set the pipeline's stencil ops to Keep. the shared flag
+                        // only blocks sampling the stencil aspect as a texture in the same pass you depth-write
+                        // (would need depthReadOnly=false + stencilReadOnly=true); add a per-aspect flag then.
+                        .stencilLoadOp     = a.stencilLoadOp,
+                        .stencilStoreOp    = a.stencilStoreOp,
+                        .stencilClearValue = a.stencilClear,
+                        .stencilReadOnly   = a.type == AccessType::DepthStencilReadOnly,
                     };
                     hasDepth = true;
                 }
@@ -1329,7 +1342,8 @@ void RenderGraph::release_resources()
 // every other call site leaves them at their (ignored) defaults.
 void GraphBuilder::use(ResourceHandle handle, AccessType type,
                        WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth,
-                       uint32_t baseMip, uint32_t baseLayer)
+                       uint32_t baseMip, uint32_t baseLayer,
+                       WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
 #if RG_VALIDATE
     // immediate (declaration-time) usage check: fires at the exact b.sampled()/b.storage_write() call
@@ -1359,7 +1373,8 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
 #endif
 
     if (m_new_pass->accessCount < PassNode::kMaxAccess)
-        m_new_pass->accesses[m_new_pass->accessCount++] = { handle, type, load, store, clear, clearDepth, baseMip, baseLayer };
+        m_new_pass->accesses[m_new_pass->accessCount++] =
+            { handle, type, load, store, clear, clearDepth, stencilLoad, stencilStore, stencilClear, baseMip, baseLayer };
     // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it
 }
 
@@ -1375,9 +1390,9 @@ void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t bas
     use(handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer)
+void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer, WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
-    use(handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer);
+    use(handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, stencilLoad, stencilStore, stencilClear);
 }
 
 void GraphBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)

@@ -85,7 +85,9 @@ struct GraphBuilder
     void use(ResourceHandle handle, AccessType type,
              WGPULoadOp load = WGPULoadOp_Undefined, WGPUStoreOp store = WGPUStoreOp_Undefined,
              WGPUColor clear = {}, float clearDepth = {},
-             uint32_t baseMip = 0, uint32_t baseLayer = 0);
+             uint32_t baseMip = 0, uint32_t baseLayer = 0,
+             WGPULoadOp stencilLoad = WGPULoadOp_Undefined, WGPUStoreOp stencilStore = WGPUStoreOp_Undefined,
+             uint32_t stencilClear = 0);
 
     // color attachment
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1}, uint32_t baseMip = 0, uint32_t baseLayer = 0);
@@ -93,8 +95,10 @@ struct GraphBuilder
     // the target must be single-sample, same format + size as that multisample color; Dawn validates. the
     // target may be imported (e.g. resolve a multisample color straight into the swapchain).
     void resolve(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
-    // depth stencil attachment
-    void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    // depth stencil attachment. for a depth+stencil format pass the stencil load/store/clear too (a
+    // depth-only format leaves them Undefined/0); the bound pipeline's depthStencil state drives the actual
+    // stencil test/write -- the graph only carries the attachment's load/store/clear ops.
+    void depth_stencil(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, float clearDepth = 1.0f, uint32_t baseMip = 0, uint32_t baseLayer = 0, WGPULoadOp stencilLoad = WGPULoadOp_Undefined, WGPUStoreOp stencilStore = WGPUStoreOp_Undefined, uint32_t stencilClear = 0);
     // depth stencil attachment, read-only (depth/stencil test, no write; e.g. lighting depth-testing
     // a prepass depth). no load/store/clear: WebGPU requires depthLoadOp/StoreOp Undefined when read-only.
     void depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
