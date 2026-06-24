@@ -192,10 +192,6 @@ struct RenderGraph
     void execute(WGPUCommandEncoder encoder, WGPUQueue queue);
     // release graph-created textures/views/buffers (imported resources left alone)
     void release_resources();
-    // resolve a handle to its node (linear walk; see ceiling note in .cpp)
-    // TODO: remove this: clients do not need to see the internal structure
-    ResourceNode* node(ResourceHandle h);
-
     // No data members: state lives in a .cpp-private RenderGraphStorage (see RenderGraph.cpp).
 
 private:

@@ -522,6 +522,7 @@ struct RenderGraphStorage
     PassNode*               m_passes{};
     WGPUDevice              m_device{};
     uint32_t                next_id = 1; // 0 = invalid handle
+    ResourceNode**          byId{};      // id->node (sized next_id); built in compile() phase 3 -> O(1) find_node
 };
 
 static RenderGraphStorage* storage(RenderGraph* rg)
@@ -529,6 +530,18 @@ static RenderGraphStorage* storage(RenderGraph* rg)
     return reinterpret_cast<RenderGraphStorage*>(
         reinterpret_cast<uint8_t*>(rg)
         + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
+}
+
+// resolve a handle to its node. O(1) through the byId table compile() builds (persisted on storage for
+// the frame); before that table exists (declaration time) or for the invalid id 0, fall back to a linear
+// walk. an unknown handle resolves to null.
+static ResourceNode* find_node(RenderGraph* rg, ResourceHandle h)
+{
+    RenderGraphStorage& s = *storage(rg);
+    if (s.byId && h.id && h.id < s.next_id) return s.byId[h.id];   // fast path: compiled graph
+    for (ResourceNode* r = s.m_resouces; r; r = r->next)           // pre-compile or id 0: walk
+        if (r->handle.id == h.id) return r;
+    return nullptr;
 }
 
 GraphAllocator* create_allocator(size_t arenaSize){
@@ -939,7 +952,7 @@ bool RenderGraph::compile()
                     // a slot that becomes a future "current". layer 0 (create_temporal_image's handle) is the
                     // only legal write target.
                     if (prevLayer[id]) {
-                        ResourceNode* w = node(p->accesses[i].handle);
+                        ResourceNode* w = find_node(this, p->accesses[i].handle);
                         WGPUStringView wn = w ? w->name : WGPUStringView{};
                         std::printf("[RenderGraph] error: pass \"%.*s\" writes temporal resource \"%.*s\" "
                                     "layer %u -- only layer 0 (create_temporal_image's handle) is writable.\n",
@@ -950,7 +963,7 @@ bool RenderGraph::compile()
                     continue;
                 }
                 if (id == 0 || external[id] || produced[id] || !hasWriter[id]) continue;
-                ResourceNode* r = node(p->accesses[i].handle);
+                ResourceNode* r = find_node(this, p->accesses[i].handle);
                 WGPUStringView rn = r ? r->name : WGPUStringView{};
                 std::printf("[RenderGraph] error: pass \"%.*s\" reads resource \"%.*s\" before any pass "
                             "writes it -- declare a writer of \"%.*s\" first.\n",
@@ -966,9 +979,10 @@ bool RenderGraph::compile()
     // phase 3: frame-independent CPU analysis -> accumulate WGPU usage + resolve concrete sizes.
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
     {
-        // id->node table, same scratch_alloc-over-next_id trick as phases 1/2.
-        ResourceNode** byId = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_id);
-        defer { s.m_allocator->reset_scratch(); };
+        // id->node table: O(1) handle resolution. front-arena (lives until the next create_render_graph
+        // reset) and persisted on storage so find_node / PassContext reuse it through realize + execute.
+        s.byId = s.m_allocator->alloc<ResourceNode*>(s.next_id);
+        ResourceNode** byId = s.byId;   // local alias for the loop + resolve_size below
         for (ResourceNode* r = s.m_resouces; r; r = r->next) byId[r->handle.id] = r;
 
         uint32_t passIdx = 0;
@@ -1064,7 +1078,7 @@ void debug_print_mermaid(RenderGraph* rg)
     // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
     sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
-            ResourceNode* r = rg->node({ id });
+            ResourceNode* r = find_node(rg, { id });
             WGPUStringView nm = r ? r->name : WGPUStringView{};
             const char* tag = kind == HazardKind::WAW ? " (WAW)" : kind == HazardKind::WAR ? " (WAR)" : "";
             std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
@@ -1141,28 +1155,19 @@ void debug_print_lifetimes(RenderGraph* rg)
     // the axisFormat if a graph ever exceeds that. names assumed colon/pipe-free -> no escaping.
 }
 
-// resolve a handle to its node by linear walk of the resource list.
-// ponytail: O(n) per lookup; build an id->node table on the graph if pass bodies do many lookups.
-ResourceNode* RenderGraph::node(ResourceHandle h)
-{
-    for (ResourceNode* r = storage(this)->m_resouces; r; r = r->next)
-        if (r->handle.id == h.id) return r;
-    return nullptr;
-}
-
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
-    return graph->node(h)->view;
+    return find_node(graph, h)->view;
 }
 
 WGPUTexture PassContext::texture(ResourceHandle h) const
 {
-    return graph->node(h)->texture;
+    return find_node(graph, h)->texture;
 }
 
 WGPUBuffer PassContext::buffer(ResourceHandle h) const
 {
-    return graph->node(h)->buffer;
+    return find_node(graph, h)->buffer;
 }
 
 // create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
@@ -1267,7 +1272,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
 
             for (uint32_t i = 0; i < p->accessCount; ++i) {
                 const ResourceAccess& a = p->accesses[i];
-                ResourceNode* r = node(a.handle);
+                ResourceNode* r = find_node(this, a.handle);
                 if (!r) continue;
                 if (a.type == AccessType::ColorAttachment && nc < 8) {
                     color[nc] = WGPURenderPassColorAttachment{

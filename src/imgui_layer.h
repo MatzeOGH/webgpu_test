@@ -328,7 +328,7 @@ static bool rg_pass_is_sink(RenderGraph* rg, PassNode* p)
 {
 	for (uint32_t i = 0; i < p->accessCount; ++i) {
 		if (!access_is_write(p->accesses[i].type)) continue;
-		ResourceNode* r = rg->node(p->accesses[i].handle);
+		ResourceNode* r = find_node(rg, p->accesses[i].handle);
 		if (r && r->imported) return true;
 	}
 	return false;
@@ -843,7 +843,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		int inS = 0, outS = 0;
 		for (uint32_t k = 0; k < p->accessCount; ++k) {
 			const ResourceAccess& acc = p->accesses[k];
-			ResourceNode* r = rg->node(acc.handle);
+			ResourceNode* r = find_node(rg, acc.handle);
 			WGPUStringView rn = r ? r->name : WGPUStringView{};
 			char lbl[48]; std::snprintf(lbl, sizeof lbl, "%.*s", (int)rn.length, rn.data ? rn.data : "?");
 			ImVec2 ls = ImGui::CalcTextSize(lbl);
@@ -916,7 +916,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 
 	// ---- tooltip: hovered pin wins; else fall back to the per-pass reads/writes list.
 	if (hovB >= 0) {
-		PassNode* p = box[hovB].p; ResourceNode* r = rg->node({ hovId });
+		PassNode* p = box[hovB].p; ResourceNode* r = find_node(rg, { hovId });
 		WGPUStringView rn = r ? r->name : WGPUStringView{};
 		ImGui::BeginTooltip();
 		ImGui::Text("%.*s", (int)rn.length, rn.data ? rn.data : "?");
@@ -959,7 +959,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		ImGui::Separator();
 		for (uint32_t k = 0; k < p->accessCount; ++k) {
 			const ResourceAccess& acc = p->accesses[k];
-			ResourceNode* r = rg->node(acc.handle);
+			ResourceNode* r = find_node(rg, acc.handle);
 			WGPUStringView rn = r ? r->name : WGPUStringView{};
 			ImGui::Text("[%s] %.*s  (%s)%s", access_is_write(acc.type) ? "W" : "R",
 				(int)rn.length, rn.data ? rn.data : "", rg_access_name(acc.type),
@@ -968,7 +968,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		ImGui::EndTooltip();
 	}
 	else if (hovEdge >= 0) {
-		REdge& e = edge[hovEdge]; ResourceNode* r = rg->node({ e.id });
+		REdge& e = edge[hovEdge]; ResourceNode* r = find_node(rg, { e.id });
 		WGPUStringView rn = r ? r->name : WGPUStringView{};
 		WGPUStringView sn = box[e.src].p->name, dn = box[e.dst].p->name;
 		ImGui::BeginTooltip();
