@@ -303,46 +303,6 @@ struct GraphAllocator
     PersistentResourcePool pool;        // name-keyed temporal/history textures
     TransientResourcePool  transient;   // descriptor-keyed per-frame texture cache
 
-    // 1x1 identity textures backing kNullTexture reads (PassContext::view_or_default): the feature-off
-    // value for an optional sampled input (e.g. 1.0/white for a no-op multiply, 0.0/black for a no-op
-    // add). keyed by (dim, sampleType, identity), lazily created, cached across frames, leaked at
-    // shutdown like the rest of the allocator. Float sampleType only today -> a 1x1 RGBA8Unorm texture;
-    // extend if a depth/cube default is ever needed.
-    struct DefaultView { WGPUTextureViewDimension dim; WGPUTextureSampleType st; float identity; WGPUTextureView view; };
-    DefaultView defaultViews[8]{};
-    uint32_t    defaultViewCount{};
-
-    WGPUTextureView default_view(WGPUDevice device, WGPUQueue queue,
-                                 WGPUTextureViewDimension dim, WGPUTextureSampleType st, float identity)
-    {
-        for (uint32_t i = 0; i < defaultViewCount; ++i)
-            if (defaultViews[i].dim == dim && defaultViews[i].st == st && defaultViews[i].identity == identity)
-                return defaultViews[i].view;
-
-        WGPUTextureDescriptor td{
-            .usage         = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
-            .dimension     = WGPUTextureDimension_2D,
-            .size          = { 1, 1, 1 },
-            .format        = WGPUTextureFormat_RGBA8Unorm,
-            .mipLevelCount = 1,
-            .sampleCount   = 1,
-        };
-        WGPUTexture tex = wgpuDeviceCreateTexture(device, &td);
-        const uint8_t v = (uint8_t)(identity * 255.0f);
-        const uint8_t px[4] = { v, v, v, 255 };
-        WGPUTexelCopyTextureInfo dst{ .texture = tex, .mipLevel = 0, .origin = { 0, 0, 0 }, .aspect = WGPUTextureAspect_All };
-        WGPUTexelCopyBufferLayout layout{ .offset = 0, .bytesPerRow = 4, .rowsPerImage = 1 };
-        WGPUExtent3D ext{ 1, 1, 1 };
-        wgpuQueueWriteTexture(queue, &dst, px, sizeof(px), &layout, &ext);
-        WGPUTextureViewDescriptor vd{
-            .format = WGPUTextureFormat_RGBA8Unorm, .dimension = dim,
-            .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = 1,
-        };
-        WGPUTextureView view = wgpuTextureCreateView(tex, &vd);
-        if (defaultViewCount < 8) defaultViews[defaultViewCount++] = { dim, st, identity, view };
-        return view;
-    }
-
     // alignment must be a power of two
     static constexpr size_t align_up(size_t value, size_t alignment)
     {
@@ -1195,16 +1155,6 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
     return graph->node(h)->view;
 }
 
-// resolve h to its view, or -- for kNullTexture -- a cached 1x1 identity view of the requested shape.
-// lets an always-on pass bind an optional sampled input without a separate "feature off" pipeline.
-WGPUTextureView PassContext::view_or_default(ResourceHandle h, WGPUTextureViewDimension dim,
-                                             WGPUTextureSampleType sampleType, float identity) const
-{
-    if (h.id) return graph->node(h)->view;
-    RenderGraphStorage& s = *storage(graph);
-    return s.m_allocator->default_view(s.m_device, queue, dim, sampleType, identity);
-}
-
 WGPUTexture PassContext::texture(ResourceHandle h) const
 {
     return graph->node(h)->texture;
@@ -1398,7 +1348,7 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
                        uint32_t baseMip, uint32_t baseLayer,
                        WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
-    if (!handle.id) return;   // kNullTexture: record nothing -- no dependency, no usage bit, no view lookup later
+    if (!handle.id) return;   // invalid handle (id 0): record nothing -- no dependency, no usage bit, no view lookup later
 #if RG_VALIDATE
     // immediate (declaration-time) usage check: fires at the exact b.sampled()/b.storage_write() call
     // site, not deferred to compile(). A pass is one WebGPU usage scope; a resource may not be aliased

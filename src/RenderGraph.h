@@ -41,14 +41,6 @@ struct ResourceHandle
     uint32_t id{};
 };
 
-// the invalid/sentinel handle (id 0; next_id starts at 1). Passing it to a READ access
-// (sampled/uniform/storage_read) no-ops in GraphBuilder::use() -- no dependency, no usage bit -- and a
-// pass body resolves it through PassContext::view_or_default to a caller-chosen identity view (the
-// feature-off value: 1.0/white for a multiplicative input, 0.0/black for an additive one). Lets one
-// always-on pass take an optional sampled input without a pipeline/shader variant or a branch.
-// See docs/rendergraph-null-textures.md.
-inline constexpr ResourceHandle kNullTexture{ 0 };
-
 // a ping-pong temporal (history) resource: two physical textures the PersistentResourcePool rotates
 // each frame. write `curr`, read `prev`. returned by create_temporal_image.
 struct TemporalImage
@@ -78,11 +70,6 @@ struct PassContext
     RenderGraph* graph{};
 
     WGPUTextureView view(ResourceHandle h) const;   // resolved view
-    // like view(), but resolves kNullTexture to a cached 1x1 identity view -- `identity` is the
-    // feature-off value (1.0/white = no-op multiply, 0.0/black = no-op add). dim/sampleType must
-    // match the bind-group-layout slot.
-    WGPUTextureView view_or_default(ResourceHandle h, WGPUTextureViewDimension dim,
-                                    WGPUTextureSampleType sampleType, float identity) const;
     WGPUTexture texture(ResourceHandle h) const;    // resolved texture (copies need the texture, not a view)
     WGPUBuffer buffer(ResourceHandle h) const;  // resolved buffer
 };

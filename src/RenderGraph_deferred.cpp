@@ -3,14 +3,14 @@
 // feature chain rather than a branchy DAG:
 //
 //   scene = cubeOn ? cube_skybox()
-//                  : compose( lighting( gbuffer, shadows ), ssao )   // ssao is kNullTexture when off
+//                  : compose( lighting( gbuffer, shadows ), ssao )   // compose skipped when SSAO off
 //   scene = bloom(scene)   // inserts a mip pyramid, or passes through
 //   scene = taa(scene)     // accumulates with history, or passes through
 //   present(scene)         // final blit to the swapchain
 //
-// Each stage returns the colour handle the next reads, so toggles compose instead of forking the graph.
-// Disabled SSAO returns kNullTexture: compose's AO slot resolves to a 1x1 white identity (AO = 1.0),
-// so compose stays a single always-on pass with no "feature off" variant. Matrix-free: the camera is a
+// Each stage returns the colour handle the next reads, so a toggle adds or drops passes instead of
+// forking the graph. SSAO off: compose's output would be lit * 1 == lit, so the pass is skipped and lit
+// passes through (cull-from-sinks drops the rest), same as bloom/taa. Matrix-free: the camera is a
 // position + basis in the UBO, fed to a WGSL ray function, so the gbuffer stores LINEAR depth and the
 // deferred passes reconstruct the world hit -- no projection/inverse matrices. #included into the single
 // TU after RenderGraph_demo.h.
@@ -292,8 +292,8 @@ static const char* kUvHelper = R"(
 fn uv_of(ndc : vec2f) -> vec2f { return vec2f(ndc.x, -ndc.y) * 0.5 + 0.5; }
 )";
 
-// compose fragment: lit colour modulated by AO. AO is SAMPLED (not textureLoad'd) so a 1x1 white
-// identity (kNullTexture default, SSAO off) reads 1.0 everywhere -> lit unchanged, no branch/variant.
+// compose fragment: lit colour modulated by AO. Only declared when SSAO is on (off, compose is skipped
+// and lit is presented directly), so AO here is always a real texture.
 // ponytail: AO multiplies the whole lit result, not just the ambient term; if it over-darkens lit
 // surfaces, output ambient/direct separately from lighting and apply AO to ambient only.
 static const char* kComposeFs = R"(
@@ -494,8 +494,8 @@ static ResourceHandle build_shadows(RenderGraph* rg, WGPUDevice dev, ResourceHan
     return csm;
 }
 
-// ssao: screen-space AO from gbuffer depth + normal -> aoTex. Caller passes kNullTexture instead when
-// SSAO is off (compose then samples the white identity), so this is only called when enabled.
+// ssao: screen-space AO from gbuffer depth + normal -> aoTex. Only called when SSAO is enabled; off, the
+// caller skips both this and compose.
 static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHandle ubo,
                                  ResourceHandle gDepth, ResourceHandle gNormal, ResourceHandle swap)
 {
@@ -594,22 +594,25 @@ static void build_sky(RenderGraph* rg, WGPUDevice dev, ResourceHandle gDepth, Re
         });
 }
 
-// compose: lit * ao -> scene colour. Always present; `ao` is kNullTexture when SSAO is off, resolving
-// to a 1x1 white view (AO = 1.0). One pipeline, no "feature off" variant.
-static ResourceHandle build_compose(RenderGraph* rg, WGPUDevice dev, ResourceHandle lit, ResourceHandle ao, ResourceHandle swap)
+// compose: lit * ao -> scene colour. Only declared when SSAO is on; with it off the result would be
+// lit * 1 == lit, so we skip the pass and pass `lit` straight through (cull-from-sinks drops the rest).
+// Same shape as build_bloom/build_taa: insert a pass or return the colour unchanged.
+static ResourceHandle build_compose(RenderGraph* rg, WGPUDevice dev, ResourceHandle lit, ResourceHandle ao, ResourceHandle swap, bool ssaoOn)
 {
+    if (!ssaoOn) return lit;
+
     auto scene = screen_tex(rg, "compose.scene", kSwapFormat, swap);
     rg->add_pass(WEBGPU_STR("compose"), PassKind::Graphics,
         [&](GraphBuilder& b) {
             b.sampled(lit);
-            b.sampled(ao);                                                                  // kNullTexture -> use() no-ops, no dependency
+            b.sampled(ao);
             b.color(scene, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },
         [dev, lit, ao](PassContext& ctx) {
             WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(composePipe, 0);
             WGPUBindGroupEntry e[3] = {
                 { .binding = 0, .textureView = ctx.view(lit) },
-                { .binding = 1, .textureView = ctx.view_or_default(ao, WGPUTextureViewDimension_2D, WGPUTextureSampleType_Float, 1.0f) },
+                { .binding = 1, .textureView = ctx.view(ao) },
                 { .binding = 2, .sampler = linSampler },
             };
             WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
@@ -1121,10 +1124,10 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     } else {
         GBuffer g          = build_gbuffer(rg, dev, ubo, swap);
         ResourceHandle csm = build_shadows(rg, dev, ubo);
-        ResourceHandle ao  = ssaoOn ? build_ssao(rg, env, ubo, g.depth, g.normal, swap) : kNullTexture;
+        ResourceHandle ao  = ssaoOn ? build_ssao(rg, env, ubo, g.depth, g.normal, swap) : ResourceHandle{};
         ResourceHandle lit = build_lighting(rg, dev, ubo, g, csm, swap);
         build_sky(rg, dev, g.depth, lit);
-        scene = build_compose(rg, dev, lit, ao, swap);   // always present; ao defaults to white when off
+        scene = build_compose(rg, dev, lit, ao, swap, ssaoOn);   // SSAO off -> compose skipped, lit passes through
     }
 
     // ---- post chain: each effect inserts passes or returns the colour unchanged ----
