@@ -384,6 +384,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// virtual nodes (frame-boundary endpoints: temporal read/write so far) -- toggled from the toolbar.
 	// read before the layout pass so disabling them also drops their layout influence (no reserved columns).
 	static bool showVirtual = true;
+	// imported buffers (uniforms read by many passes): on = one source node fanning faint edges to every
+	// reader; off = a node at each use site, like an imported texture. read here so it shapes the layout too.
+	static bool fanBuffers = true;
 
 	// ---- layout pass (sink-anchored, Sugiyama-style). columns place each pass left of what depends on
 	// it: column = longest distance TO a sink over the FULL dependency graph, so sinks land rightmost and
@@ -485,15 +488,15 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			int lwb = -1, lws = -1;   // last writer, if any
 			for (int i = 0; i < n; ++i) { int sl = rg_out_slot(box[i].p, r->handle.id); if (sl >= 0) { lwb = i; lws = sl; } }
 			if (lwb < 0) {             // no in-graph writer: external input read from outside the frame
-				if (r->imported && r->kind == ResourceNode::Kind::Buffer) {
-					// a uniform is read almost everywhere -- emit ONE source node anchored at its earliest reader
-					// (far left); the draw loop fans faint edges to every reader, so all consumers show without a
-					// node per use site swamping the view. textures keep a node per use site below.
+				if (r->imported && r->kind == ResourceNode::Kind::Buffer && fanBuffers) {
+					// collapsed: a uniform is read almost everywhere -- emit ONE source node anchored at its
+					// earliest reader (far left); the draw loop fans faint edges to every reader, so all
+					// consumers show without a node per use site swamping the view.
 					int best = -1, bestSl = -1;
 					for (int i = 0; i < n; ++i) { int sl = rg_in_slot(box[i].p, r->handle.id); if (sl >= 0 && (best < 0 || colOf[i] < colOf[best])) { best = i; bestSl = sl; } }
 					if (best >= 0) push_tnode(true, best, bestSl, r, "imported", kRGExt);
 				}
-				else if (r->imported)  // imported texture -> source node at each reader pin
+				else if (r->imported)  // imported texture, or a buffer with fan-out off -> a node at each reader pin
 					for (int i = 0; i < n; ++i) { int sl = rg_in_slot(box[i].p, r->handle.id); if (sl >= 0) push_tnode(true, i, sl, r, "imported", kRGExt); }
 			}
 			else if (r->imported)      // present: imported + written -> sink node at the last writer
@@ -621,6 +624,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	ImGui::SameLine(); ImGui::SetNextItemWidth(180);
 	ImGui::InputTextWithHint("##rgfilter", "filter passes...", filter, sizeof filter);
 	ImGui::SameLine(); ImGui::Checkbox("virtual nodes", &showVirtual);
+	ImGui::SameLine(); ImGui::Checkbox("fan-out buffers", &fanBuffers);   // off -> one virtual node per buffer use site
 	const bool filterActive = filter[0] != 0;
 
 	// pannable canvas: a static scroll offset (drag left/middle to pan) + a grid, after the imgui node-
@@ -874,10 +878,11 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// write/sink node is fed by an output pin from the left); an imported buffer fans to all readers (below).
 	// tint + caption come from the node's kind.
 	for (TNode& t : tnodes) {
-		// an imported buffer (a uniform read by many passes) is ONE source node fanning faint dashed edges to
-		// EVERY reader, so all consumers show without a node per use site. never wholesale-hidden by the pass
-		// filter -- the per-reader gate just drops the edges to filtered passes.
-		const bool fan = t.isRead && t.res->imported && t.res->kind == ResourceNode::Kind::Buffer;
+		// with fan-out on, an imported buffer (a uniform read by many passes) is ONE source node fanning faint
+		// dashed edges to EVERY reader, so all consumers show without a node per use site; it's never wholesale-
+		// hidden by the pass filter (the per-reader gate just drops the edges to filtered passes). off -> it's a
+		// node per use site like a texture, taking the single-edge branch below.
+		const bool fan = fanBuffers && t.isRead && t.res->imported && t.res->kind == ResourceNode::Kind::Buffer;
 		if (!fan && fout(t.passBox)) continue;
 		ImVec2 c(origin.x + lnode[t.li].x, origin.y + lnode[t.li].y);
 		ImVec2 a(c.x - t.w * 0.5f, c.y - t.h * 0.5f), b(c.x + t.w * 0.5f, c.y + t.h * 0.5f);
