@@ -454,15 +454,15 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 
 	// ---- virtual nodes: frame-boundary endpoints drawn as real DAG nodes so the column/barycenter/y code
 	// below places them like any pass (no bespoke overlay). each attaches to ONE pass pin -- a read node one
-	// column BEFORE its reader, a write node one column AFTER its writer -- so a widely-read resource gets a
+	// column BEFORE its reader, a write node one column AFTER its writer -- so a widely-read texture gets a
 	// small node at each use site (like repeated power symbols) instead of one node fanning edges everywhere.
 	// three kinds, all gated by the toolbar toggle:
 	//   * temporal: create_temporal_image makes two resource nodes sharing a name -- curr (temporalIndex 0,
 	//     written THIS frame for next) and prev (temporalIndex 1, read this frame = LAST frame's curr; the
 	//     pool rotates two physical textures). cross-frame, so no in-frame edge joins the pair.
-	//   * external input: an IMPORTED texture read with no in-graph writer (importe_image'd, value from
-	//     outside the frame). buffers are skipped wholesale (the Kind::Buffer guard below) -- uniforms get
-	//     import_buffer'd and read almost everywhere, so a node per use site would swamp the view.
+	//   * external input: an IMPORTED resource read with no in-graph writer (importe_image'd / import_buffer'd,
+	//     value from outside the frame). a texture gets a node per reader pin; a buffer (a uniform read almost
+	//     everywhere) is ONE source node fanning faint edges to every reader, so it doesn't swamp the view.
 	//   * present: an imported resource that IS written -- the swapchain, whose final value leaves to display.
 	struct TNode { bool isRead; int passBox, pin; ResourceNode* res; int col; float w, h; const char* cap; ImU32 tint; int li; };
 	static std::vector<TNode> tnodes; tnodes.clear();
@@ -484,8 +484,16 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			}
 			int lwb = -1, lws = -1;   // last writer, if any
 			for (int i = 0; i < n; ++i) { int sl = rg_out_slot(box[i].p, r->handle.id); if (sl >= 0) { lwb = i; lws = sl; } }
-			if (lwb < 0) {             // no in-graph writer
-				if (r->imported)       // external input: imported, read from outside -> source node at each reader pin
+			if (lwb < 0) {             // no in-graph writer: external input read from outside the frame
+				if (r->imported && r->kind == ResourceNode::Kind::Buffer) {
+					// a uniform is read almost everywhere -- emit ONE source node anchored at its earliest reader
+					// (far left); the draw loop fans faint edges to every reader, so all consumers show without a
+					// node per use site swamping the view. textures keep a node per use site below.
+					int best = -1, bestSl = -1;
+					for (int i = 0; i < n; ++i) { int sl = rg_in_slot(box[i].p, r->handle.id); if (sl >= 0 && (best < 0 || colOf[i] < colOf[best])) { best = i; bestSl = sl; } }
+					if (best >= 0) push_tnode(true, best, bestSl, r, "imported", kRGExt);
+				}
+				else if (r->imported)  // imported texture -> source node at each reader pin
 					for (int i = 0; i < n; ++i) { int sl = rg_in_slot(box[i].p, r->handle.id); if (sl >= 0) push_tnode(true, i, sl, r, "imported", kRGExt); }
 			}
 			else if (r->imported)      // present: imported + written -> sink node at the last writer
@@ -861,19 +869,37 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		}
 	}
 
-	// ---- virtual endpoint nodes + dashed links, drawn from the layout positions computed above. each node
-	// attaches to one pass pin in the adjacent column: a read/source node feeds an input pin from the left,
-	// a write/sink node is fed by an output pin from the left. tint + caption come from the node's kind.
+	// ---- virtual endpoint nodes + dashed links, drawn from the layout positions computed above. most nodes
+	// attach to one pass pin in the adjacent column (a read/source node feeds an input pin from the left, a
+	// write/sink node is fed by an output pin from the left); an imported buffer fans to all readers (below).
+	// tint + caption come from the node's kind.
 	for (TNode& t : tnodes) {
-		if (fout(t.passBox)) continue;
+		// an imported buffer (a uniform read by many passes) is ONE source node fanning faint dashed edges to
+		// EVERY reader, so all consumers show without a node per use site. never wholesale-hidden by the pass
+		// filter -- the per-reader gate just drops the edges to filtered passes.
+		const bool fan = t.isRead && t.res->imported && t.res->kind == ResourceNode::Kind::Buffer;
+		if (!fan && fout(t.passBox)) continue;
 		ImVec2 c(origin.x + lnode[t.li].x, origin.y + lnode[t.li].y);
 		ImVec2 a(c.x - t.w * 0.5f, c.y - t.h * 0.5f), b(c.x + t.w * 0.5f, c.y + t.h * 0.5f);
-		ImVec2 p, q;
-		if (t.isRead) { q = inPin(t.passBox, t.pin); p = ImVec2(b.x, c.y); }    // node -> reader input pin
-		else          { p = outPin(t.passBox, t.pin); q = ImVec2(a.x, c.y); }   // writer output pin -> node
-		float dx = (q.x - p.x) * 0.5f;
-		rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, t.tint, 2.0f);
-		rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, t.tint, 7.0f);
+		if (fan) {
+			ImU32 fc = rg_with_alpha(t.tint, 90); ImVec2 p(b.x, c.y);
+			for (int i = 0; i < n; ++i) {
+				if (fout(i)) continue;
+				int sl = rg_in_slot(box[i].p, t.res->handle.id);
+				if (sl < 0) continue;
+				ImVec2 q = inPin(i, sl); float dx = (q.x - p.x) * 0.5f;
+				rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, fc, 1.5f);
+				rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, fc, 6.0f);
+			}
+		}
+		else {
+			ImVec2 p, q;
+			if (t.isRead) { q = inPin(t.passBox, t.pin); p = ImVec2(b.x, c.y); }    // node -> reader input pin
+			else          { p = outPin(t.passBox, t.pin); q = ImVec2(a.x, c.y); }   // writer output pin -> node
+			float dx = (q.x - p.x) * 0.5f;
+			rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, t.tint, 2.0f);
+			rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, t.tint, 7.0f);
+		}
 
 		char nm[48]; std::snprintf(nm, sizeof nm, "%.*s", (int)t.res->name.length, t.res->name.data ? t.res->name.data : "?");
 		dl->AddRectFilled(a, b, IM_COL32(32, 30, 40, 240), 4.0f);
