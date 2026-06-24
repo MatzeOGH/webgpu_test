@@ -23,6 +23,10 @@ constexpr WGPUTextureFormat kAOFormat    = WGPUTextureFormat_RGBA8Unorm;   // ss
 constexpr uint32_t          kShadowSize  = 1024;                           // shadow map is a fixed square
 constexpr uint32_t          kNumCascades = 3;                              // CSM: layers in the shadow array
 constexpr uint32_t          kMaxSpheres  = 8;
+constexpr WGPUTextureFormat kFogFormat   = WGPUTextureFormat_RGBA16Float;  // froxel scatter (HDR, filterable, core storage)
+constexpr uint32_t          kFroxelX     = 160;                            // view-frustum fog grid: width
+constexpr uint32_t          kFroxelY     = 90;                             //                        height
+constexpr uint32_t          kFroxelZ     = 64;                             //                        depth slices (exponential)
 
 // One uniform buffer feeds gbuffer + shadow + lighting + ssao + cube. Layout matches the WGSL `Scene`
 // struct below (std140: vec4 members on 16-byte offsets). Host-uploaded each frame -> never written by a pass.
@@ -37,8 +41,15 @@ struct SceneUBO {
     float    resolution[2];             // gbuffer pixel size (for aspect)   (offset 224)
     uint32_t count;                     // live sphere count                 (offset 232)
     float    time;                      //                                   (offset 236)
+    float    fog[4];                    // x=density y=g z=heightFalloff w=ambient (offset 240)
+    float    fogColor[4];               // rgb = scatter tint, w = noise amount (offset 256)
+    float    jitter[4];                 // xyz = froxel jitter, w = history blend alpha (offset 272)
+    float    prevCamPos[4];             // last frame's camera (temporal reprojection) (offset 288)
+    float    prevCamFwd[4];             //                                   (offset 304)
+    float    prevCamRight[4];           //                                   (offset 320)
+    float    prevCamUp[4];              //                                   (offset 336)
 };
-static_assert(sizeof(SceneUBO) == 240, "SceneUBO must match the std140 WGSL Scene layout");
+static_assert(sizeof(SceneUBO) == 352, "SceneUBO must match the std140 WGSL Scene layout");
 
 // ---- shared WGSL snippets ------------------------------------------------------------------------
 // Each pipeline's source = a few of these concatenated (after the shared kVS). Keeping the SDF + camera
@@ -57,6 +68,13 @@ struct Scene {
     resolution : vec2f,
     count      : u32,
     time       : f32,
+    fog          : vec4f,
+    fogColor     : vec4f,
+    jitter       : vec4f,
+    prevCamPos   : vec4f,
+    prevCamFwd   : vec4f,
+    prevCamRight : vec4f,
+    prevCamUp    : vec4f,
 };
 @group(0) @binding(0) var<uniform> scene : Scene;
 )";
@@ -292,6 +310,162 @@ static const char* kUvHelper = R"(
 fn uv_of(ndc : vec2f) -> vec2f { return vec2f(ndc.x, -ndc.y) * 0.5 + 0.5; }
 )";
 
+// ---- froxel volumetric fog ----------------------------------------------------------------------
+// A 160x90x64 view-frustum-aligned grid. inject scatters light per froxel, integrate marches the
+// columns front-to-back, apply composites the result over the lit scene. The grid is built straight
+// in y-up clip space (camera_ray off the UBO basis), so it stays matrix-free like the rest of the demo
+// and the froxel's xy match a screen pixel's ndc directly (no y flip; uv_of is for framebuffer textures).
+
+// froxel<->depth mapping + phase + temporal reprojection. needs kSceneDecl + kCameraDefs (camera_ray,
+// FAR, FOV). grid dims are WGSL literals here, same as kCameraDefs hardcodes FAR/FOV.
+static const char* kFogDefs = R"(
+const FOG_NEAR : f32 = 0.5;
+fn froxel_slice_to_dist(zf : f32) -> f32 {                 // slice center -> axial distance, exponential
+    return FOG_NEAR * pow(FAR / FOG_NEAR, (zf + 0.5) / 64.0);
+}
+fn froxel_dist_to_slice(dist : f32) -> f32 {               // inverse, normalized [0,1] for the w texcoord
+    let d = clamp(dist, FOG_NEAR, FAR);
+    return log(d / FOG_NEAR) / log(FAR / FOG_NEAR);
+}
+// world center of froxel `coord`, jittered by scene.jitter (xy in-cell, z along the slice) for temporal AA.
+fn froxel_world_pos(coord : vec3u, aspect : f32) -> vec3f {
+    let ndc  = vec2f((f32(coord.x) + 0.5 + scene.jitter.x) / 160.0 * 2.0 - 1.0,
+                     (f32(coord.y) + 0.5 + scene.jitter.y) / 90.0  * 2.0 - 1.0);
+    let dist = froxel_slice_to_dist(f32(coord.z) + scene.jitter.z);
+    let rd   = camera_ray(ndc, aspect);
+    return scene.camPos.xyz + rd * (dist / max(dot(rd, scene.camFwd.xyz), 1e-3));   // axial dist -> ray length
+}
+fn phase_hg(cosT : f32, g : f32) -> f32 {                  // Henyey-Greenstein: g>0 forward, g<0 back scatter
+    let g2 = g * g;
+    let d  = 1.0 + g2 - 2.0 * g * cosT;
+    return (1.0 - g2) / pow(max(d, 1e-4), 1.5);            // 4*pi folded into the scatter term so fog fades to a visible colour, not black
+}
+// project a world point into LAST frame's grid (uvw in [0,1]); inverse of froxel_world_pos vs prevCam*.
+fn prev_froxel_uvw(wp : vec3f, aspect : f32) -> vec3f {
+    let rel   = wp - scene.prevCamPos.xyz;
+    let axial = dot(rel, scene.prevCamFwd.xyz);
+    if (axial <= FOG_NEAR) { return vec3f(-1.0); }         // behind / nearer than the grid -> reject
+    let t  = tan(0.5 * FOV);
+    let nx = dot(rel, scene.prevCamRight.xyz) / (axial * aspect * t);
+    let ny = dot(rel, scene.prevCamUp.xyz)    / (axial * t);
+    return vec3f(nx * 0.5 + 0.5, ny * 0.5 + 0.5, froxel_dist_to_slice(axial));   // same y-up convention as inject
+}
+// cheap 3D value-noise fbm to break the fog into wisps. STATIC world-space field on purpose: an animated
+// one would drift between frames and the camera-only temporal reprojection would smear it (needs motion
+// vectors). the per-frame froxel jitter + temporal EMA supersample this field, so the wisps stay smooth.
+fn hash13(p : vec3f) -> f32 {
+    var q = fract(p * 0.1031);
+    q = q + dot(q, q.zyx + 31.32);
+    return fract((q.x + q.y) * q.z);
+}
+fn value_noise(p : vec3f) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let x00 = mix(hash13(i + vec3f(0.0, 0.0, 0.0)), hash13(i + vec3f(1.0, 0.0, 0.0)), u.x);
+    let x10 = mix(hash13(i + vec3f(0.0, 1.0, 0.0)), hash13(i + vec3f(1.0, 1.0, 0.0)), u.x);
+    let x01 = mix(hash13(i + vec3f(0.0, 0.0, 1.0)), hash13(i + vec3f(1.0, 0.0, 1.0)), u.x);
+    let x11 = mix(hash13(i + vec3f(0.0, 1.0, 1.0)), hash13(i + vec3f(1.0, 1.0, 1.0)), u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+fn fbm3(p : vec3f) -> f32 {
+    var v = 0.0; var a = 0.5; var q = p;
+    for (var i = 0; i < 4; i = i + 1) { v = v + a * value_noise(q); q = q * 2.02; a = a * 0.5; }
+    return v;
+}
+)";
+
+// CSM lookup for the inject pass. shadowMap at @binding(1); Shadow + sample_shadow are copied verbatim
+// from kLightingFs (deliberately duplicated, not abstracted -- the WebGPU API isn't wrapped here).
+static const char* kFogShadowDecl = R"(
+@group(0) @binding(1) var shadowMap : texture_depth_2d_array;
+struct Shadow { factor : f32, cascade : i32 };
+fn sample_shadow(wp : vec3f) -> Shadow {
+    let dir = scene.lightDir.xyz;
+    for (var c = 0u; c < NUM_CASCADES; c = c + 1u) {
+        let ls = light_space(wp, dir, csm_ortho(c));
+        if (abs(ls.x) > 1.0 || abs(ls.y) > 1.0 || ls.z > 1.0 || ls.z < 0.0) { continue; }
+        let dim = vec2f(textureDimensions(shadowMap));
+        let tx  = vec2i(i32((ls.x * 0.5 + 0.5) * dim.x), i32((0.5 - ls.y * 0.5) * dim.y));
+        let stored = textureLoad(shadowMap, tx, i32(c), 0);
+        return Shadow(select(1.0, 0.0, ls.z - 0.004 > stored), i32(c));
+    }
+    return Shadow(1.0, -1);
+}
+)";
+
+// inject + scatter + temporal blend: density (height fog) + shadowed in-scatter per froxel, blended with
+// the reprojected history slice, written to volume A. one thread per froxel.
+static const char* kFogInjectBody = R"(
+@group(0) @binding(2) var triSampler : sampler;
+@group(0) @binding(3) var histPrev   : texture_3d<f32>;
+@group(0) @binding(4) var scatterOut : texture_storage_3d<rgba16float, write>;
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+    if (any(gid >= vec3u(160u, 90u, 64u))) { return; }
+    let aspect = scene.resolution.x / scene.resolution.y;
+    let wp = froxel_world_pos(gid, aspect);
+    let h  = max(wp.y - (-1.5), 0.0);                            // height above the ground plane (matches map())
+    let noise = fbm3(wp * 0.45);                                // static world-space wisps -> breaks up the haze
+    let dens  = mix(1.0, noise * 2.0, scene.fogColor.w);        // fogColor.w = noise amount (0 = uniform haze)
+    let sigma_t = scene.fog.x * exp(-h * scene.fog.z) * dens;   // density: height falloff modulated by noise
+    let L  = normalize(-scene.lightDir.xyz);                    // toward the sun
+    let V  = normalize(scene.camPos.xyz - wp);                  // toward the camera
+    let sh = sample_shadow(wp);
+    let phase = phase_hg(dot(-V, L), scene.fog.y);             // view ray into the scene vs sun: g>0 glows toward the sun
+    let inscat = (scene.lightColor.rgb * sh.factor * phase + vec3f(scene.fog.w)) * scene.fogColor.rgb * sigma_t;
+    var cur = vec4f(inscat, sigma_t);
+    let puv = prev_froxel_uvw(wp, aspect);                      // reproject into last frame's grid
+    if (all(puv >= vec3f(0.0)) && all(puv <= vec3f(1.0))) {     // history valid -> exponential moving average
+        let hist = textureSampleLevel(histPrev, triSampler, puv, 0.0);
+        cur = mix(hist, cur, scene.jitter.w);
+    }
+    textureStore(scatterOut, vec3i(gid), cur);
+}
+)";
+
+// integrate: march each (x,y) column front-to-back, accumulating in-scatter weighted by transmittance.
+// reads volume A as a sampled texture (textureLoad, integer coords) -> no read-capable storage needed.
+static const char* kFogIntegrateBody = R"(
+@group(0) @binding(0) var scatterIn : texture_3d<f32>;
+@group(0) @binding(1) var integOut  : texture_storage_3d<rgba16float, write>;
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+    if (gid.x >= 160u || gid.y >= 90u) { return; }
+    var accum = vec3f(0.0);
+    var transmittance = 1.0;
+    for (var z = 0u; z < 64u; z = z + 1u) {
+        let s  = textureLoad(scatterIn, vec3i(i32(gid.x), i32(gid.y), i32(z)), 0);
+        let dz = froxel_slice_to_dist(f32(z) + 1.0) - froxel_slice_to_dist(f32(z));   // slab thickness
+        let sliceT = exp(-s.a * dz);                                                  // Beer-Lambert over the slab
+        accum = accum + transmittance * s.rgb * (1.0 - sliceT) / max(s.a, 1e-5);      // energy-conserving slab integral
+        transmittance = transmittance * sliceT;
+        textureStore(integOut, vec3i(i32(gid.x), i32(gid.y), i32(z)), vec4f(accum, transmittance));
+    }
+}
+)";
+
+// apply: per pixel map the gbuffer's linear depth to a froxel slice, trilinear-sample the integrated
+// volume, composite as transmittance*scene + in-scatter. fullscreen, UBO at binding 0.
+static const char* kFogApplyFs = R"(
+@group(0) @binding(1) var litColor : texture_2d<f32>;
+@group(0) @binding(2) var gDepth   : texture_depth_2d;
+@group(0) @binding(3) var fogVol   : texture_3d<f32>;
+@group(0) @binding(4) var fogSamp  : sampler;
+@fragment fn fs(in : VsOut) -> @location(0) vec4f {
+    let px  = vec2i(in.pos.xy);
+    let lit = textureLoad(litColor, px, 0).rgb;
+    let lin = textureLoad(gDepth, px, 0);
+    let aspect = scene.resolution.x / scene.resolution.y;
+    let rd = camera_ray(in.ndc, aspect);
+    let dist  = select(lin * FAR, FAR, lin >= 1.0);            // background fogs to the far plane
+    let axial = dist * dot(rd, scene.camFwd.xyz);              // gbuffer stores ray length -> axial distance
+    let uvw = vec3f(in.ndc.x * 0.5 + 0.5, in.ndc.y * 0.5 + 0.5, froxel_dist_to_slice(axial));
+    let fog = textureSampleLevel(fogVol, fogSamp, uvw, 0.0);
+    return vec4f(lit * fog.a + fog.rgb, 1.0);
+}
+)";
+
 // compose fragment: lit colour modulated by AO. Only declared when SSAO is on (off, compose is skipped
 // and lit is presented directly), so AO here is always a real texture.
 // ponytail: AO multiplies the whole lit result, not just the ambient term; if it over-darkens lit
@@ -410,11 +584,15 @@ static WGPURenderPipeline  composePipe = nullptr, presentPipe = nullptr, taaPipe
 static WGPURenderPipeline  bloomExtractPipe = nullptr, bloomDownPipe = nullptr, bloomUpPipe = nullptr, bloomCompositePipe = nullptr;
 static WGPURenderPipeline  cubeSamplePipe = nullptr;
 static WGPUComputePipeline ssaoPipe = nullptr;
-static WGPUSampler         linSampler = nullptr;   // linear/clamp, shared by compose/bloom/cube
+static WGPUComputePipeline fogInjectPipe = nullptr, fogIntegratePipe = nullptr;   // froxel volumetrics
+static WGPURenderPipeline  fogApplyPipe = nullptr;
+static WGPUSampler         linSampler = nullptr;   // linear/clamp on all 3 axes; shared by compose/bloom/cube/fog
 static WGPUBuffer          uboBuf = nullptr;       // demo-owned scene UBO, imported into the graph each frame
 
 // feature toggles (ImGui checkboxes in deferred_ui; persist across demo switches).
 static bool ssaoOn = true, taaOn = true, bloomOn = false, cubeOn = false;
+static bool  fogOn = true;   // froxel volumetric fog; default on so the new passes run out of the box
+static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f, fogAmbient = 0.02f, fogNoise = 0.8f;
 
 // the gbuffer's four outputs, threaded through the chain as one value.
 struct GBuffer { ResourceHandle albedo, normal, rough, depth; };
@@ -624,6 +802,111 @@ static ResourceHandle build_compose(RenderGraph* rg, WGPUDevice dev, ResourceHan
             wgpuBindGroupLayoutRelease(l);
         });
     return scene;
+}
+
+// froxel volumetric fog: inject + scatter (compute) -> integrate (compute) -> apply (graphics), composited
+// over the lit scene. the scatter volume is temporal (ping-pong): inject blends this frame's froxels with
+// last frame's reprojected slice, so the grid converges instead of shimmering. returns the input unchanged
+// when off -> the volumes then accumulate zero usage and realize() skips them.
+// ponytail: one isotropic height-fog medium + per-froxel jitter only. the medium is static, so reprojection
+// is camera-only (no per-froxel motion vectors); add those + blue-noise jitter for moving/animated media.
+static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, ResourceHandle ubo,
+                                        ResourceHandle scene, ResourceHandle gDepth, ResourceHandle csm,
+                                        ResourceHandle swap, bool enabled)
+{
+    if (!enabled) return scene;
+    WGPUDevice dev = env.device;
+    const TextureDesc desc3d{
+        .dimension = WGPUTextureDimension_3D, .format = kFogFormat,
+        .sizeKind = SizeKind::Absolute, .absolute = { kFroxelX, kFroxelY, kFroxelZ }, .mipLevelCount = 1,
+    };
+    auto scatter  = rg->create_temporal_image(WEBGPU_STR("fog.scatter"), desc3d);   // .curr write, .prev history
+    auto volInteg = rg->create_image(WEBGPU_STR("fog.integrated"), desc3d);
+    const uint32_t ix = (kFroxelX + 3) / 4, iy = (kFroxelY + 3) / 4, iz = (kFroxelZ + 3) / 4;   // inject 4x4x4
+    const uint32_t cx = (kFroxelX + 7) / 8, cy = (kFroxelY + 7) / 8;                            // integrate 8x8x1
+
+    // inject: scene UBO + CSM + last frame's volume -> scatter.curr.
+    rg->add_pass(WEBGPU_STR("fog.inject"), PassKind::Compute,
+        [&](GraphBuilder& b) {
+            b.uniform(ubo);
+            b.sampled(csm);
+            b.sampled(scatter.prev);
+            b.storage_write(scatter.curr);
+        },
+        [dev, ubo, csm, scatter, ix, iy, iz](PassContext& ctx) {
+            // CSM bound as one depth-2d-array view spanning all cascades, exactly like the lighting body.
+            WGPUTextureViewDescriptor avd{
+                .format = kDepthFormat, .dimension = WGPUTextureViewDimension_2DArray,
+                .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = kNumCascades,
+            };
+            WGPUTextureView csmView = wgpuTextureCreateView(ctx.texture(csm), &avd);
+            WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(fogInjectPipe, 0);
+            WGPUBindGroupEntry e[5] = {
+                { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(SceneUBO) },
+                { .binding = 1, .textureView = csmView },
+                { .binding = 2, .sampler = linSampler },
+                { .binding = 3, .textureView = ctx.view(scatter.prev) },   // default full-volume 3D view
+                { .binding = 4, .textureView = ctx.view(scatter.curr) },
+            };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 5, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+            wgpuComputePassEncoderSetPipeline(ctx.compute, fogInjectPipe);
+            wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, ix, iy, iz);
+            wgpuBindGroupRelease(bg);
+            wgpuBindGroupLayoutRelease(l);
+            wgpuTextureViewRelease(csmView);
+        });
+
+    // integrate: scatter.curr -> integrated volume, accumulating in-scatter + transmittance per column.
+    rg->add_pass(WEBGPU_STR("fog.integrate"), PassKind::Compute,
+        [&](GraphBuilder& b) {
+            b.sampled(scatter.curr);
+            b.storage_write(volInteg);
+        },
+        [dev, scatter, volInteg, cx, cy](PassContext& ctx) {
+            WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(fogIntegratePipe, 0);
+            WGPUBindGroupEntry e[2] = {
+                { .binding = 0, .textureView = ctx.view(scatter.curr) },
+                { .binding = 1, .textureView = ctx.view(volInteg) },
+            };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+            wgpuComputePassEncoderSetPipeline(ctx.compute, fogIntegratePipe);
+            wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, cx, cy, 1);
+            wgpuBindGroupRelease(bg);
+            wgpuBindGroupLayoutRelease(l);
+        });
+
+    // apply: composite the integrated fog over the lit scene -> new scene colour.
+    auto out = screen_tex(rg, "fog.scene", kSwapFormat, swap);
+    rg->add_pass(WEBGPU_STR("fog.apply"), PassKind::Graphics,
+        [&](GraphBuilder& b) {
+            b.uniform(ubo);
+            b.sampled(scene);
+            b.sampled(gDepth);
+            b.sampled(volInteg);
+            b.color(out, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+        },
+        [dev, ubo, scene, gDepth, volInteg](PassContext& ctx) {
+            WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(fogApplyPipe, 0);
+            WGPUBindGroupEntry e[5] = {
+                { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(SceneUBO) },
+                { .binding = 1, .textureView = ctx.view(scene) },
+                { .binding = 2, .textureView = ctx.view(gDepth) },
+                { .binding = 3, .textureView = ctx.view(volInteg) },
+                { .binding = 4, .sampler = linSampler },
+            };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 5, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+            wgpuRenderPassEncoderSetPipeline(ctx.render, fogApplyPipe);
+            wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+            wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+            wgpuBindGroupRelease(bg);
+            wgpuBindGroupLayoutRelease(l);
+        });
+    return out;
 }
 
 // cubemap skybox (array-layer subresource): clear 6 faces into one cube texture, sample it by camera ray
@@ -925,6 +1208,38 @@ static void deferred_init(const DemoEnv& env)
     ssaoPipe = wgpuDeviceCreateComputePipeline(dev, &ssaoPD);
     wgpuShaderModuleRelease(ssaoSM);
 
+    // fog inject: density + shadowed in-scatter per froxel, temporal-blended into the scatter volume.
+    WGPUShaderModule fogInjSM = make_shader(dev, std::string(kSceneDecl) + kCameraDefs + kFogShadowDecl + kFogDefs + kFogInjectBody);
+    WGPUComputePipelineDescriptor fogInjPD{
+        .label = WEBGPU_STR("fog.inject pipeline"),
+        .compute = { .module = fogInjSM, .entryPoint = WEBGPU_STR("main") },
+    };
+    fogInjectPipe = wgpuDeviceCreateComputePipeline(dev, &fogInjPD);
+    wgpuShaderModuleRelease(fogInjSM);
+
+    // fog integrate: march each froxel column front-to-back into the integrated volume.
+    WGPUShaderModule fogIntSM = make_shader(dev, std::string(kSceneDecl) + kCameraDefs + kFogDefs + kFogIntegrateBody);
+    WGPUComputePipelineDescriptor fogIntPD{
+        .label = WEBGPU_STR("fog.integrate pipeline"),
+        .compute = { .module = fogIntSM, .entryPoint = WEBGPU_STR("main") },
+    };
+    fogIntegratePipe = wgpuDeviceCreateComputePipeline(dev, &fogIntPD);
+    wgpuShaderModuleRelease(fogIntSM);
+
+    // fog apply: composite the integrated volume over the lit scene (fullscreen).
+    WGPUShaderModule fogAppSM = make_shader(dev, std::string(kVS) + kSceneDecl + kCameraDefs + kFogDefs + kFogApplyFs);
+    WGPUColorTargetState fogAppCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
+    WGPUFragmentState fogAppFrag{ .module = fogAppSM, .entryPoint = WEBGPU_STR("fs"), .targetCount = 1, .targets = &fogAppCT };
+    WGPURenderPipelineDescriptor fogAppPD{
+        .label = WEBGPU_STR("fog.apply pipeline"),
+        .vertex = { .module = fogAppSM, .entryPoint = WEBGPU_STR("vs") },
+        .primitive = { .topology = WGPUPrimitiveTopology_TriangleList },
+        .multisample = { .count = 1, .mask = ~0u },
+        .fragment = &fogAppFrag,
+    };
+    fogApplyPipe = wgpuDeviceCreateRenderPipeline(dev, &fogAppPD);
+    wgpuShaderModuleRelease(fogAppSM);
+
     // compose: lit * ao -> scene color (samples ao, so a 1x1 identity works when SSAO off).
     WGPUShaderModule composeSM = make_shader(dev, std::string(kVS) + kUvHelper + kComposeFs);
     WGPUColorTargetState composeCT{ .format = kSwapFormat, .writeMask = WGPUColorWriteMask_All };
@@ -1077,6 +1392,9 @@ static void deferred_shutdown()
     wgpuRenderPipelineRelease(taaPipe);
     wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(composePipe);
+    wgpuRenderPipelineRelease(fogApplyPipe);
+    wgpuComputePipelineRelease(fogIntegratePipe);
+    wgpuComputePipelineRelease(fogInjectPipe);
     wgpuComputePipelineRelease(ssaoPipe);
     wgpuRenderPipelineRelease(lightingPipe);
     wgpuRenderPipelineRelease(shadowPipe);
@@ -1114,6 +1432,29 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     for (int i = 0; i < 3; ++i) { sb.camPos[i] = env.camera.pos[i]; sb.camFwd[i] = env.camera.fwd[i]; sb.camRight[i] = env.camera.right[i]; sb.camUp[i] = env.camera.up[i]; }
     sb.resolution[0] = (float)env.width; sb.resolution[1] = (float)env.height;
     sb.time = t;
+
+    // froxel fog params + temporal state. prevCam* drive the reprojection; jitter (Halton, keyed to the
+    // frame index) shifts the grid each frame so the temporal blend converges. carried across frames in
+    // statics; on the first build prev == current, so prev_froxel_uvw maps a froxel onto itself (no-op).
+    static float sPrevPos[3] = {0,0,0}, sPrevFwd[3] = {0,0,1}, sPrevRight[3] = {1,0,0}, sPrevUp[3] = {0,1,0};
+    static bool  sHavePrev = false;
+    sb.fog[0] = fogDensity; sb.fog[1] = fogAnisotropy; sb.fog[2] = fogHeightFalloff; sb.fog[3] = fogAmbient;
+    sb.fogColor[0] = 0.9f; sb.fogColor[1] = 0.95f; sb.fogColor[2] = 1.0f; sb.fogColor[3] = fogNoise;   // w = noise amount
+    for (int i = 0; i < 3; ++i) {
+        sb.prevCamPos[i]   = sHavePrev ? sPrevPos[i]   : env.camera.pos[i];
+        sb.prevCamFwd[i]   = sHavePrev ? sPrevFwd[i]   : env.camera.fwd[i];
+        sb.prevCamRight[i] = sHavePrev ? sPrevRight[i] : env.camera.right[i];
+        sb.prevCamUp[i]    = sHavePrev ? sPrevUp[i]    : env.camera.up[i];
+    }
+    auto halton = [](uint32_t i, uint32_t b) { float f = 1.0f, r = 0.0f; while (i > 0) { f /= (float)b; r += f * (float)(i % b); i /= b; } return r; };
+    const uint32_t fi = (uint32_t)(env.frame & 1023u) + 1u;       // +1 so index 0 isn't the degenerate origin
+    sb.jitter[0] = halton(fi, 2u) - 0.5f;
+    sb.jitter[1] = halton(fi, 3u) - 0.5f;
+    sb.jitter[2] = halton(fi, 5u) - 0.5f;
+    sb.jitter[3] = sHavePrev ? 0.05f : 1.0f;                      // history blend alpha; first frame ignores history
+    for (int i = 0; i < 3; ++i) { sPrevPos[i] = env.camera.pos[i]; sPrevFwd[i] = env.camera.fwd[i]; sPrevRight[i] = env.camera.right[i]; sPrevUp[i] = env.camera.up[i]; }
+    sHavePrev = true;
+
     wgpuQueueWriteBuffer(env.queue, uboBuf, 0, &sb, sizeof(sb));
     ResourceHandle ubo = rg->import_buffer(WEBGPU_STR("scene.ubo"), uboBuf);
 
@@ -1128,6 +1469,7 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
         ResourceHandle lit = build_lighting(rg, dev, ubo, g, csm, swap);
         build_sky(rg, dev, g.depth, lit);
         scene = build_compose(rg, dev, lit, ao, swap, ssaoOn);   // SSAO off -> compose skipped, lit passes through
+        scene = build_volumetrics(rg, env, ubo, scene, g.depth, csm, swap, fogOn);   // froxel fog over lit + sky
     }
 
     // ---- post chain: each effect inserts passes or returns the colour unchanged ----
@@ -1143,4 +1485,12 @@ static void deferred_ui()
     ImGui::Checkbox("TAA", &taaOn);
     ImGui::Checkbox("Bloom", &bloomOn);
     ImGui::Checkbox("Cubemap", &cubeOn);
+    ImGui::Checkbox("Volumetric Fog", &fogOn);
+    if (fogOn) {
+        ImGui::SliderFloat("Fog density",    &fogDensity,       0.0f, 0.5f);
+        ImGui::SliderFloat("Fog anisotropy", &fogAnisotropy,   -0.9f, 0.9f);
+        ImGui::SliderFloat("Fog height",     &fogHeightFalloff, 0.0f, 1.0f);
+        ImGui::SliderFloat("Fog ambient",    &fogAmbient,       0.0f, 0.2f);
+        ImGui::SliderFloat("Fog noise",      &fogNoise,         0.0f, 1.0f);
+    }
 }
