@@ -74,6 +74,24 @@ static size_t sv_length(WGPUStringView s)
     return (s.length == WGPU_STRLEN) ? (s.data ? std::strlen(s.data) : 0) : s.length;
 }
 
+// content equality of two string views (length-normalized, NUL-safe).
+static bool sv_eq(WGPUStringView a, WGPUStringView b)
+{
+    size_t na = sv_length(a), nb = sv_length(b);
+    return na == nb && (na == 0 || std::memcmp(a.data, b.data, na) == 0);
+}
+
+// group label of a pass name: the span before the first '.', empty if none. passes are named dotted
+// by convention (shadow.cascade, bloom.down) -- that prefix is the logical group the debug tooling
+// (markers, DAG, mermaid) brackets. shares the same backing chars, so it's a view, not a copy.
+static WGPUStringView group_prefix(WGPUStringView name)
+{
+    size_t n = sv_length(name);
+    for (size_t i = 0; i < n; ++i)
+        if (name.data[i] == '.') return WGPUStringView{ .data = name.data, .length = i };
+    return WGPUStringView{};
+}
+
 // Owns GPU resources that must outlive the per-frame graph teardown -- today, temporal/history textures
 // (temporal accumulation, history feedback). One Entry per logical temporal resource, keyed by name content (the
 // graph copies names into the per-frame arena, so the pointers don't survive between frames). Each Entry
@@ -1079,6 +1097,22 @@ void debug_print_mermaid(RenderGraph* rg)
     for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
         std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->name.length, p->name.data ? p->name.data : "");
 
+    // bracket each contiguous run of same-prefix passes (shadow.cascade, bloom.*) in a subgraph -- the
+    // mermaid analogue of the DAG's group frames and the encoder debug groups. node ids resolve wherever
+    // declared, so nodes -> subgraphs -> edges renders correctly.
+    uint32_t gi = 0;
+    for (PassNode* a = s.m_passes; a; ) {
+        WGPUStringView pre = group_prefix(a->name);
+        PassNode* b = a->next; uint32_t gj = gi + 1;
+        while (b && sv_length(pre) && sv_eq(group_prefix(b->name), pre)) { b = b->next; ++gj; }
+        if (sv_length(pre) && gj - gi >= 2) {
+            std::printf("  subgraph \"%.*s\"\n", (int)sv_length(pre), pre.data);
+            for (uint32_t k = gi; k < gj; ++k) std::printf("    P%u\n", k);
+            std::printf("  end\n");
+        }
+        a = b; gi = gj;
+    }
+
     // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
     sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
@@ -1264,7 +1298,18 @@ void RenderGraph::realize(WGPUDevice device)
 void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
 {
     RenderGraphStorage& s = *storage(this);
+    // bracket each contiguous run of same-prefix passes (shadow.cascade x3, bloom.*) in an encoder
+    // debug group, so a RenderDoc/PIX capture shows collapsible regions over the per-pass labels.
+    // push/pop happen between passes (no pass open at that point) -> balanced + nested by construction.
+    WGPUStringView openGroup{};
     for (PassNode* p = s.m_passes; p; p = p->next) {
+        WGPUStringView grp = group_prefix(p->name);
+        if (!sv_eq(grp, openGroup)) {
+            if (sv_length(openGroup)) wgpuCommandEncoderPopDebugGroup(encoder);
+            if (sv_length(grp))       wgpuCommandEncoderPushDebugGroup(encoder, grp);
+            openGroup = grp;
+        }
+
         PassContext ctx{};
         ctx.encoder = encoder;
         ctx.graph = this;
@@ -1369,6 +1414,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
         // them now the pass has ended. runs for every kind, so ctx.view() auto-releases in compute/transfer too.
         for (uint32_t i = 0; i < s.viewScratchN; ++i) wgpuTextureViewRelease(s.viewScratch[i]);
     }
+    if (sv_length(openGroup)) wgpuCommandEncoderPopDebugGroup(encoder);   // close the last open group
 }
 
 // release graph-created GPU handles (imported ones are caller-owned -> left alone). pairs with
