@@ -76,13 +76,3 @@ static WGPUShaderModule make_shader(WGPUDevice dev, const std::string& code)
 {
     return make_shader(dev, WGPUStringView{ code.c_str(), code.size() });
 }
-
-// a single-mip 2D view of one texture -- how a pass body samples a chosen mip (bloom's mip chain).
-static WGPUTextureView mip_view_2d(WGPUTexture tex, WGPUTextureFormat fmt, uint32_t mip)
-{
-    WGPUTextureViewDescriptor vd{
-        .format = fmt, .dimension = WGPUTextureViewDimension_2D,
-        .baseMipLevel = mip, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = 1,
-    };
-    return wgpuTextureCreateView(tex, &vd);
-}

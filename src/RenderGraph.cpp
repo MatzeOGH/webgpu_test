@@ -523,6 +523,10 @@ struct RenderGraphStorage
     WGPUDevice              m_device{};
     uint32_t                next_id = 1; // 0 = invalid handle
     ResourceNode**          byId{};      // id->node (sized next_id); built in compile() phase 3 -> O(1) find_node
+    // execute() scratch: subresource views built for the current pass (attachments + the body's ctx.view()),
+    // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
+    WGPUTextureView         viewScratch[PassNode::kMaxAccess]{};
+    uint32_t                viewScratchN{};
 };
 
 static RenderGraphStorage* storage(RenderGraph* rg)
@@ -1157,7 +1161,38 @@ void debug_print_lifetimes(RenderGraph* rg)
 
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
-    return find_node(graph, h)->view;
+    ResourceNode* r = find_node(graph, h);
+    if (!r) return {};                   // unknown / default handle (P4 will make this loud)
+    if (!r->texture) return r->view;     // imported: the caller-registered view (e.g. swapchain)
+
+    // a single-mip 2D texture's full view IS its only subresource, and a 3D volume is sampled whole, so the
+    // view already on the node is the right one -- hand it back (no per-call churn, and a 3D volume must not
+    // be sliced to one 2D layer). only a mip chain / 2D array needs a per-subresource view.
+    uint32_t layers = (r->dimension == WGPUTextureDimension_2D)
+                    ? (r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1) : 1;
+    if (!pass || (r->mipLevelCount <= 1 && layers <= 1)) return r->view;
+
+    // mip chain / array: hand back the (baseMip, baseLayer) 2D slice the body's READ access declared, pooled
+    // with the attachment views for release after the pass (exactly like attach_view in execute()).
+    // ponytail: a 3D mip chain would fall through and get a 2D view -- none exist; revisit if one does.
+    const ResourceAccess* rd = nullptr;
+    for (uint32_t i = 0; i < pass->accessCount; ++i) {
+        const ResourceAccess& a = pass->accesses[i];
+        if (a.handle.id == h.id && !access_is_write(a.type)) {
+            assert(!rd && "ctx.view: two reads of one handle in a pass -- ambiguous subresource; use ctx.texture");
+            rd = &a;
+        }
+    }
+    if (!rd) return r->view;   // viewed but not declared as a read in this pass -> the full view
+    RenderGraphStorage& s = *storage(graph);
+    WGPUTextureViewDescriptor vd{
+        .format          = r->format,
+        .dimension       = WGPUTextureViewDimension_2D,
+        .baseMipLevel    = rd->baseMip,   .mipLevelCount   = 1,
+        .baseArrayLayer  = rd->baseLayer, .arrayLayerCount = 1,
+    };
+    assert(s.viewScratchN < PassNode::kMaxAccess);
+    return s.viewScratch[s.viewScratchN++] = wgpuTextureCreateView(r->texture, &vd);
 }
 
 WGPUTexture PassContext::texture(ResourceHandle h) const
@@ -1228,11 +1263,14 @@ void RenderGraph::realize(WGPUDevice device)
 // rather than shared because those live in Renderer.cpp (not a header) and this TU is standalone.
 void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
 {
-    for (PassNode* p = storage(this)->m_passes; p; p = p->next) {
+    RenderGraphStorage& s = *storage(this);
+    for (PassNode* p = s.m_passes; p; p = p->next) {
         PassContext ctx{};
         ctx.encoder = encoder;
         ctx.graph = this;
         ctx.queue = queue;
+        ctx.pass = p;
+        s.viewScratchN = 0;   // per-pass: attachment + body ctx.view() views accumulate here, freed after the body
 
         if (p->kind == PassKind::Compute && p->exec_fn) {
             WGPUComputePassDescriptor cd{ .label = p->name };
@@ -1255,10 +1293,9 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             // (r->texture null, e.g. swapchain) keep their caller-owned registered view.
             // ponytail: rebuilt per pass per frame; cache on the node keyed by subresource if it ever shows
             // up in a profile.
-            // attach_view runs at most once per access; sized to the per-pass access ceiling so a
-            // malformed pass (e.g. >1 depth, or 8 color + extra depth) can't overrun before Dawn validates.
-            WGPUTextureView made[PassNode::kMaxAccess]{};
-            uint32_t nmade = 0;
+            // built views land in the shared per-pass scratch (s.viewScratch, drained after the body) so the
+            // body's own ctx.view() reads pool with these attachments. one view per access -> the per-pass
+            // access ceiling bounds it; the assert guards an overrun that construction already prevents.
             auto attach_view = [&](ResourceNode* r, const ResourceAccess& a) -> WGPUTextureView {
                 if (!r->texture) return r->view;
                 WGPUTextureViewDescriptor vd{
@@ -1267,7 +1304,8 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                     .baseMipLevel    = a.baseMip,   .mipLevelCount   = 1,
                     .baseArrayLayer  = a.baseLayer, .arrayLayerCount = 1,
                 };
-                return made[nmade++] = wgpuTextureCreateView(r->texture, &vd);
+                assert(s.viewScratchN < PassNode::kMaxAccess);
+                return s.viewScratch[s.viewScratchN++] = wgpuTextureCreateView(r->texture, &vd);
             };
 
             for (uint32_t i = 0; i < p->accessCount; ++i) {
@@ -1322,11 +1360,14 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             p->exec_fn(p->exec_obj, ctx);
             wgpuRenderPassEncoderEnd(ctx.render);
             wgpuRenderPassEncoderRelease(ctx.render);
-            for (uint32_t i = 0; i < nmade; ++i) wgpuTextureViewRelease(made[i]);   // attachment views are pass-scoped
         }
         else { // Transfer / None: body records straight onto the encoder
             if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
         }
+
+        // pass-scoped subresource views (attachments built above + any the body built via ctx.view()) -- free
+        // them now the pass has ended. runs for every kind, so ctx.view() auto-releases in compute/transfer too.
+        for (uint32_t i = 0; i < s.viewScratchN; ++i) wgpuTextureViewRelease(s.viewScratch[i]);
     }
 }
 

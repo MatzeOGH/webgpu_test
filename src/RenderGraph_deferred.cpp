@@ -1004,11 +1004,10 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
                 b.sampled(bloom, i);
                 b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, i + 1);
             },
-            [dev, bloom, i](PassContext& ctx) {
-                WGPUTextureView srcView = mip_view_2d(ctx.texture(bloom), kColorFormat, i);
+            [dev, bloom](PassContext& ctx) {
                 WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomDownPipe, 0);
                 WGPUBindGroupEntry e[2] = {
-                    { .binding = 0, .textureView = srcView },
+                    { .binding = 0, .textureView = ctx.view(bloom) },   // declared read mip; graph-built + freed after the pass
                     { .binding = 1, .sampler = linSampler },
                 };
                 WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
@@ -1018,7 +1017,6 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
                 wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
                 wgpuBindGroupRelease(bg);
                 wgpuBindGroupLayoutRelease(l);
-                wgpuTextureViewRelease(srcView);
             });
     }
 
@@ -1030,11 +1028,10 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
                 b.sampled(bloom, i);
                 b.color(bloom, WGPULoadOp_Load, WGPUStoreOp_Store, WGPUColor{}, i - 1);
             },
-            [dev, bloom, i](PassContext& ctx) {
-                WGPUTextureView srcView = mip_view_2d(ctx.texture(bloom), kColorFormat, i);
+            [dev, bloom](PassContext& ctx) {
                 WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomUpPipe, 0);
                 WGPUBindGroupEntry e[2] = {
-                    { .binding = 0, .textureView = srcView },
+                    { .binding = 0, .textureView = ctx.view(bloom) },   // declared read mip; graph-built + freed after the pass
                     { .binding = 1, .sampler = linSampler },
                 };
                 WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
@@ -1044,7 +1041,6 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
                 wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
                 wgpuBindGroupRelease(bg);
                 wgpuBindGroupLayoutRelease(l);
-                wgpuTextureViewRelease(srcView);
             });
     }
 
@@ -1057,11 +1053,10 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
             b.color(result, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },
         [dev, scene, bloom](PassContext& ctx) {
-            WGPUTextureView mip0 = mip_view_2d(ctx.texture(bloom), kColorFormat, 0);
             WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(bloomCompositePipe, 0);
             WGPUBindGroupEntry e[3] = {
                 { .binding = 0, .textureView = ctx.view(scene) },
-                { .binding = 1, .textureView = mip0 },
+                { .binding = 1, .textureView = ctx.view(bloom) },   // mip 0 (the declared read); graph-built + freed after the pass
                 { .binding = 2, .sampler = linSampler },
             };
             WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
@@ -1071,7 +1066,6 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
             wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);
-            wgpuTextureViewRelease(mip0);
         });
     return result;
 }

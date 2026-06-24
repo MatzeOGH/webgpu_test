@@ -68,6 +68,7 @@ struct PassContext
     WGPUComputePassEncoder compute{};  // set for Compute passes
     WGPUQueue queue{};
     RenderGraph* graph{};
+    PassNode* pass{};   // the pass being recorded; lets view(h) build the subresource the access declared
 
     WGPUTextureView view(ResourceHandle h) const;   // resolved view
     WGPUTexture texture(ResourceHandle h) const;    // resolved texture (copies need the texture, not a view)
