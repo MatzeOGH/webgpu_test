@@ -6,6 +6,7 @@
 namespace pt_demo {
 
 constexpr WGPUTextureFormat kAccumFormat = WGPUTextureFormat_RGBA16Float;  // HDR accumulation (renderable + sampleable in core)
+constexpr uint64_t          kAccumBytes  = 16;                             // pt.samples temporal buffer: array<u32,4>
 
 // camera basis + accumulation/quality knobs. scene lives in the shader, so nothing else crosses.
 struct PtUBO {
@@ -191,10 +192,40 @@ fn pt_aces(x : vec3f) -> vec3f {
 }
 )";
 
+// pt.accum: an isolated GPU-side accumulator that exercises create_persistent_buffer. it reads the UBO
+// reset flag and does an IN-PLACE read-modify-write on a single persistent buffer (var<storage, read_write>):
+// seed 0 on reset, else bump slot 0 each frame. own-slot RMW, so one buffer is correct -- no ping-pong.
+// nothing samples it downstream -> it survives culling only because it writes a persistent sink. the Pt
+// struct mirrors kCommon's so the UBO offsets line up.
+static const char* kAccumCS = R"(
+struct Pt {
+    camPos     : vec4f,
+    camFwd     : vec4f,
+    camRight   : vec4f,
+    camUp      : vec4f,
+    resolution : vec2f,
+    accumFrame : u32,
+    maxBounces : u32,
+    spp        : u32,
+    pad0 : u32, pad1 : u32, pad2 : u32,
+};
+@group(0) @binding(0) var<uniform> pt : Pt;
+@group(0) @binding(1) var<storage, read_write> samples : array<u32, 4>;
+@compute @workgroup_size(1)
+fn main() {
+    let reset = pt.accumFrame == 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let bump = select(0u, 1u, i == 0u);                   // only slot 0 counts frames
+        samples[i] = select(samples[i] + bump, 0u, reset);    // in-place RMW: read slot, write same slot
+    }
+}
+)";
+
 // ---- state (created once in init, lives across frames) ----
-static WGPURenderPipeline tracePipe   = nullptr;
-static WGPURenderPipeline presentPipe = nullptr;
-static WGPUBuffer         uboBuf       = nullptr;   // demo-owned, imported into the graph each frame
+static WGPURenderPipeline  tracePipe   = nullptr;
+static WGPURenderPipeline  presentPipe = nullptr;
+static WGPUComputePipeline accumPipe   = nullptr;   // pt.accum: temporal-buffer accumulator
+static WGPUBuffer          uboBuf       = nullptr;   // demo-owned, imported into the graph each frame
 
 // ---- accumulation knobs + the snapshot the reset logic compares against ----
 static int      maxBounces  = 5;        // ImGui slider: path depth cap
@@ -238,6 +269,14 @@ static void pathtracer_init(const DemoEnv& env)
     presentPipe = wgpuDeviceCreateRenderPipeline(dev, &presentPD);
     wgpuShaderModuleRelease(presentSM);
 
+    WGPUShaderModule accumSM = make_shader(dev, std::string(kAccumCS));
+    WGPUComputePipelineDescriptor accumPD{
+        .label   = WEBGPU_STR("pt.accum pipeline"),
+        .compute = { .module = accumSM, .entryPoint = WEBGPU_STR("main") },
+    };
+    accumPipe = wgpuDeviceCreateComputePipeline(dev, &accumPD);
+    wgpuShaderModuleRelease(accumSM);
+
     WGPUBufferDescriptor bd{ .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, .size = sizeof(PtUBO) };
     uboBuf = wgpuDeviceCreateBuffer(dev, &bd);
 }
@@ -246,6 +285,7 @@ static void pathtracer_shutdown()
 {
     using namespace pt_demo;
     wgpuBufferRelease(uboBuf);
+    wgpuComputePipelineRelease(accumPipe);
     wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(tracePipe);
 }
@@ -284,6 +324,31 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
         .dimension = WGPUTextureDimension_2D, .format = kAccumFormat,
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
     });
+
+    // P6: an in-place GPU accumulator in a SINGLE persistent buffer (no ping-pong) -- the showcase for
+    // create_persistent_buffer. read + write the same buffer in one pass (the StorageRead+StorageWrite RMW
+    // pair); own-slot, so one buffer is correct + half the memory of a temporal pair. nothing reads it, so
+    // trace/present are untouched -- it survives culling purely by writing a persistent sink.
+    auto acc = rg->create_persistent_buffer(WEBGPU_STR("pt.samples"), { .size = kAccumBytes });
+    rg->add_pass(WEBGPU_STR("pt.accum"), PassKind::Compute,
+        [&](GraphBuilder& b) {
+            b.uniform(ubo);
+            b.storage_read_write(acc);   // one call mirrors WGSL var<storage, read_write> samples
+        },
+        [dev, ubo, acc](PassContext& ctx) {
+            WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(accumPipe, 0);
+            WGPUBindGroupEntry e[2] = {
+                { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(PtUBO) },
+                { .binding = 1, .buffer = ctx.buffer(acc), .offset = 0, .size = kAccumBytes },
+            };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+            wgpuComputePassEncoderSetPipeline(ctx.compute, accumPipe);
+            wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, 1, 1, 1);
+            wgpuBindGroupRelease(bg);
+            wgpuBindGroupLayoutRelease(l);
+        });
 
     // trace one new sample, fold it into the running mean carried in prev.
     rg->add_pass(WEBGPU_STR("pt.trace"), PassKind::Graphics,

@@ -118,7 +118,7 @@ static void rg_usage_str(WGPUTextureUsage u, char* out, size_t n)
 		(u & WGPUTextureUsage_CopyDst)          ? "w" : "");
 }
 
-// same idea for buffer usage (the temporal pool is textures only, so buffers key on a different set).
+// same idea for buffer usage (a different flag set than textures).
 static void rg_buf_usage_str(WGPUBufferUsage u, char* out, size_t n)
 {
 	std::snprintf(out, n, "%s%s%s%s%s%s%s",
@@ -524,9 +524,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// column BEFORE its reader, a write node one column AFTER its writer -- so a widely-read texture gets a
 	// small node at each use site (like repeated power symbols) instead of one node fanning edges everywhere.
 	// three kinds, all gated by the toolbar toggle:
-	//   * temporal: create_temporal_image makes two resource nodes sharing a name -- curr (temporalIndex 0,
+	//   * temporal: create_temporal_image/_buffer make two resource nodes sharing a name -- curr (temporalIndex 0,
 	//     written THIS frame for next) and prev (temporalIndex 1, read this frame = LAST frame's curr; the
-	//     pool rotates two physical textures). cross-frame, so no in-frame edge joins the pair.
+	//     pool rotates two physical textures/buffers). cross-frame, so no in-frame edge joins the pair.
 	//   * external input: an IMPORTED resource read with no in-graph writer (importe_image'd / import_buffer'd,
 	//     value from outside the frame). a texture gets a node per reader pin; a buffer (a uniform read almost
 	//     everywhere) is ONE source node fanning faint edges to every reader, so it doesn't swamp the view.
@@ -1407,13 +1407,17 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 	for (ResourceNode* r = s.m_resouces; r; r = r->next)
 		if (r->kind == ResourceNode::Kind::Buffer && !r->is_external() && r->buffer) { ++bufCount; bufBytes += r->bufferSize; }
 
-	// temporal/history textures: kLayers physical textures per entry (current + previous), ping-ponged.
-	int tmpCount = 0;
-	uint64_t tmpBytes = 0;
-	for (const PersistentResourcePool::Entry& e : pool.entries)
-		if (e.created) { ++tmpCount; tmpBytes += rg_texture_bytes(e.size, e.format, e.mipLevelCount) * PersistentResourcePool::kLayers; }
+	// temporal/history resources: kLayers physical textures OR buffers per entry (current + previous),
+	// ping-ponged. the buffer arm leaves size {} / format Undefined, so split on bufferSize to size each right.
+	int tmpTexCount = 0, tmpBufCount = 0;
+	uint64_t tmpTexBytes = 0, tmpBufBytes = 0;
+	for (const PersistentResourcePool::Entry& e : pool.entries) {
+		if (!e.created) continue;
+		if (e.bufferSize) { ++tmpBufCount; tmpBufBytes += e.bufferSize * e.layers; }
+		else              { ++tmpTexCount; tmpTexBytes += rg_texture_bytes(e.size, e.format, e.mipLevelCount) * e.layers; }
+	}
 
-	const uint64_t grand = texBytes + bufBytes + tmpBytes;
+	const uint64_t grand = texBytes + bufBytes + tmpTexBytes + tmpBufBytes;
 
 	ImGui::Text("frame %llu  --  transient pool: %d held, %d in use", (unsigned long long)tp.frame, held, inUse);
 	ImGui::SameLine();
@@ -1425,14 +1429,16 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 	char gb[24]; rg_bytes_str(grand, gb, sizeof gb);
 	ImGui::Text("VRAM %s total", gb);
 	{
-		char a[24], ib[24], idb[24], bb[24], cb[24];
+		char a[24], ib[24], idb[24], bb[24], cb[24], cbb[24];
 		rg_bytes_str(texBytes, a, sizeof a);
 		rg_bytes_str(texInUseBytes, ib, sizeof ib);
 		rg_bytes_str(texBytes - texInUseBytes, idb, sizeof idb);   // in use is a subset sum -> no underflow
 		rg_bytes_str(bufBytes, bb, sizeof bb);
-		rg_bytes_str(tmpBytes, cb, sizeof cb);
+		rg_bytes_str(tmpTexBytes, cb, sizeof cb);
+		rg_bytes_str(tmpBufBytes, cbb, sizeof cbb);
 		ImGui::BulletText("transient tex  %-9s  %d held (%s in use, %s idle)", a, held, ib, idb);
-		ImGui::BulletText("temporal       %-9s  %d entries x%u layers", cb, tmpCount, PersistentResourcePool::kLayers);
+		ImGui::BulletText("temporal tex   %-9s  %d entries", cb, tmpTexCount);
+		ImGui::BulletText("temporal buf   %-9s  %d entries", cbb, tmpBufCount);
 		ImGui::BulletText("buffers        %-9s  %d", bb, bufCount);
 	}
 
@@ -1487,20 +1493,43 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 		ImGui::TableHeadersRow();
 		bool any = false;
 		for (const PersistentResourcePool::Entry& e : pool.entries) {
-			if (!e.created) continue;
+			if (!e.created || e.bufferSize) continue;   // buffer-arm entries listed in their own table below
 			any = true;
 			char ub[8]; rg_usage_str(e.usage, ub, sizeof ub);
-			const uint64_t eb = rg_texture_bytes(e.size, e.format, e.mipLevelCount) * PersistentResourcePool::kLayers;
+			const uint64_t eb = rg_texture_bytes(e.size, e.format, e.mipLevelCount) * e.layers;
 			ImGui::TableNextRow();
 			ImGui::TableNextColumn(); ImGui::Text("%s", e.name.c_str());
 			ImGui::TableNextColumn(); ImGui::Text("%ux%u", e.size.width, e.size.height);
 			ImGui::TableNextColumn(); ImGui::Text("%u", e.mipLevelCount);
-			ImGui::TableNextColumn(); ImGui::Text("%u x%u", e.size.depthOrArrayLayers, PersistentResourcePool::kLayers);
+			ImGui::TableNextColumn(); ImGui::Text("%u x%u", e.size.depthOrArrayLayers, e.layers);
 			ImGui::TableNextColumn(); ImGui::Text("%s", rg_format_name(e.format));
 			ImGui::TableNextColumn(); ImGui::Text("%s", ub);
 			ImGui::TableNextColumn();
 			if (eb) { char mb[24]; rg_bytes_str(eb, mb, sizeof mb); ImGui::Text("%s", mb); }
 			else    ImGui::TextDisabled("?");
+		}
+		ImGui::EndTable();
+		if (!any) ImGui::TextDisabled("(none)");
+	}
+
+	// temporal/history buffers (PersistentResourcePool buffer arm): one row per name, kLayers buffers each.
+	ImGui::Spacing();
+	ImGui::TextDisabled("temporal (history) buffers");
+	if (ImGui::BeginTable("tp_tmpbuf", 3, tf)) {
+		ImGui::TableSetupColumn("name");
+		ImGui::TableSetupColumn("usage");
+		ImGui::TableSetupColumn("mem (x layers)");
+		ImGui::TableHeadersRow();
+		bool any = false;
+		for (const PersistentResourcePool::Entry& e : pool.entries) {
+			if (!e.created || !e.bufferSize) continue;
+			any = true;
+			char ub[12]; rg_buf_usage_str(e.bufUsage, ub, sizeof ub);
+			char mb[24]; rg_bytes_str(e.bufferSize * e.layers, mb, sizeof mb);
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn(); ImGui::Text("%s", e.name.c_str());
+			ImGui::TableNextColumn(); ImGui::Text("%s", ub);
+			ImGui::TableNextColumn(); ImGui::Text("%s", mb);
 		}
 		ImGui::EndTable();
 		if (!any) ImGui::TextDisabled("(none)");

@@ -72,12 +72,14 @@ wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
 // ---- demos: each defines <id>_init / <id>_shutdown / <id>_build / <id>_ui --------------------------
 #include "RenderGraph_deferred.cpp"
 #include "RenderGraph_pathtracer.cpp"
+#include "RenderGraph_particles.cpp"
 
 // the registry. one row per demo; RG_DEMO_LIST(X) builds the table from the naming convention, so the
 // hooks never need a hand-written Demo literal. add a demo above, then add its row here.
 #define RG_DEMO_LIST(X) \
     X("Deferred",    deferred)   \
-    X("Path Tracer", pathtracer)
+    X("Path Tracer", pathtracer) \
+    X("Particles",   particles)
 
 int main()
 {

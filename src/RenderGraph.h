@@ -49,6 +49,14 @@ struct TemporalImage
     ResourceHandle prev;   // last frame's result, READ-only this frame
 };
 
+// the GPU-buffer twin of TemporalImage: two physical buffers the PersistentResourcePool rotates each
+// frame, same contract -- write `curr`, read `prev`. returned by create_temporal_buffer.
+struct TemporalBuffer
+{
+    ResourceHandle curr;   // this frame's WRITE target
+    ResourceHandle prev;   // last frame's result, READ-only this frame
+};
+
 // how a pass touches a resource (read/write hazards + WGPU usage flags). The enumerators encode
 // WebGPU usage-scope semantics used only by RenderGraph.cpp's hazard/usage passes, so the full
 // definition -- and ResourceAccess, the recorded access -- live there; the header needs just the
@@ -107,6 +115,11 @@ struct GraphBuilder
     void sampled(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     void storage_read(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     void storage_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    // in-place read+write of one storage resource in a single pass: the API mirror of WGSL
+    // `var<storage, read_write>`. records the StorageRead+StorageWrite pair (the only read+write pairing
+    // legal in one pass) so the graph orders the pass against other producers/readers but not against
+    // itself. own-slot / atomic use only -- the in-dispatch race is the shader's to handle.
+    void storage_read_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // uniform
     void uniform(ResourceHandle handle);
     // transfer (copy) source / destination
@@ -116,6 +129,13 @@ struct GraphBuilder
     void vertex_buffer(ResourceHandle handle);
     void index_buffer(ResourceHandle handle);
     void indirect_buffer(ResourceHandle handle);
+
+    // mark this pass as a one-time initializer for a persistent resource (create_persistent_image/_buffer):
+    // it runs only while `target` is unrealized -- the first frame, or after the pool evicts/recreates it --
+    // then compile() skips it. the baked result persists in the pool, so readers bind to it with no in-graph
+    // writer (legal for a persistent/external resource). declare the write to `target` as usual (color() /
+    // storage_write()); this only gates the pass. one init target per pass; write only that target.
+    void init_once(ResourceHandle target);
 
     PassNode* m_new_pass{};
 };
@@ -150,8 +170,9 @@ struct RenderGraph
     //
     ResourceHandle create_image(WGPUStringView name, const TextureDesc& desc);
     ResourceHandle importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size);
-    ResourceHandle create_buffer(WGPUStringView name, const BufferDesc& desc);
     ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
+    // (no create_buffer: a per-frame transient buffer has no use here -- every buffer is either imported
+    // or pool-backed via create_temporal_buffer / create_persistent_buffer. reinstate if one is ever needed.)
 
     // Temporal (history) resource: a ping-pong pair the PersistentResourcePool rotates each frame, so
     // this frame's `.curr` becomes next frame's `.prev` for free -- no manual ping-pong or caller-owned
@@ -161,6 +182,33 @@ struct RenderGraph
     // ponytail: ping-pong only. N-deep history (checkerboard reconstruction, frame-gen reading 2 frames
     // back) was removed for simplicity; reinstate a `layers` count + indexed accessor if ever needed.
     TemporalImage create_temporal_image(WGPUStringView name, const TextureDesc& desc);
+
+    // Temporal (history) BUFFER: the GPU-buffer twin of create_temporal_image -- two physical buffers
+    // the PersistentResourcePool ping-pongs each frame, same contract (write `.curr`, read `.prev`;
+    // writing `.prev` is an authoring error, reported under RG_VALIDATE). For GPU-authored cross-frame
+    // state -- accumulators, particle systems -- the graph owns the storage, no caller-side double-buffer.
+    // GPU-authored only: no host-upload affordance (host-written UBOs stay imported).
+    TemporalBuffer create_temporal_buffer(WGPUStringView name, const BufferDesc& desc);
+
+    // Persistent (cross-frame) SINGLE GPU buffer the graph owns: one pool-backed buffer (no ping-pong),
+    // survives the per-frame teardown, auto-evicted once no pass declares it. Read AND write it in one pass
+    // (var<storage, read_write>): the graph models that as the StorageRead+StorageWrite RMW pair and does
+    // not self-order the pass. Use for in-place own-slot state -- accumulators, atomic counters, append /
+    // free-lists; for cross-element reads (neighbour / previous-frame), use create_temporal_buffer instead.
+    // The graph owns lifetime + usage + cross-pass ordering only; making the in-dispatch RMW race-free is
+    // the shader's job (own-slot discipline / atomics). GPU-authored only (no host-upload affordance).
+    // ponytail: in-place persistent state is correct only because this is a single-queue, no-frames-in-flight
+    // loop (frame N's submit completes before N+1 reads). Add explicit sync if frames-in-flight ever land.
+    ResourceHandle create_persistent_buffer(WGPUStringView name, const BufferDesc& desc);
+
+    // Persistent (cross-frame) SINGLE texture the graph owns: the image twin of create_persistent_buffer.
+    // One pool-backed texture (no ping-pong), survives the per-frame teardown, auto-evicted once no pass
+    // declares it. For a precomputed/baked resource written once then sampled every frame -- IBL / env map,
+    // BRDF LUT, prefiltered specular. Declare it every frame (to read it), and fill it with a pass marked
+    // GraphBuilder::init_once(handle): that bake runs only when the texture is freshly (re)created, not every
+    // frame. ponytail: bake targets should be Absolute-sized -- a Relative one recreated on resize is not
+    // re-baked (the init pass was already culled that frame); fine for IBL/LUTs, which are size-independent.
+    ResourceHandle create_persistent_image(WGPUStringView name, const TextureDesc& desc);
 
 
     // CAVEAT: pass declaration order matters (implicit SSA versioning, def-before-use): declare a
@@ -185,6 +233,7 @@ struct RenderGraph
     // transient resource before any pass writes it. messages are printed; on false skip this frame.
     // that check is a dev aid compiled out in release (NDEBUG) like assert; see RG_VALIDATE in the
     // .cpp; a release build skips the per-frame walk and compile() always returns true.
+    // IMPORTANT: if compile failes all cached resources as well as temporal and anything else gets perged.
     bool compile();
 
     // create GPU resources from the usage + size that compile() worked out
@@ -216,7 +265,7 @@ private:
 };
 
 // Creates an instance of the `GraphAllocator` with a given areana size
-// default to to 1MB 
+// default to to 1MB
 GraphAllocator* create_allocator(size_t arenaSize = 1u << 20);
 RenderGraph* create_render_graph(GraphAllocator* allocator);
 
