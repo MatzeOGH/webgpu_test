@@ -563,6 +563,16 @@ struct ResourceNode
     uint32_t firstUse = kNoPass;
     uint32_t lastUse  = kNoPass;
 
+    // aliasing (compile() phase 4, only when enableAlias): the physical slot this transient shares with
+    // other disjoint-lifetime resources. kNoSlot = its own object (ineligible, or aliasing off). hasWriter
+    // + firstDefines are the eligibility inputs captured during the phase-3 access walk: a transient may
+    // take over another's storage only if some pass writes it (else its bytes are host-owned) AND its first
+    // touch fully overwrites (else it would read the previous occupant's leftovers).
+    static constexpr uint32_t kNoSlot = ~0u;
+    uint32_t aliasSlot    = kNoSlot;
+    bool     hasWriter    = false;
+    bool     firstDefines = false;
+
     ResourceNode* next{}; // ptr to the next resouce node of the render graph
 };
 
@@ -606,6 +616,20 @@ struct NodeAdjacency
     NodeAdjacency* next{};
 };
 
+// one physical GPU object shared by >=1 transient with disjoint lifetimes + identical signature (aliasing,
+// compile() phase 4). texture-only: there is no transient-buffer path (every buffer is imported or
+// pool-backed), so buffer aliasing is moot. ponytail: add a buffer arm here if transient buffers ever land.
+struct PhysicalResource
+{
+    WGPUTextureDimension dimension{};   // signature: members must match exactly to share this slot
+    WGPUTextureFormat    format{};
+    WGPUExtent3D         size{};
+    WGPUTextureUsage     texUsage{};    // union over members (WebGPU needs every member's bits at create)
+    uint32_t             freeFrom{};    // occupant lastUse; reusable iff the next member's firstUse > this (STRICT)
+    WGPUTexture          texture{};     // filled by realize() via transient.acquire()
+    WGPUTextureView      view{};
+};
+
 // RenderGraph carries no data members; its state lives here, bump-allocated immediately after the
 // RenderGraph object (see create_render_graph) and recovered via a fixed offset from `this`. Keeps
 // the header a pure method-only interface.
@@ -617,6 +641,10 @@ struct RenderGraphStorage
     WGPUDevice              m_device{};
     uint32_t                next_id = 1; // 0 = invalid handle
     ResourceNode**          byId{};      // id->node (sized next_id); built in compile() phase 3 -> O(1) find_node
+    // aliasing: physical slots computed by compile() phase 4 (front-arena, this frame). m_slotCount == 0
+    // whenever aliasing is off -> realize()/release_resources() fall back to the per-resource path unchanged.
+    PhysicalResource*       m_slots{};
+    uint32_t                m_slotCount{};
     // execute() scratch: subresource views built for the current pass (attachments + the body's ctx.view()),
     // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
     WGPUTextureView         viewScratch[PassNode::kMaxAccess]{};
@@ -691,6 +719,17 @@ static bool access_is_write(AccessType t)
         || t == AccessType::ResolveAttachment   // the resolve writes its single-sample target
         || t == AccessType::StorageWrite
         || t == AccessType::CopyDst;
+}
+
+// does this access fully define the resource's contents, so an aliased slot's previous occupant bytes are
+// never observed? a cleared color/depth attachment, a storage write, or a copy-dst overwrite. drives the
+// aliasing eligibility check (compile() phase 4). NOT a write-load distinction: a LoadOp_Load attachment
+// or storage read keeps prior contents and so cannot safely take over another resource's storage.
+static bool access_defines(const ResourceAccess& a)
+{
+    if (a.type == AccessType::ColorAttachment || a.type == AccessType::DepthStencilAttachment)
+        return a.loadOp == WGPULoadOp_Clear;
+    return a.type == AccessType::StorageWrite || a.type == AccessType::CopyDst;
 }
 
 #if RG_VALIDATE
@@ -1024,7 +1063,7 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
     return r->resolved = { (uint32_t)(b.width * r->scaleX + 0.5f), (uint32_t)(b.height * r->scaleY + 0.5f), layers };
 }
 
-bool RenderGraph::compile()
+bool RenderGraph::compile(bool enableAlias)
 {
     RenderGraphStorage& s = *storage(this);
 
@@ -1177,8 +1216,12 @@ bool RenderGraph::compile()
                 // each later touch overwrites lastUse. imported resources are skipped -- excluded from
                 // aliasing, so a span would be meaningless.
                 if (!r->is_external()) {   // persistent is pool-owned -> excluded from aliasing, like imported
-                    if (r->firstUse == ResourceNode::kNoPass) r->firstUse = passIdx;
+                    if (r->firstUse == ResourceNode::kNoPass) {
+                        r->firstUse = passIdx;
+                        r->firstDefines = access_defines(p->accesses[i]);   // aliasing: does the first touch overwrite?
+                    }
                     r->lastUse = passIdx;
+                    if (access_is_write(p->accesses[i].type)) r->hasWriter = true;
                 }
                 switch (p->accesses[i].type) {
                   case AccessType::ColorAttachment:
@@ -1217,6 +1260,67 @@ bool RenderGraph::compile()
 
         // ponytail: usage==0 here == untouched by a live pass -> future realize() skips it = free
         // dead-resource culling. no separate resource liveness list needed.
+    }
+
+    // phase 4: transient memory aliasing (opt-in). pack disjoint-lifetime, same-signature transients onto a
+    // shared physical object so peak VRAM tracks max simultaneous overlap, not the sum of all transients.
+    // CPU-only -> it belongs here next to phase 3, not realize(). the schedule is a single linear queue, so
+    // each transient's liveness is a closed [firstUse,lastUse] interval and greedy left-edge first-fit is
+    // optimal (same trick as linear-scan register allocation). off (enableAlias==false) -> no slots, every
+    // aliasSlot stays kNoSlot, and realize() takes the unchanged per-resource path.
+    if (enableAlias) {
+        // eligible transients (see ResourceNode::aliasSlot): texture-only, single mip + sample so the slot's
+        // default view fits every member; first touch must fully define (no reading a previous occupant's
+        // bytes) and some pass must write it (don't stomp host-uploaded contents). imported/persistent and
+        // dead (kNoPass) excluded. collect into scratch, then sort by firstUse for the left-edge sweep.
+        ResourceNode** elig = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_id);
+        defer { s.m_allocator->reset_scratch(); };
+        uint32_t nElig = 0;
+        for (ResourceNode* r = s.m_resouces; r; r = r->next)
+            if (r->kind == ResourceNode::Kind::Texture && !r->is_external()
+                && r->firstUse != ResourceNode::kNoPass
+                && r->mipLevelCount == 1 && r->sampleCount == 1
+                && r->hasWriter && r->firstDefines)
+                elig[nElig++] = r;
+
+        // insertion sort by firstUse asc (nElig is a handful -> the O(n^2) is free; ponytail).
+        for (uint32_t i = 1; i < nElig; ++i) {
+            ResourceNode* key = elig[i];
+            uint32_t j = i;
+            while (j && elig[j - 1]->firstUse > key->firstUse) { elig[j] = elig[j - 1]; --j; }
+            elig[j] = key;
+        }
+
+        // first-fit: reuse the first signature-matching slot whose occupant is already dead (STRICT
+        // freeFrom < firstUse: equality means they share a pass -> binding one object as two resources in
+        // one usage scope, illegal), else open a new one. slots live in the front arena (read this frame by
+        // realize/release). m_slots == null / m_slotCount == 0 when nothing is eligible.
+        if (nElig) s.m_slots = s.m_allocator->alloc<PhysicalResource>(nElig);
+        for (uint32_t i = 0; i < nElig; ++i) {
+            ResourceNode* r = elig[i];
+            uint32_t slot = ResourceNode::kNoSlot;
+            for (uint32_t k = 0; k < s.m_slotCount; ++k) {
+                PhysicalResource& ph = s.m_slots[k];
+                if (ph.dimension == r->dimension && ph.format == r->format
+                    && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height
+                    && ph.size.depthOrArrayLayers == r->resolved.depthOrArrayLayers
+                    && ph.freeFrom < r->firstUse) { slot = k; break; }
+            }
+            if (slot == ResourceNode::kNoSlot) {
+                slot = s.m_slotCount++;
+                PhysicalResource& ph = s.m_slots[slot];
+                ph.dimension = r->dimension; ph.format = r->format; ph.size = r->resolved;
+            }
+            PhysicalResource& ph = s.m_slots[slot];
+            ph.texUsage |= r->texUsage;   // widen to the union: every member is created on this one object
+            ph.freeFrom  = r->lastUse;
+            r->aliasSlot = slot;
+#if RG_VALIDATE
+            assert(ph.dimension == r->dimension && ph.format == r->format
+                   && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height
+                   && "alias slot signature mismatch");
+#endif
+        }
     }
 
     return true;
@@ -1290,6 +1394,29 @@ void debug_print_mermaid(RenderGraph* rg)
     // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.
 }
 
+// rough bytes-per-texel for the formats this project creates -- used only by the aliasing memory report
+// (peak-allocation accounting), never for allocation. no block-compressed formats here, so a linear
+// width*height*layers*texel estimate is exact enough; unknown formats fall back to 4.
+static uint32_t texel_bytes(WGPUTextureFormat f)
+{
+    switch (f) {
+      case WGPUTextureFormat_R8Unorm: case WGPUTextureFormat_R8Uint: case WGPUTextureFormat_Stencil8: return 1;
+      case WGPUTextureFormat_R16Float: case WGPUTextureFormat_RG8Unorm: case WGPUTextureFormat_Depth16Unorm: return 2;
+      case WGPUTextureFormat_RGBA8Unorm: case WGPUTextureFormat_BGRA8Unorm: case WGPUTextureFormat_RG16Float:
+      case WGPUTextureFormat_R32Float: case WGPUTextureFormat_Depth32Float: case WGPUTextureFormat_Depth24Plus: return 4;
+      case WGPUTextureFormat_RGBA16Float: case WGPUTextureFormat_RG32Float: return 8;
+      case WGPUTextureFormat_RGBA32Float: return 16;
+      default: return 4;
+    }
+}
+
+// bytes one texture of this size+format would occupy (base mip only -- aliasing members are single-mip).
+static uint64_t texture_bytes(WGPUExtent3D size, WGPUTextureFormat format)
+{
+    uint32_t layers = size.depthOrArrayLayers ? size.depthOrArrayLayers : 1;
+    return (uint64_t)size.width * size.height * layers * texel_bytes(format);
+}
+
 // dump resource lifetimes as a Mermaid Gantt on stdout. the timeline runs over passes in execution
 // order: a "passes" row names each slot (one bar per pass), and below it each transient resource is a
 // bar from its first to its last pass. overlapping bars can't share memory; gaps between them are
@@ -1347,6 +1474,30 @@ void debug_print_lifetimes(RenderGraph* rg)
                     (int)f.length, f.data ? f.data : "",
                     (int)l.length, l.data ? l.data : "",
                     r->firstUse * 1000, (r->lastUse + 1) * 1000);
+    }
+
+    // physical slots (only present when compile() ran phase 4 with aliasing on): each slot is one GPU
+    // object shared by the transients listed under it. the totals are the peak-allocation win.
+    if (s.m_slotCount) {
+        uint32_t  logical = 0;
+        uint64_t  logicalBytes = 0, physicalBytes = 0;
+        std::printf("physical slots (aliasing):\n");
+        for (uint32_t i = 0; i < s.m_slotCount; ++i) {
+            PhysicalResource& ph = s.m_slots[i];
+            uint64_t slotBytes = texture_bytes(ph.size, ph.format);
+            physicalBytes += slotBytes;
+            std::printf("  slot %u  %ux%u:", i, ph.size.width, ph.size.height);
+            for (ResourceNode* r = s.m_resouces; r; r = r->next)
+                if (r->aliasSlot == i) {
+                    ++logical; logicalBytes += slotBytes;   // a member shares the slot's signature -> same bytes
+                    std::printf(" %.*s", (int)r->name.length, r->name.data ? r->name.data : "");
+                }
+            std::printf("\n");
+        }
+        std::printf("  %u logical transients -> %u physical objects; aliased VRAM %llu -> %llu KB (saved %llu KB)\n",
+                    logical, s.m_slotCount, (unsigned long long)(logicalBytes / 1024),
+                    (unsigned long long)(physicalBytes / 1024),
+                    (unsigned long long)((logicalBytes - physicalBytes) / 1024));
     }
 
     std::fflush(stdout);
@@ -1465,12 +1616,27 @@ void RenderGraph::realize(WGPUDevice device)
         }
     }
 
+    // aliasing (compile() phase 4): acquire one pooled texture per physical slot with the union usage, then
+    // point every member resource at it. m_slotCount == 0 when aliasing is off -> this is skipped and the
+    // per-resource loop below realizes each transient on its own, exactly as before. one acquire per slot
+    // (not per member) keeps the pool's claim count right: distinct slots get distinct textures, members share.
+    for (uint32_t i = 0; i < s.m_slotCount; ++i) {
+        PhysicalResource& ph = s.m_slots[i];
+        transient.acquire(device, ph.size, ph.format, ph.dimension, 1, 1, ph.texUsage, ph.texture, ph.view);
+    }
+    for (ResourceNode* r = s.m_resouces; r; r = r->next)
+        if (r->aliasSlot != ResourceNode::kNoSlot) {
+            PhysicalResource& ph = s.m_slots[r->aliasSlot];
+            r->texture = ph.texture; r->view = ph.view;
+        }
+
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         // non-external (graph-owned, per-frame) resources are all transient TEXTURES: every buffer is
         // imported or pool-backed (temporal/persistent), so there is no transient-buffer path. reuse a
         // pooled texture matching this descriptor; release_resources() leaves it alone and the pool
-        // recycles/evicts at end_frame().
-        if (r->is_external() || r->kind != ResourceNode::Kind::Texture || !r->texUsage) continue;
+        // recycles/evicts at end_frame(). a member already placed on an alias slot (above) skips this.
+        if (r->is_external() || r->kind != ResourceNode::Kind::Texture || !r->texUsage
+            || r->aliasSlot != ResourceNode::kNoSlot) continue;
         transient.acquire(device, r->resolved, r->format, r->dimension, r->mipLevelCount, r->sampleCount, r->texUsage,
                           r->texture, r->view);
     }
@@ -1633,6 +1799,10 @@ void RenderGraph::release_resources()
         // drop our borrowed refs, don't release. the TransientResourcePool recycles/evicts it at end_frame().
         r->texture = nullptr; r->view = nullptr;
     }
+    // aliased members just had their borrowed refs cleared; drop the per-slot refs too. the pool owns each
+    // physical texture and frees it at end_frame() -- releasing here would double-free. m_slots is arena
+    // garbage next frame regardless; this only keeps a stale handle from being read mid-teardown.
+    for (uint32_t i = 0; i < s.m_slotCount; ++i) { s.m_slots[i].texture = nullptr; s.m_slots[i].view = nullptr; }
     s.m_allocator->pool.end_frame();        // free temporal resources gone idle (demo switch / feature toggle)
     s.m_allocator->transient.end_frame();   // release every claim + evict idle textures
 }

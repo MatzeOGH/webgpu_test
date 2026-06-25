@@ -233,7 +233,9 @@ struct RenderGraph
     // that check is a dev aid compiled out in release (NDEBUG) like assert; see RG_VALIDATE in the
     // .cpp; a release build skips the per-frame walk and compile() always returns true.
     // IMPORTANT: TODO: if compile failes all cached resources as well as temporal and anything else gets perged.
-    bool compile();
+    // enableAlias: opt in to transient memory aliasing (phase 4) -- pack disjoint-lifetime, same-signature
+    // transients onto shared physical objects to cut peak VRAM. default off = byte-identical to before.
+    bool compile(bool enableAlias = false);
 
     // create GPU resources from the usage + size that compile() worked out
     void realize(WGPUDevice device);
