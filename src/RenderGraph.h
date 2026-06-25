@@ -176,8 +176,12 @@ struct RenderGraph
     ResourceHandle create_image(WGPUStringView name, const TextureDesc& desc);
     ResourceHandle importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size);
     ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
-    // (no create_buffer: a per-frame transient buffer has no use here -- every buffer is either imported
-    // or pool-backed via create_temporal_buffer / create_persistent_buffer. reinstate if one is ever needed.)
+    // a per-frame transient GPU buffer the graph owns (the buffer twin of create_image): realize() backs it
+    // from the TransientResourcePool and phase-4 aliasing may pack it onto a shared buffer with a disjoint-
+    // lifetime sibling; freed at end_frame. for graph-authored scratch consumed within the frame (compute
+    // output, indirect args, scan/compaction). host-written UBOs stay imported; cross-frame state uses
+    // create_temporal_buffer / create_persistent_buffer.
+    ResourceHandle create_buffer(WGPUStringView name, const BufferDesc& desc);
 
     // Temporal (history) resource: a ping-pong pair the PersistentResourcePool rotates each frame, so
     // this frame's `.curr` becomes next frame's `.prev` for free -- no manual ping-pong or caller-owned

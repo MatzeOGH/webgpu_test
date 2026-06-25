@@ -252,39 +252,45 @@ struct PersistentResourcePool
     ~PersistentResourcePool() { for (Entry& e : entries) destroy(&e); }
 };
 
-// Caches transient textures across the per-frame teardown so realize()/release_resources() stop
-// churning the driver: one physical texture per Entry, matched by descriptor (size/format/dim/usage)
-// and handed back out next frame instead of recreated + destroyed. Sibling to PersistentResourcePool
-// (name-keyed ping-pong for history); this one is descriptor-keyed and evicts textures left idle.
-// ponytail: linear scan over a vector -- fine for the ~dozen transients a frame declares. This same
-// pool is the substrate for within-frame aliasing later: release a claim at a resource's lastUse
-// instead of frame end and a later disjoint-lifetime resource reclaims the texture.
+// Caches per-frame transient GPU objects across teardown so realize()/release_resources() stop churning
+// the driver: one physical object per Entry, handed back next frame instead of recreated + destroyed.
+// Each Entry is a TEXTURE (matched by size/format/dim/mip/sample/usage) or a BUFFER (matched by size +
+// usage), tagged by `isBuffer`; textures and buffers share the inUse-claim, idle eviction, vector and
+// teardown -- only the match + create differ (the two acquire overloads). Sibling to PersistentResourcePool
+// (name-keyed ping-pong for history); this one is descriptor-keyed and evicts objects left idle.
+// ponytail: linear scan over a vector -- fine for the ~dozen transients a frame declares. inUse (not the
+// frame stamp) is the claim, so two simultaneously-live same-descriptor resources get two distinct objects.
 struct TransientResourcePool
 {
-    static constexpr uint64_t kRetain = 4;   // destroy a texture left unclaimed this many frames
+    static constexpr uint64_t kRetain = 4;   // destroy an object left unclaimed this many frames
 
     struct Entry
     {
+        bool                 isBuffer = false;   // false = texture arm below, true = buffer arm
+        // texture arm (isBuffer == false)
         WGPUExtent3D         size   = {};
         WGPUTextureFormat    format = WGPUTextureFormat_Undefined;
         WGPUTextureDimension dim    = WGPUTextureDimension_2D;
         uint32_t             mipLevelCount = 1;
         uint32_t             sampleCount   = 1;
         WGPUTextureUsage     usage  = {};
-
         WGPUTexture          tex    = {};
         WGPUTextureView      view   = {};
-
-        bool                 inUse         = false;  // claimed right now; released in end_frame (or mid-frame once aliasing lands)
+        // buffer arm (isBuffer == true)
+        uint64_t             bufferSize = 0;
+        WGPUBufferUsage      bufUsage   = {};
+        WGPUBuffer           buf        = {};
+        // shared
+        bool                 inUse         = false;  // claimed right now; released in end_frame
         uint64_t             lastUsedFrame = 0;      // recency, eviction only
     };
     std::vector<Entry> entries;
     uint64_t frame            = 0;
     uint32_t createdThisFrame = 0;                   // debug: cache misses this frame (reset each end_frame)
 
-    // debug event log: one record per texture create/evict so a UI can prove steady-state reuse --
-    // no Create records after warmup means the cache hands the same textures back, not new ones. Ring
-    // buffer, newest wraps over oldest; never read by the pool itself.
+    // debug event log: one record per TEXTURE create/evict so a UI can prove steady-state reuse -- no
+    // Create records after warmup means the cache hands the same textures back. buffers skip the log (the
+    // LogRec is texture-shaped). Ring buffer, newest wraps over oldest; never read by the pool itself.
     enum class Event : uint8_t { Create, Evict };
     struct LogRec { uint64_t frame; Event kind; WGPUExtent3D size; WGPUTextureFormat format; };
     static constexpr uint32_t kLog = 128;
@@ -296,14 +302,13 @@ struct TransientResourcePool
         eventLog[eventCount++ % kLog] = { frame, kind, e.size, e.format };
     }
 
-    // hand out a free texture matching the descriptor, else create one. inUse (not the frame stamp)
-    // is the claim, so two simultaneously-live same-descriptor resources get two distinct textures.
+    // hand out a free TEXTURE matching the descriptor, else create one.
     void acquire(WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
                  WGPUTextureDimension dim, uint32_t mipLevelCount, uint32_t sampleCount, WGPUTextureUsage usage,
                  WGPUTexture& outTex, WGPUTextureView& outView)
     {
         for (Entry& e : entries) {
-            if (!e.inUse && e.format == format && e.dim == dim && e.usage == usage
+            if (!e.isBuffer && !e.inUse && e.format == format && e.dim == dim && e.usage == usage
                 && e.mipLevelCount == mipLevelCount && e.sampleCount == sampleCount
                 && e.size.width == size.width && e.size.height == size.height
                 && e.size.depthOrArrayLayers == size.depthOrArrayLayers) {
@@ -315,6 +320,7 @@ struct TransientResourcePool
         }
         entries.emplace_back();
         Entry& e = entries.back();
+        e.isBuffer = false;
         e.size = size; e.format = format; e.dim = dim; e.mipLevelCount = mipLevelCount; e.sampleCount = sampleCount; e.usage = usage;
         WGPUTextureDescriptor d{
             .usage         = usage,
@@ -333,14 +339,33 @@ struct TransientResourcePool
         outTex = e.tex; outView = e.view;
     }
 
-    // end of frame: drop every claim, destroy textures idle >= kRetain frames, advance the clock.
+    // hand out a free BUFFER matching (size, usage), else create one. same claim/evict path as textures.
+    void acquire(WGPUDevice device, uint64_t size, WGPUBufferUsage usage, WGPUBuffer& outBuf)
+    {
+        for (Entry& e : entries) {
+            if (e.isBuffer && !e.inUse && e.bufferSize == size && e.bufUsage == usage) {
+                e.inUse = true; e.lastUsedFrame = frame; outBuf = e.buf; return;
+            }
+        }
+        entries.emplace_back();
+        Entry& e = entries.back();
+        e.isBuffer = true;
+        e.bufferSize = size; e.bufUsage = usage;
+        WGPUBufferDescriptor d{ .usage = usage, .size = size };
+        e.buf = wgpuDeviceCreateBuffer(device, &d);
+        e.inUse = true; e.lastUsedFrame = frame;
+        ++createdThisFrame;
+        outBuf = e.buf;
+    }
+
+    // end of frame: drop every claim, destroy objects idle >= kRetain frames, advance the clock.
     void end_frame()
     {
         for (size_t i = entries.size(); i-- > 0; ) {
             Entry& e = entries[i];
             e.inUse = false;
             if (frame - e.lastUsedFrame >= kRetain) {   // lastUsedFrame <= frame always -> no underflow
-                log_event(Event::Evict, e);
+                if (!e.isBuffer) log_event(Event::Evict, e);
                 destroy(&e);
                 entries[i] = entries.back();
                 entries.pop_back();
@@ -354,6 +379,7 @@ struct TransientResourcePool
     {
         if (e->view) { wgpuTextureViewRelease(e->view); e->view = nullptr; }
         if (e->tex)  { wgpuTextureRelease(e->tex);      e->tex  = nullptr; }
+        if (e->buf)  { wgpuBufferRelease(e->buf);       e->buf  = nullptr; }
     }
 
     ~TransientResourcePool() { for (Entry& e : entries) destroy(&e); }
@@ -378,9 +404,9 @@ struct GraphAllocator
     size_t scratchHighWater{};
 
     // resource pools folded in. reset() below only rewinds the bump cursors -- it leaves these be,
-    // because they cache GPU textures across frames on purpose (history ping-pong + transient reuse).
-    PersistentResourcePool pool;        // name-keyed temporal/history textures
-    TransientResourcePool  transient;   // descriptor-keyed per-frame texture cache
+    // because they cache GPU objects across frames on purpose (history ping-pong + transient reuse).
+    PersistentResourcePool pool;        // name-keyed temporal/history textures + buffers
+    TransientResourcePool  transient;   // descriptor-keyed per-frame texture + buffer cache (tagged by kind)
 
     // alignment must be a power of two
     static constexpr size_t align_up(size_t value, size_t alignment)
@@ -618,17 +644,23 @@ struct NodeAdjacency
 };
 
 // one physical GPU object shared by >=1 transient with disjoint lifetimes + identical signature (aliasing,
-// compile() phase 4). texture-only: there is no transient-buffer path (every buffer is imported or
-// pool-backed), so buffer aliasing is moot. ponytail: add a buffer arm here if transient buffers ever land.
+// compile() phase 4). carries the texture arm OR the buffer arm per `kind` -- a slot never mixes the two
+// (phase 4 buckets by kind). `freeFrom` + the alias bookkeeping are shared across both arms.
 struct PhysicalResource
 {
+    ResourceNode::Kind   kind{};        // Texture (default 0) or Buffer; selects which arm below is live
+    uint32_t             freeFrom{};    // occupant lastUse; reusable iff the next member's firstUse > this (STRICT)
+    // texture arm (kind == Texture)
     WGPUTextureDimension dimension{};   // signature: members must match exactly to share this slot
     WGPUTextureFormat    format{};
     WGPUExtent3D         size{};
     WGPUTextureUsage     texUsage{};    // union over members (WebGPU needs every member's bits at create)
-    uint32_t             freeFrom{};    // occupant lastUse; reusable iff the next member's firstUse > this (STRICT)
     WGPUTexture          texture{};     // filled by realize() via transient.acquire()
     WGPUTextureView      view{};
+    // buffer arm (kind == Buffer)
+    uint64_t             bufferSize{};  // signature
+    WGPUBufferUsage      bufUsage{};    // union over members
+    WGPUBuffer           buffer{};      // filled by realize() via transient.acquire() (buffer overload)
 };
 
 // RenderGraph carries no data members; its state lives here, bump-allocated immediately after the
@@ -773,6 +805,23 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
     resouce->absolute = desc.absolute;
     resouce->mipLevelCount = desc.mipLevelCount ? desc.mipLevelCount : 1;
     resouce->sampleCount = desc.sampleCount ? desc.sampleCount : 1;
+
+    list_append(&s.m_resouces, resouce);
+
+    return resouce->handle;
+}
+
+// transient (graph-owned, per-frame) GPU buffer: the buffer twin of create_image. realize() backs it from
+// the TransientResourcePool buffer arm (or a phase-4 alias slot); release_resources() drops the borrowed ref.
+ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc& desc)
+{
+    RenderGraphStorage& s = *storage(this);
+    ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
+
+    resouce->handle = { s.next_id++ };
+    resouce->name = s.m_allocator->copy_string(name);
+    resouce->kind = ResourceNode::Kind::Buffer;
+    resouce->bufferSize = desc.size;
 
     list_append(&s.m_resouces, resouce);
 
@@ -1270,19 +1319,25 @@ bool RenderGraph::compile(bool enableAlias)
     // optimal (same trick as linear-scan register allocation). off (enableAlias==false) -> no slots, every
     // aliasSlot stays kNoSlot, and realize() takes the unchanged per-resource path.
     if (enableAlias) {
-        // eligible transients (see ResourceNode::aliasSlot): texture-only, single mip + sample so the slot's
-        // default view fits every member; first touch must fully define (no reading a previous occupant's
-        // bytes) and some pass must write it (don't stomp host-uploaded contents). imported/persistent and
-        // dead (kNoPass) excluded. collect into scratch, then sort by firstUse for the left-edge sweep.
+        // eligible transients (see ResourceNode::aliasSlot): graph-owned + touched by a live pass; first
+        // touch fully defines (no reading a previous occupant's bytes) and some pass writes it (don't stomp
+        // host-uploaded contents). textures must be single mip + sample so a slot's default view fits every
+        // member; buffers carry no such constraint. imported/persistent + dead (kNoPass) excluded. collect
+        // into scratch, then sort by firstUse for the left-edge sweep.
+        // ponytail: firstDefines treats a StorageWrite as a full define. true for a cleared/fully-written
+        // attachment; for a BUFFER a storage_write may write only part, so an aliased successor could read
+        // the previous occupant's bytes. the shader owns writing every byte it later reads -- same implicit
+        // contract textures carry, sharper for buffers. tighten to CopyDst-only here if that ever bites.
         ResourceNode** elig = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_id);
         defer { s.m_allocator->reset_scratch(); };
         uint32_t nElig = 0;
-        for (ResourceNode* r = s.m_resouces; r; r = r->next)
-            if (r->kind == ResourceNode::Kind::Texture && !r->is_external()
-                && r->firstUse != ResourceNode::kNoPass
-                && r->mipLevelCount == 1 && r->sampleCount == 1
-                && r->hasWriter && r->firstDefines)
-                elig[nElig++] = r;
+        for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+            if (r->is_external() || r->firstUse == ResourceNode::kNoPass || !r->hasWriter || !r->firstDefines)
+                continue;
+            if (r->kind == ResourceNode::Kind::Texture && (r->mipLevelCount != 1 || r->sampleCount != 1))
+                continue;   // mip chain / MSAA: keeps its own texture (a slot's default view wouldn't fit)
+            elig[nElig++] = r;
+        }
 
         // insertion sort by firstUse asc (nElig is a handful -> the O(n^2) is free; ponytail).
         for (uint32_t i = 1; i < nElig; ++i) {
@@ -1298,27 +1353,36 @@ bool RenderGraph::compile(bool enableAlias)
         // realize/release). m_slots == null / m_slotCount == 0 when nothing is eligible.
         if (nElig) s.m_slots = s.m_allocator->alloc<PhysicalResource>(nElig);
         for (uint32_t i = 0; i < nElig; ++i) {
-            ResourceNode* r = elig[i];
+            ResourceNode* r     = elig[i];
+            const bool    isBuf = r->kind == ResourceNode::Kind::Buffer;
             uint32_t slot = ResourceNode::kNoSlot;
             for (uint32_t k = 0; k < s.m_slotCount; ++k) {
                 PhysicalResource& ph = s.m_slots[k];
-                if (ph.dimension == r->dimension && ph.format == r->format
-                    && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height
-                    && ph.size.depthOrArrayLayers == r->resolved.depthOrArrayLayers
-                    && ph.freeFrom < r->firstUse) { slot = k; break; }
+                if (ph.kind != r->kind) continue;                       // never mix textures + buffers in one slot
+                const bool sig = isBuf
+                    ? (ph.bufferSize == r->bufferSize)
+                    : (ph.dimension == r->dimension && ph.format == r->format
+                       && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height
+                       && ph.size.depthOrArrayLayers == r->resolved.depthOrArrayLayers);
+                if (sig && ph.freeFrom < r->firstUse) { slot = k; break; }   // STRICT: no shared pass
             }
             if (slot == ResourceNode::kNoSlot) {
                 slot = s.m_slotCount++;
                 PhysicalResource& ph = s.m_slots[slot];
-                ph.dimension = r->dimension; ph.format = r->format; ph.size = r->resolved;
+                ph.kind = r->kind;
+                if (isBuf) ph.bufferSize = r->bufferSize;
+                else { ph.dimension = r->dimension; ph.format = r->format; ph.size = r->resolved; }
             }
             PhysicalResource& ph = s.m_slots[slot];
-            ph.texUsage |= r->texUsage;   // widen to the union: every member is created on this one object
+            if (isBuf) ph.bufUsage |= r->bufUsage;   // widen to the union: every member shares this one object
+            else       ph.texUsage |= r->texUsage;
             ph.freeFrom  = r->lastUse;
             r->aliasSlot = slot;
 #if RG_VALIDATE
-            assert(ph.dimension == r->dimension && ph.format == r->format
-                   && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height
+            assert(ph.kind == r->kind && (isBuf
+                   ? ph.bufferSize == r->bufferSize
+                   : (ph.dimension == r->dimension && ph.format == r->format
+                      && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height))
                    && "alias slot signature mismatch");
 #endif
         }
@@ -1590,8 +1654,8 @@ void RenderGraph::realize(WGPUDevice device)
     // one. first union the usage over all layers (each physical texture cycles through every layer role
     // across frames), then (re)create on demand, then point each layer node at its rotated slot. size +
     // usage came from compile(); the pool owns lifetime, so release_resources() leaves these alone.
-    PersistentResourcePool& pool      = s.m_allocator->pool;
-    TransientResourcePool&  transient = s.m_allocator->transient;
+    PersistentResourcePool& pool         = s.m_allocator->pool;
+    TransientResourcePool&  transient    = s.m_allocator->transient;   // textures + buffers, tagged by kind
 
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (!r->persistent) continue;
@@ -1617,29 +1681,37 @@ void RenderGraph::realize(WGPUDevice device)
         }
     }
 
-    // aliasing (compile() phase 4): acquire one pooled texture per physical slot with the union usage, then
+    // aliasing (compile() phase 4): acquire one pooled object per physical slot with the union usage, then
     // point every member resource at it. m_slotCount == 0 when aliasing is off -> this is skipped and the
-    // per-resource loop below realizes each transient on its own, exactly as before. one acquire per slot
-    // (not per member) keeps the pool's claim count right: distinct slots get distinct textures, members share.
+    // per-resource loops below realize each transient on its own, exactly as before. one acquire per slot
+    // (not per member) keeps the claim count right: distinct slots get distinct objects, members share. a
+    // slot is a texture or a buffer per ph.kind (phase 4 never mixes them).
     for (uint32_t i = 0; i < s.m_slotCount; ++i) {
         PhysicalResource& ph = s.m_slots[i];
-        transient.acquire(device, ph.size, ph.format, ph.dimension, 1, 1, ph.texUsage, ph.texture, ph.view);
+        if (ph.kind == ResourceNode::Kind::Texture)
+            transient.acquire(device, ph.size, ph.format, ph.dimension, 1, 1, ph.texUsage, ph.texture, ph.view);
+        else
+            transient.acquire(device, ph.bufferSize, ph.bufUsage, ph.buffer);   // buffer acquire overload
     }
     for (ResourceNode* r = s.m_resouces; r; r = r->next)
         if (r->aliasSlot != ResourceNode::kNoSlot) {
             PhysicalResource& ph = s.m_slots[r->aliasSlot];
-            r->texture = ph.texture; r->view = ph.view;
+            r->texture = ph.texture; r->view = ph.view; r->buffer = ph.buffer;
         }
 
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-        // non-external (graph-owned, per-frame) resources are all transient TEXTURES: every buffer is
-        // imported or pool-backed (temporal/persistent), so there is no transient-buffer path. reuse a
-        // pooled texture matching this descriptor; release_resources() leaves it alone and the pool
-        // recycles/evicts at end_frame(). a member already placed on an alias slot (above) skips this.
+        // graph-owned per-frame TEXTURES not on an alias slot: reuse a pooled texture matching this
+        // descriptor; release_resources() leaves it alone and the pool recycles/evicts at end_frame().
         if (r->is_external() || r->kind != ResourceNode::Kind::Texture || !r->texUsage
             || r->aliasSlot != ResourceNode::kNoSlot) continue;
         transient.acquire(device, r->resolved, r->format, r->dimension, r->mipLevelCount, r->sampleCount, r->texUsage,
                           r->texture, r->view);
+    }
+    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
+        // graph-owned per-frame BUFFERS not on an alias slot: the buffer twin of the loop above.
+        if (r->is_external() || r->kind != ResourceNode::Kind::Buffer || !r->bufUsage
+            || r->aliasSlot != ResourceNode::kNoSlot) continue;
+        transient.acquire(device, r->bufferSize, r->bufUsage, r->buffer);   // buffer acquire overload
     }
 }
 
@@ -1796,16 +1868,18 @@ void RenderGraph::release_resources()
     RenderGraphStorage& s = *storage(this);
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->is_external()) continue;   // pool owns temporal/persistent, caller owns imported -> not ours
-        // every non-external resource is a transient texture (no transient-buffer path) -> it's pool-owned;
-        // drop our borrowed refs, don't release. the TransientResourcePool recycles/evicts it at end_frame().
-        r->texture = nullptr; r->view = nullptr;
+        // graph-owned per-frame transient (texture or buffer) -> pool-owned; drop our borrowed refs, don't
+        // release. the Transient{Resource,Buffer}Pool recycles/evicts at end_frame().
+        r->texture = nullptr; r->view = nullptr; r->buffer = nullptr;
     }
-    // aliased members just had their borrowed refs cleared; drop the per-slot refs too. the pool owns each
-    // physical texture and frees it at end_frame() -- releasing here would double-free. m_slots is arena
+    // aliased members just had their borrowed refs cleared; drop the per-slot refs too. the pools own each
+    // physical object and free it at end_frame() -- releasing here would double-free. m_slots is arena
     // garbage next frame regardless; this only keeps a stale handle from being read mid-teardown.
-    for (uint32_t i = 0; i < s.m_slotCount; ++i) { s.m_slots[i].texture = nullptr; s.m_slots[i].view = nullptr; }
-    s.m_allocator->pool.end_frame();        // free temporal resources gone idle (demo switch / feature toggle)
-    s.m_allocator->transient.end_frame();   // release every claim + evict idle textures
+    for (uint32_t i = 0; i < s.m_slotCount; ++i) {
+        s.m_slots[i].texture = nullptr; s.m_slots[i].view = nullptr; s.m_slots[i].buffer = nullptr;
+    }
+    s.m_allocator->pool.end_frame();          // free temporal resources gone idle (demo switch / feature toggle)
+    s.m_allocator->transient.end_frame();     // release every claim + evict idle textures AND buffers
 }
 
 // records one access on the pass currently being built: the one primitive every GraphBuilder

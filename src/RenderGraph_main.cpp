@@ -208,7 +208,7 @@ int main()
             if (ImGui::RadioButton(demos[i].name, active == i)) active = i;   // F1..Fn also switch
         }
         ImGui::Separator();
-        static bool enableAlias = false;   // phase-4 transient aliasing; folded into the reshape sig below
+        static bool enableAlias = true;   // phase-4 transient aliasing; folded into the reshape sig below
         ImGui::Checkbox("alias transients", &enableAlias);
         demos[active].ui();
         ImGui::End();
@@ -265,8 +265,10 @@ int main()
             lastSig = sig;
             std::printf("execution order:");
             for (PassNode* p = storage(rg)->m_passes; p; p = p->next) std::printf(" %.*s", (int)p->name.length, p->name.data);
-            std::printf("\ntransient pool: %zu textures, %u created this frame\n",
-                        allocator->transient.entries.size(), allocator->transient.createdThisFrame);
+            size_t tpTex = 0, tpBuf = 0;   // one pool, tagged by kind
+            for (const auto& e : allocator->transient.entries) (e.isBuffer ? tpBuf : tpTex)++;
+            std::printf("\ntransient pool: %zu textures, %zu buffers (%u created this frame)\n",
+                        tpTex, tpBuf, allocator->transient.createdThisFrame);
             if (storage(rg)->m_slotCount) {   // phase-4 aliasing ran (enableAlias): logical transients -> physical slots
                 uint32_t logical = 0;
                 for (ResourceNode* r = storage(rg)->m_resouces; r; r = r->next)

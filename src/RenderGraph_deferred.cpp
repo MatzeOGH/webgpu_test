@@ -587,6 +587,7 @@ static WGPURenderPipeline  bloomExtractPipe = nullptr, bloomDownPipe = nullptr, 
 static WGPURenderPipeline  cubeSamplePipe = nullptr;
 static WGPUComputePipeline ssaoPipe = nullptr;
 static WGPUComputePipeline fogInjectPipe = nullptr, fogIntegratePipe = nullptr;   // froxel volumetrics
+static WGPUComputePipeline bufFillPipe = nullptr, bufStepPipe = nullptr;   // B4: buffer-alias demo (fill / step)
 static WGPURenderPipeline  fogApplyPipe = nullptr;
 static WGPUSampler         linSampler = nullptr;   // linear/clamp on all 3 axes; shared by compose/bloom/cube/fog
 static WGPUBuffer          uboBuf = nullptr;       // demo-owned scene UBO, imported into the graph each frame
@@ -596,6 +597,7 @@ static bool ssaoOn = true, taaOn = true, bloomOn = false, cubeOn = false;
 static bool  fogOn = true;   // froxel volumetric fog; default on so the new passes run out of the box
 static bool  aliasDemoOn = false;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
 static bool  forceKeepDemoOn = false;   // Q1: a side-effect-only pass kept alive by force_keep() (else culled)
+static bool  bufAliasDemoOn = true;   // B4: transient-BUFFER disjoint-lifetime chain (exercises buffer aliasing)
 static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f, fogAmbient = 0.02f, fogNoise = 0.8f;
 
 // the gbuffer's four outputs, threaded through the chain as one value.
@@ -1175,6 +1177,83 @@ static ResourceHandle build_forcekeep_test(RenderGraph* rg, ResourceHandle scene
     return scene;
 }
 
+// B4 buffer-alias demo shaders. fill: dst[i]=i (no src) seeds the chain. step: dst[i]=src[i]+1 fully
+// defines dst from src, so each scratch buffer is a clean firstDefines (full overwrite).
+static const char* kBufFillCs = R"(
+@group(0) @binding(0) var<storage, read_write> dst : array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&dst)) { dst[i] = i; }
+}
+)";
+static const char* kBufStepCs = R"(
+@group(0) @binding(0) var<storage, read>       src : array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst : array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let i = gid.x;
+    if (i < arrayLength(&dst)) { dst[i] = src[i] + 1u; }
+}
+)";
+
+// B4: a disjoint-lifetime transient-BUFFER chain that exercises compile() phase-4 buffer aliasing (the
+// buffer twin of build_alias_test). compute-only -- a graphics pass can't write a buffer. each scratch is
+// filled FROM the running accumulator and folded BACK, so the accum dependency forces the next fill a pass
+// after the previous fold -> scratch_i dies before scratch_{i+1} is born -> all scratches collapse onto one
+// physical buffer when enableAlias is on (off: one buffer each). nothing reads the result into the
+// swapchain, so the tail is force_keep()'d (Q1) to keep the side chain alive. side effect only; no scene touch.
+static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool enabled)
+{
+    if (!enabled) return;
+    WGPUDevice dev = env.device;
+    constexpr uint64_t kBytes  = 1024;                 // 256 u32
+    constexpr uint32_t kGroups = (256u + 63u) / 64u;
+
+    auto fill = [&](const char* nm, ResourceHandle dst) {
+        rg->add_pass(WGPUStringView{ nm, WGPU_STRLEN }, PassKind::Compute,
+            [&](GraphBuilder& b) { b.storage_write(dst); },
+            [dev, dst](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(bufFillPipe, 0);
+                WGPUBindGroupEntry e[1] = { { .binding = 0, .buffer = ctx.buffer(dst), .offset = 0, .size = kBytes } };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuComputePassEncoderSetPipeline(ctx.compute, bufFillPipe);
+                wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, kGroups, 1, 1);
+                wgpuBindGroupRelease(bg); wgpuBindGroupLayoutRelease(l);
+            });
+    };
+    auto step = [&](const char* nm, ResourceHandle src, ResourceHandle dst, bool keep) {
+        rg->add_pass(WGPUStringView{ nm, WGPU_STRLEN }, PassKind::Compute,
+            [&, keep](GraphBuilder& b) { b.storage_read(src); b.storage_write(dst); if (keep) b.force_keep(); },
+            [dev, src, dst](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(bufStepPipe, 0);
+                WGPUBindGroupEntry e[2] = {
+                    { .binding = 0, .buffer = ctx.buffer(src), .offset = 0, .size = kBytes },
+                    { .binding = 1, .buffer = ctx.buffer(dst), .offset = 0, .size = kBytes },
+                };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuComputePassEncoderSetPipeline(ctx.compute, bufStepPipe);
+                wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, kGroups, 1, 1);
+                wgpuBindGroupRelease(bg); wgpuBindGroupLayoutRelease(l);
+            });
+    };
+
+    static const char* kScr[] = { "bufalias.s0", "bufalias.s1", "bufalias.s2", "bufalias.s3" };
+    ResourceHandle accum = rg->create_buffer(WEBGPU_STR("bufalias.accum"), { .size = kBytes });
+    ResourceHandle s0    = rg->create_buffer(WGPUStringView{ kScr[0], WGPU_STRLEN }, { .size = kBytes });
+    fill("bufalias.fill", s0);                 // seed scratch 0 (dst-only define)
+    step("bufalias.fold", s0, accum, false);   // scratch 0 -> accum (accum's first write)
+    for (uint32_t i = 1; i < 4; ++i) {
+        ResourceHandle si = rg->create_buffer(WGPUStringView{ kScr[i], WGPU_STRLEN }, { .size = kBytes });
+        step("bufalias.fill", accum, si, false);     // accum -> scratch i (reads accum -> ordered after prev fold)
+        step("bufalias.fold", si, accum, i == 3);    // scratch i -> accum; tail force_keep()s the whole chain
+    }
+}
+
 // present: blit the final scene colour to the swapchain (the chain's sink).
 static void build_present(RenderGraph* rg, WGPUDevice dev, ResourceHandle scene, ResourceHandle swap)
 {
@@ -1438,6 +1517,18 @@ static void deferred_init(const DemoEnv& env)
     cubeSamplePipe = wgpuDeviceCreateRenderPipeline(dev, &cubePD);
     wgpuShaderModuleRelease(cubeSM);
 
+    // B4 buffer-alias demo: two trivial compute pipelines (fill seeds, step defines dst from src).
+    WGPUShaderModule bufFillSM = make_shader(dev, kBufFillCs);
+    WGPUComputePipelineDescriptor bufFillPD{ .label = WEBGPU_STR("bufalias.fill pipeline"),
+        .compute = { .module = bufFillSM, .entryPoint = WEBGPU_STR("main") } };
+    bufFillPipe = wgpuDeviceCreateComputePipeline(dev, &bufFillPD);
+    wgpuShaderModuleRelease(bufFillSM);
+    WGPUShaderModule bufStepSM = make_shader(dev, kBufStepCs);
+    WGPUComputePipelineDescriptor bufStepPD{ .label = WEBGPU_STR("bufalias.step pipeline"),
+        .compute = { .module = bufStepSM, .entryPoint = WEBGPU_STR("main") } };
+    bufStepPipe = wgpuDeviceCreateComputePipeline(dev, &bufStepPD);
+    wgpuShaderModuleRelease(bufStepSM);
+
     WGPUBufferDescriptor bd{ .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, .size = sizeof(SceneUBO) };
     uboBuf = wgpuDeviceCreateBuffer(dev, &bd);
 }
@@ -1457,6 +1548,8 @@ static void deferred_shutdown()
     wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(composePipe);
     wgpuRenderPipelineRelease(fogApplyPipe);
+    wgpuComputePipelineRelease(bufStepPipe);
+    wgpuComputePipelineRelease(bufFillPipe);
     wgpuComputePipelineRelease(fogIntegratePipe);
     wgpuComputePipelineRelease(fogInjectPipe);
     wgpuComputePipelineRelease(ssaoPipe);
@@ -1541,6 +1634,7 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     scene = build_taa(rg, env, scene, swap, taaOn);
     scene = build_alias_test(rg, env, scene, swap, aliasDemoOn);   // R2: off by default; exercises phase-4 aliasing
     scene = build_forcekeep_test(rg, scene, swap, forceKeepDemoOn);   // Q1: off by default; side pass kept by force_keep()
+    build_buffer_alias_test(rg, env, bufAliasDemoOn);   // B4: off by default; transient-buffer alias chain (compute side passes)
     build_present(rg, dev, scene, swap);
 }
 
@@ -1554,6 +1648,7 @@ static void deferred_ui()
     ImGui::Checkbox("Volumetric Fog", &fogOn);
     ImGui::Checkbox("Alias test (phase-4 demo)", &aliasDemoOn);
     ImGui::Checkbox("force_keep test (Q1 demo)", &forceKeepDemoOn);
+    ImGui::Checkbox("Buffer alias test (B4 demo)", &bufAliasDemoOn);
     if (fogOn) {
         ImGui::SliderFloat("Fog density",    &fogDensity,       0.0f, 0.5f);
         ImGui::SliderFloat("Fog anisotropy", &fogAnisotropy,   -0.9f, 0.9f);
