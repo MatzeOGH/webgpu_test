@@ -73,6 +73,7 @@ struct PassContext
     WGPUTextureView view(ResourceHandle h) const;   // resolved view
     WGPUTexture texture(ResourceHandle h) const;    // resolved texture (copies need the texture, not a view)
     WGPUBuffer buffer(ResourceHandle h) const;  // resolved buffer
+    WGPUExtent3D size(ResourceHandle h) const;  // resolved extent -- derive a compute dispatch / scissor from a relative-sized target
 };
 
 struct GraphBuilder
@@ -250,6 +251,7 @@ private:
         static_assert(std::is_trivially_destructible_v<D>,
             "execute callback must be trivially destructible (arena frees without dtor); capture handles/ids by value");
         void* m = alloc_exec(sizeof(D), alignof(D));
+        if (!m) return;   // arena OOM (alloc_exec already announced it): leave exec_fn null -> execute() skips this pass
         ::new (m) D(std::forward<F>(f));
         set_exec(b, m, [](void* o, PassContext& c){ (*static_cast<D*>(o))(c); });
     }

@@ -395,6 +395,10 @@ struct GraphAllocator
 
         if (offset + size > capacity - scratchUsed)
         {
+            // always-on (release too): assert is stripped under NDEBUG, so without this an OOM returns null and
+            // the caller (begin_pass, make<T>, store_exec, ...) deref-crashes silently. announce it loudly.
+            std::printf("[RenderGraph] error: arena OOM -- need %zu bytes, %zu/%zu used, %zu scratch. "
+                        "raise arenaSize in create_allocator.\n", size, used, capacity, scratchUsed);
             assert(false && "GraphAllocator OOM");
             return nullptr;
         }
@@ -411,6 +415,8 @@ struct GraphAllocator
     {
         if (size > capacity - scratchUsed)
         {
+            std::printf("[RenderGraph] error: scratch OOM -- need %zu bytes, scratch %zu/%zu.\n",
+                        size, scratchUsed, capacity);
             assert(false && "GraphAllocator scratch OOM");
             return nullptr;
         }
@@ -420,6 +426,8 @@ struct GraphAllocator
 
         if (newScratchUsed > capacity - used)   // would cross into the live front/permanent region
         {
+            std::printf("[RenderGraph] error: scratch OOM -- need %zu bytes, would cross the front region "
+                        "(%zu used).\n", size, used);
             assert(false && "GraphAllocator scratch OOM");
             return nullptr;
         }
@@ -1011,7 +1019,9 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
     WGPUExtent3D b = base ? resolve_size(base, byId) : WGPUExtent3D{};
     // scale only width/height; layer count (cube/array) is the node's own, not the base's.
     uint32_t layers = r->absolute.depthOrArrayLayers ? r->absolute.depthOrArrayLayers : 1;
-    return r->resolved = { (uint32_t)(b.width * r->scaleX), (uint32_t)(b.height * r->scaleY), layers };
+    // round, don't truncate: at scale 0.5 an odd base dim (1281 -> 640.5) must land on 641, not 640 --
+    // truncation dropped a pixel, the half-res scaling bug. +0.5 then cast = round-half-up (sizes are >= 0).
+    return r->resolved = { (uint32_t)(b.width * r->scaleX + 0.5f), (uint32_t)(b.height * r->scaleY + 0.5f), layers };
 }
 
 bool RenderGraph::compile()
@@ -1344,10 +1354,18 @@ void debug_print_lifetimes(RenderGraph* rg)
     // the axisFormat if a graph ever exceeds that. names assumed colon/pipe-free -> no escaping.
 }
 
+// a ctx resolver got a handle no live node matches (id 0, an uncompiled handle, or one from another graph).
+// always-on (release too): announce it, then the resolver hands back an empty object so the body binds nothing
+// rather than dereferencing null. a valid graph never reaches here.
+static void rg_resolve_miss(const char* fn, ResourceHandle h)
+{
+    std::printf("[RenderGraph] error: ctx.%s(): no live resource for handle id %u.\n", fn, h.id);
+}
+
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
     ResourceNode* r = find_node(graph, h);
-    if (!r) return {};                   // unknown / default handle (P4 will make this loud)
+    if (!r) { rg_resolve_miss("view", h); return {}; }   // unknown / default handle: loud, bind nothing
     if (!r->texture) return r->view;     // imported: the caller-registered view (e.g. swapchain)
 
     // a single-mip 2D texture's full view IS its only subresource, and a 3D volume is sampled whole, so the
@@ -1370,6 +1388,8 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
     }
     if (!rd) return r->view;   // viewed but not declared as a read in this pass -> the full view
     RenderGraphStorage& s = *storage(graph);
+    assert(rd->baseMip < r->mipLevelCount && "ctx.view: baseMip past the texture's mip count");
+    assert(rd->baseLayer < layers && "ctx.view: baseLayer past the texture's layer count");
     WGPUTextureViewDescriptor vd{
         .format          = r->format,
         .dimension       = WGPUTextureViewDimension_2D,
@@ -1382,12 +1402,28 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
 
 WGPUTexture PassContext::texture(ResourceHandle h) const
 {
-    return find_node(graph, h)->texture;
+    ResourceNode* r = find_node(graph, h);
+    if (!r) { rg_resolve_miss("texture", h); return {}; }
+    return r->texture;   // null for an imported texture (sample via ctx.view) -- the body's concern, not a graph bug
 }
 
 WGPUBuffer PassContext::buffer(ResourceHandle h) const
 {
-    return find_node(graph, h)->buffer;
+    ResourceNode* r = find_node(graph, h);
+    if (!r) { rg_resolve_miss("buffer", h); return {}; }
+    // realize() skips a buffer with no accumulated usage (no live pass wrote it) -> r->buffer stays null. an
+    // imported buffer always carries its registered handle, so a null here means a declared-but-unwritten graph
+    // buffer (e.g. a temporal whose .curr no pass writes); binding it is a Dawn error -- assert at the resolve
+    // so it points at the missing write, not a downstream bind.
+    assert(r->buffer && "ctx.buffer(): resource declared but never realized (no live writer)");
+    return r->buffer;
+}
+
+WGPUExtent3D PassContext::size(ResourceHandle h) const
+{
+    ResourceNode* r = find_node(graph, h);
+    if (!r) { rg_resolve_miss("size", h); return {}; }
+    return r->resolved;   // compile() phase 3 resolved every live resource
 }
 
 // create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
@@ -1504,7 +1540,14 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             // body's own ctx.view() reads pool with these attachments. one view per access -> the per-pass
             // access ceiling bounds it; the assert guards an overrun that construction already prevents.
             auto attach_view = [&](ResourceNode* r, const ResourceAccess& a) -> WGPUTextureView {
-                if (!r->texture) return r->view;
+                if (!r->texture) {   // imported: the caller-owned view spans the whole resource; a subresource pick is ignored
+                    assert(a.baseMip == 0 && a.baseLayer == 0 &&
+                           "subresource (baseMip/baseLayer) selection on an imported attachment is ignored");
+                    return r->view;
+                }
+                uint32_t layers = r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1;
+                assert(a.baseMip < r->mipLevelCount && "attachment baseMip past the texture's mip count");
+                assert(a.baseLayer < layers && "attachment baseLayer past the texture's layer count");
                 WGPUTextureViewDescriptor vd{
                     .format          = r->format,
                     .dimension       = WGPUTextureViewDimension_2D,
@@ -1630,10 +1673,18 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
     }
 #endif
 
-    if (m_new_pass->accessCount < PassNode::kMaxAccess)
+    if (m_new_pass->accessCount < PassNode::kMaxAccess) {
         m_new_pass->accesses[m_new_pass->accessCount++] =
             { handle, type, load, store, clear, clearDepth, stencilLoad, stencilStore, stencilClear, baseMip, baseLayer };
-    // ponytail: silently drops past kMaxAccess; add assert/grow when a real pass hits it
+    } else {
+        // hard structural cap hit (PassNode::kMaxAccess). dropping the access silently mis-renders (a missing
+        // attachment/binding), so be loud right here -- always-on (not RG_VALIDATE), at the offending b.*() call.
+        std::printf("[RenderGraph] error: pass \"%.*s\" hit kMaxAccess (%u) -- access on resource id %u dropped; "
+                    "raise PassNode::kMaxAccess.\n",
+                    (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "",
+                    (unsigned)PassNode::kMaxAccess, handle.id);
+        assert(false && "RenderGraph: pass exceeded kMaxAccess");
+    }
 }
 
 void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)

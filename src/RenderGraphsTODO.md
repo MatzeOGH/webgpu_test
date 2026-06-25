@@ -2,8 +2,8 @@
 
 ## Critical (active bugs)
 
-[] fix GraphAllocator OOM path: assert() is stripped in release builds, so alloc_raw returns nullptr and callers (e.g. begin_pass) null-deref instead of failing gracefully
-[] scaling does not work in the smoke test: when using a scale of 0.5 for relative size the rendering produces errors
+[x] fix GraphAllocator OOM path: assert() is stripped in release builds, so alloc_raw returns nullptr and callers (e.g. begin_pass) null-deref instead of failing gracefully -- DONE (P4): always-on loud printf in alloc_raw/scratch_alloc_raw before the stripped assert; store_exec null-checks alloc_exec and leaves exec_fn null so execute() skips the pass; the 3 PassContext resolvers (+size) null-guard via rg_resolve_miss and return {}
+[x] scaling does not work in the smoke test: when using a scale of 0.5 for relative size the rendering produces errors -- DONE (P3): resolve_size now rounds (+0.5f) before the uint32 cast so an odd dim at 0.5 lands on the right pixel (1281->641); proven by making the SSAO ao texture Relative 0.5 and driving its dispatch from ctx.size(ao). foreground-verified clean
 
 ## High Priority
 

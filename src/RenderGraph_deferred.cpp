@@ -269,11 +269,13 @@ fn ndc_of(px : vec2i, fdim : vec2f) -> vec2f {
 }
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid : vec3u) {
-    let dim = vec2i(textureDimensions(gDepth));
-    let px  = vec2i(i32(gid.x), i32(gid.y));
-    if (px.x >= dim.x || px.y >= dim.y) { return; }
+    let adim = vec2i(textureDimensions(aoOut));                         // half-res output grid -> matches the dispatch
+    let opx  = vec2i(i32(gid.x), i32(gid.y));
+    if (opx.x >= adim.x || opx.y >= adim.y) { return; }
+    let dim = vec2i(textureDimensions(gDepth));                         // full-res gbuffer we sample
+    let px  = vec2i((vec2f(opx) + 0.5) * vec2f(dim) / vec2f(adim));     // output cell -> source pixel (center of the block)
     let lin = textureLoad(gDepth, px, 0);
-    if (lin >= 1.0) { textureStore(aoOut, px, vec4f(1.0)); return; }     // background = fully lit
+    if (lin >= 1.0) { textureStore(aoOut, opx, vec4f(1.0)); return; }   // background = fully lit
 
     let fdim   = vec2f(dim);
     let aspect = fdim.x / fdim.y;
@@ -301,7 +303,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         ao = ao + max(ndv - 0.02, 0.0) * rng;
     }
     ao = clamp(1.0 - ao / f32(SAMPLES) * 2.5, 0.0, 1.0);
-    textureStore(aoOut, px, vec4f(ao, ao, ao, 1.0));
+    textureStore(aoOut, opx, vec4f(ao, ao, ao, 1.0));
 }
 )";
 
@@ -598,11 +600,11 @@ static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f,
 struct GBuffer { ResourceHandle albedo, normal, rough, depth; };
 
 // a swapchain-sized offscreen texture (WGPU_STRLEN -> copy_string measures the literal).
-static ResourceHandle screen_tex(RenderGraph* rg, const char* name, WGPUTextureFormat fmt, ResourceHandle swap)
+static ResourceHandle screen_tex(RenderGraph* rg, const char* name, WGPUTextureFormat fmt, ResourceHandle swap, float scale = 1.0f)
 {
     return rg->create_image(WGPUStringView{ name, WGPU_STRLEN }, {
         .dimension = WGPUTextureDimension_2D, .format = fmt,
-        .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swap,
+        .sizeKind = SizeKind::Relative, .scaleX = scale, .scaleY = scale, .relativeTo = swap,
     });
 }
 
@@ -678,8 +680,7 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
                                  ResourceHandle gDepth, ResourceHandle gNormal, ResourceHandle swap)
 {
     WGPUDevice dev = env.device;
-    auto ao = screen_tex(rg, "ssao.ao", kAOFormat, swap);
-    const uint32_t gx = (env.width + 7) / 8, gy = (env.height + 7) / 8;
+    auto ao = screen_tex(rg, "ssao.ao", kAOFormat, swap, 0.5f);   // half-res AO (P3); grid + dispatch derive from ctx.size(ao)
     rg->add_pass(WEBGPU_STR("ssao"), PassKind::Compute,
         [&](GraphBuilder& b) {
             b.uniform(ubo);                 // camera basis for world reconstruction
@@ -687,7 +688,7 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
             b.sampled(gNormal);
             b.storage_write(ao);
         },
-        [dev, ubo, gDepth, gNormal, ao, gx, gy](PassContext& ctx) {
+        [dev, ubo, gDepth, gNormal, ao](PassContext& ctx) {
             WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(ssaoPipe, 0);
             WGPUBindGroupEntry e[4] = {
                 { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(SceneUBO) },
@@ -699,7 +700,8 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
             wgpuComputePassEncoderSetPipeline(ctx.compute, ssaoPipe);
             wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
-            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, gx, gy, 1);
+            WGPUExtent3D as = ctx.size(ao);                       // half-res AO extent -> workgroups cover exactly its grid
+            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, (as.width + 7) / 8, (as.height + 7) / 8, 1);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);
         });
