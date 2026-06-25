@@ -7,7 +7,7 @@
 
 ## High Priority
 
-[] force_keep flag on passes / explicit mark_output(ResourceHandle) -- culling currently only roots at passes writing an *imported or temporal* resource, so side-effect-only passes (readback/debug/profiling/indirect-arg-gen) and non-external outputs get silently dropped
+[x] force_keep flag on passes / explicit mark_output(ResourceHandle) 
 [x] persistent non-temporal resources: a pool-backed resource that survives the per-frame teardown but is NOT ping-pong rotated -- written once (or every N frames) and read for many frames after. unblocks compute-once/read-many bakes (BRDF LUT, prefiltered/irradiance IBL, SH, atlases) and reduced-cadence GI -- DONE: create_persistent_image/create_persistent_buffer (1-slot, no rotation, exempt from def-before-use like temporal) plus GraphBuilder::initialize(target, hash) for the compute-once/read-many bake itself (re-bakes on first creation, eviction, descriptor/resize change, or hash mismatch; skips otherwise). Demoed in RenderGraph_bake.cpp (procedural sky) and the path tracer's persistent accumulator buffer.
 [] kMaxAccess=16 per pass and the 1MB arena are fixed with no growth path; add an assert or grow-on-demand -- currently silently drops accesses past the cap
 [] review/critique the scratch_alloc implementation -- scrutinize the two-sided arena arithmetic (alignment round-down, unsigned-underflow guards, the capacity-scratchUsed vs capacity-used boundary checks in alloc_raw/scratch_alloc_raw), confirm no front/scratch overlap edge case, and sanity-check the per-scope defer reset_scratch() pattern in compile()/sweep_resource_versions()

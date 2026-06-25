@@ -7,6 +7,8 @@ namespace pt_demo {
 
 constexpr WGPUTextureFormat kAccumFormat = WGPUTextureFormat_RGBA16Float;  // HDR accumulation (renderable + sampleable in core)
 constexpr uint64_t          kAccumBytes  = 16;                             // pt.samples temporal buffer: array<u32,4>
+constexpr uint32_t          kHistoBins   = 256;
+constexpr uint64_t          kHistoBytes  = kHistoBins * sizeof(uint32_t);  // 1 KiB
 
 // camera basis + accumulation/quality knobs. scene lives in the shader, so nothing else crosses.
 struct PtUBO {
@@ -18,7 +20,9 @@ struct PtUBO {
     uint32_t accumFrame;     // frames blended so far; doubles as the RNG seed. 0 = reset
     uint32_t maxBounces;     // path depth cap (Russian roulette may cut it short sooner)
     uint32_t spp;            // samples per pixel PER FRAME (more = fewer frames to converge)
-    uint32_t _pad[3];        // round up to a 16-byte multiple
+    uint32_t dnRadius;       // denoise: bilateral filter kernel radius (0 = off)
+    float    dnSigmaS;       // denoise: spatial sigma
+    float    dnSigmaL;       // denoise: luminance sigma (edge sensitivity)
 };
 static_assert(sizeof(PtUBO) == 96, "PtUBO must match the std140 WGSL Pt layout");
 
@@ -33,7 +37,7 @@ struct Pt {
     accumFrame : u32,
     maxBounces : u32,
     spp        : u32,
-    pad0 : u32, pad1 : u32, pad2 : u32,
+    dnRadius : u32, dnSigmaS : f32, dnSigmaL : f32,
 };
 @group(0) @binding(0) var<uniform> pt : Pt;
 @group(0) @binding(1) var prevTex : texture_2d<f32>;
@@ -180,14 +184,28 @@ static const char* kTraceFs = R"(
 // present fs: tonemap + gamma-encode the HDR accumulation into the (non-sRGB) swapchain.
 static const char* kPresentFs = R"(
 @group(0) @binding(0) var srcTex : texture_2d<f32>;
+@group(0) @binding(1) var<storage> histo : array<u32, 256>;
 fn pt_aces(x : vec3f) -> vec3f {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
 }
 @fragment fn fs(in : VsOut) -> @location(0) vec4f {
-    let px     = vec2i(i32(in.pos.x), i32(in.pos.y));
-    let hdr    = textureLoad(srcTex, px, 0).rgb;
-    let mapped = pt_aces(hdr);
+    let px  = vec2i(i32(in.pos.x), i32(in.pos.y));
+    let hdr = textureLoad(srcTex, px, 0).rgb;
+
+    // ponytail: per-pixel histogram scan; hoist to a 1-workgroup compute if this shows on a profile
+    var total = 0u;
+    var wsum  = 0.0;
+    for (var i = 0u; i < 256u; i = i + 1u) {
+        let n = histo[i];
+        total += n;
+        wsum += f32(n) * ((f32(i) + 0.5) / 256.0);
+    }
+    let avgBin   = wsum / max(f32(total), 1.0);
+    let avgLum   = exp2(avgBin * log2(17.0)) - 1.0;
+    let exposure = clamp(0.18 / max(avgLum, 0.001), 0.25, 4.0);
+
+    let mapped = pt_aces(hdr * exposure);
     return vec4f(pow(mapped, vec3f(1.0 / 2.2)), 1.0);
 }
 )";
@@ -207,7 +225,7 @@ struct Pt {
     accumFrame : u32,
     maxBounces : u32,
     spp        : u32,
-    pad0 : u32, pad1 : u32, pad2 : u32,
+    dnRadius : u32, dnSigmaS : f32, dnSigmaL : f32,
 };
 @group(0) @binding(0) var<uniform> pt : Pt;
 @group(0) @binding(1) var<storage, read_write> samples : array<u32, 4>;
@@ -221,16 +239,91 @@ fn main() {
 }
 )";
 
+// log-luminance histogram over the HDR accumulation (256 bins, single workgroup). exercises
+// storage_write on a persistent buffer -- a pure-write sink the graph hasn't seen yet.
+static const char* kHistogramCS = R"(
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> bins : array<u32, 256>;
+
+var<workgroup> local_bins : array<atomic<u32>, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) lid : u32) {
+    atomicStore(&local_bins[lid], 0u);
+    workgroupBarrier();
+
+    let dim = textureDimensions(srcTex);
+    let total = dim.x * dim.y;
+    var i = lid;
+    while (i < total) {
+        let c = textureLoad(srcTex, vec2i(i32(i % dim.x), i32(i / dim.x)), 0).rgb;
+        let lum = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+        let bin = min(u32(log2(lum + 1.0) * 256.0 / log2(17.0)), 255u);
+        atomicAdd(&local_bins[bin], 1u);
+        i += 256u;
+    }
+    workgroupBarrier();
+
+    bins[lid] = atomicLoad(&local_bins[lid]);
+}
+)";
+
+// edge-aware bilateral filter: 5x5 kernel weighted by spatial distance + luminance similarity.
+// transient image output (the first in this demo) exercises create_image + compute storage_write on a texture.
+static const char* kDenoiseCS = R"(
+struct Pt {
+    camPos : vec4f, camFwd : vec4f, camRight : vec4f, camUp : vec4f,
+    resolution : vec2f, accumFrame : u32, maxBounces : u32, spp : u32,
+    dnRadius : u32, dnSigmaS : f32, dnSigmaL : f32,
+};
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+@group(0) @binding(1) var dstTex : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> pt : Pt;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+    let dim = textureDimensions(srcTex);
+    if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+
+    let center = textureLoad(srcTex, vec2i(gid.xy), 0).rgb;
+    let cLum   = dot(center, vec3f(0.2126, 0.7152, 0.0722));
+    let r      = i32(pt.dnRadius);
+
+    var sum = vec3f(0.0);
+    var wt  = 0.0;
+    for (var dy = -r; dy <= r; dy = dy + 1) {
+        for (var dx = -r; dx <= r; dx = dx + 1) {
+            let px = vec2i(i32(gid.x) + dx, i32(gid.y) + dy);
+            if (px.x < 0 || px.y < 0 || px.x >= i32(dim.x) || px.y >= i32(dim.y)) { continue; }
+            let n    = textureLoad(srcTex, px, 0).rgb;
+            let nLum = dot(n, vec3f(0.2126, 0.7152, 0.0722));
+            let ds   = f32(dx * dx + dy * dy);
+            let dl   = (cLum - nLum) * (cLum - nLum);
+            let w    = exp(-ds / (2.0 * pt.dnSigmaS * pt.dnSigmaS)
+                          - dl / (2.0 * pt.dnSigmaL * pt.dnSigmaL));
+            sum += n * w;
+            wt  += w;
+        }
+    }
+    textureStore(dstTex, vec2i(gid.xy), vec4f(sum / wt, 1.0));
+}
+)";
+
 // ---- state (created once in init, lives across frames) ----
 static WGPURenderPipeline  tracePipe   = nullptr;
 static WGPURenderPipeline  presentPipe = nullptr;
 static WGPUComputePipeline accumPipe   = nullptr;   // pt.accum: temporal-buffer accumulator
+static WGPUComputePipeline histoPipe   = nullptr;   // pt.histogram: luminance binning
+static WGPUComputePipeline denoisePipe  = nullptr;   // pt.denoise: bilateral filter
 static WGPUBuffer          uboBuf       = nullptr;   // demo-owned, imported into the graph each frame
 
 // ---- accumulation knobs + the snapshot the reset logic compares against ----
 static int      maxBounces  = 5;        // ImGui slider: path depth cap
 static int      spp         = 1;        // ImGui slider: samples per pixel per frame
 static uint32_t accum       = 0;        // frames folded in so far; 0 = start over
+static int      dnRadius    = 1;        // ImGui slider: bilateral filter kernel radius (0 = off)
+static float    dnSigmaS    = 1.0f;     // ImGui slider: spatial sigma
+static float    dnSigmaL    = 0.15f;    // ImGui slider: luminance sigma
 static float    lastCam[5]  = {};       // px,py,pz,yaw,pitch snapshot to spot camera motion
 static uint32_t lastW = 0, lastH = 0;   // resolution snapshot (resize rebuilds the accum texture)
 static int      lastBounces = 5;        // changing bounce depth changes the estimator -> reset accum
@@ -277,6 +370,22 @@ static void pathtracer_init(const DemoEnv& env)
     accumPipe = wgpuDeviceCreateComputePipeline(dev, &accumPD);
     wgpuShaderModuleRelease(accumSM);
 
+    WGPUShaderModule histoSM = make_shader(dev, std::string(kHistogramCS));
+    WGPUComputePipelineDescriptor histoPD{
+        .label   = WEBGPU_STR("pt.histogram pipeline"),
+        .compute = { .module = histoSM, .entryPoint = WEBGPU_STR("main") },
+    };
+    histoPipe = wgpuDeviceCreateComputePipeline(dev, &histoPD);
+    wgpuShaderModuleRelease(histoSM);
+
+    WGPUShaderModule denoiseSM = make_shader(dev, std::string(kDenoiseCS));
+    WGPUComputePipelineDescriptor denoisePD{
+        .label   = WEBGPU_STR("pt.denoise pipeline"),
+        .compute = { .module = denoiseSM, .entryPoint = WEBGPU_STR("main") },
+    };
+    denoisePipe = wgpuDeviceCreateComputePipeline(dev, &denoisePD);
+    wgpuShaderModuleRelease(denoiseSM);
+
     WGPUBufferDescriptor bd{ .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, .size = sizeof(PtUBO) };
     uboBuf = wgpuDeviceCreateBuffer(dev, &bd);
 }
@@ -285,6 +394,8 @@ static void pathtracer_shutdown()
 {
     using namespace pt_demo;
     wgpuBufferRelease(uboBuf);
+    wgpuComputePipelineRelease(denoisePipe);
+    wgpuComputePipelineRelease(histoPipe);
     wgpuComputePipelineRelease(accumPipe);
     wgpuRenderPipelineRelease(presentPipe);
     wgpuRenderPipelineRelease(tracePipe);
@@ -316,6 +427,9 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
     u.accumFrame = accum;
     u.maxBounces = (uint32_t)maxBounces;
     u.spp        = (uint32_t)spp;
+    u.dnRadius   = (uint32_t)dnRadius;
+    u.dnSigmaS   = dnSigmaS;
+    u.dnSigmaL   = dnSigmaL;
     wgpuQueueWriteBuffer(env.queue, uboBuf, 0, &u, sizeof(u));
     ResourceHandle ubo = rg->import_buffer(WEBGPU_STR("pt.ubo"), uboBuf);
 
@@ -329,7 +443,15 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
     // create_persistent_buffer. read + write the same buffer in one pass (the StorageRead+StorageWrite RMW
     // pair); own-slot, so one buffer is correct + half the memory of a temporal pair. nothing reads it, so
     // trace/present are untouched -- it survives culling purely by writing a persistent sink.
-    auto acc = rg->create_persistent_buffer(WEBGPU_STR("pt.samples"), { .size = kAccumBytes });
+    auto acc   = rg->create_persistent_buffer(WEBGPU_STR("pt.samples"),    { .size = kAccumBytes });
+    auto histo = rg->create_persistent_buffer(WEBGPU_STR("pt.histogram"), { .size = kHistoBytes });
+
+    // transient denoised image: written by pt.denoise, read by pt.present. exercises create_image
+    // (first transient texture in this demo) and tests aliasing with the temporal ping-pong pair.
+    auto denoised = rg->create_image(WEBGPU_STR("pt.denoised"), {
+        .dimension = WGPUTextureDimension_2D, .format = kAccumFormat,
+        .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
+    });
     rg->add_pass(WEBGPU_STR("pt.accum"), PassKind::Compute,
         [&](GraphBuilder& b) {
             b.uniform(ubo);
@@ -372,18 +494,66 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
             wgpuBindGroupLayoutRelease(l);
         });
 
-    // tonemap the accumulated HDR result into the swapchain.
-    rg->add_pass(WEBGPU_STR("pt.present"), PassKind::Graphics,
+    // per-frame log-luminance histogram: reads the traced HDR image, writes 256 u32 bins into a
+    // persistent buffer via storage_write (pure-write sink, no dependency on prior contents).
+    rg->add_pass(WEBGPU_STR("pt.histogram"), PassKind::Compute,
         [&](GraphBuilder& b) {
             b.sampled(a.curr);
+            b.storage_write(histo);
+        },
+        [dev, a, histo](PassContext& ctx) {
+            WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(histoPipe, 0);
+            WGPUBindGroupEntry e[2] = {
+                { .binding = 0, .textureView = ctx.view(a.curr) },
+                { .binding = 1, .buffer = ctx.buffer(histo), .offset = 0, .size = kHistoBytes },
+            };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+            wgpuComputePassEncoderSetPipeline(ctx.compute, histoPipe);
+            wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, 1, 1, 1);
+            wgpuBindGroupRelease(bg);
+            wgpuBindGroupLayoutRelease(l);
+        });
+
+    // bilateral denoise: smooth path-tracing noise while preserving edges. transient output
+    // tests create_image + compute storage_write on a texture; mixes pass kinds in the chain.
+    rg->add_pass(WEBGPU_STR("pt.denoise"), PassKind::Compute,
+        [&](GraphBuilder& b) {
+            b.sampled(a.curr);
+            b.storage_write(denoised);
+            b.uniform(ubo);
+        },
+        [dev, a, denoised, ubo, dw = env.width, dh = env.height](PassContext& ctx) {
+            WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(denoisePipe, 0);
+            WGPUBindGroupEntry e[3] = {
+                { .binding = 0, .textureView = ctx.view(a.curr) },
+                { .binding = 1, .textureView = ctx.view(denoised) },
+                { .binding = 2, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(PtUBO) },
+            };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+            wgpuComputePassEncoderSetPipeline(ctx.compute, denoisePipe);
+            wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, (dw + 7) / 8, (dh + 7) / 8, 1);
+            wgpuBindGroupRelease(bg);
+            wgpuBindGroupLayoutRelease(l);
+        });
+
+    // tonemap the denoised HDR result into the swapchain; reads the histogram for auto-exposure.
+    rg->add_pass(WEBGPU_STR("pt.present"), PassKind::Graphics,
+        [&](GraphBuilder& b) {
+            b.sampled(denoised);
+            b.storage_read(histo);
             b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },
-        [dev, a](PassContext& ctx) {
+        [dev, denoised, histo](PassContext& ctx) {
             WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(presentPipe, 0);
-            WGPUBindGroupEntry e[1] = {
-                { .binding = 0, .textureView = ctx.view(a.curr) },
+            WGPUBindGroupEntry e[2] = {
+                { .binding = 0, .textureView = ctx.view(denoised) },
+                { .binding = 1, .buffer = ctx.buffer(histo), .offset = 0, .size = kHistoBytes },
             };
-            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+            WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 2, .entries = e };
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
             wgpuRenderPassEncoderSetPipeline(ctx.render, presentPipe);
             wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
@@ -399,4 +569,8 @@ static void pathtracer_ui()
     ImGui::Text("samples: %u", accum + 1u);          // frames blended (x spp = total paths/pixel)
     ImGui::SliderInt("Max bounces", &maxBounces, 1, 12);
     ImGui::SliderInt("SPP / frame", &spp, 1, 16);
+    ImGui::Separator();
+    ImGui::SliderInt("Denoise radius", &dnRadius, 0, 4);
+    ImGui::SliderFloat("Denoise spatial", &dnSigmaS, 0.1f, 4.0f);
+    ImGui::SliderFloat("Denoise luma", &dnSigmaL, 0.01f, 1.0f);
 }

@@ -550,6 +550,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// pass is kBoxW wide / inner column 0; an expanded group's anchor carries the whole region's width.
 	float effW[kRgDagMax]; int innerCol[kRgDagMax];
 	for (int i = 0; i < n; ++i) { effW[i] = kBoxW; innerCol[i] = 0; }
+	// expanded-group member's y offset within its region body, from the recursive interior layout (phase 2).
+	float memRelY[kRgDagMax]; for (int i = 0; i < n; ++i) memRelY[i] = 0.0f;
 	// subgroup collapse: a collapsed subgroup (same-name run) folds to its first member (the rep, shown as a
 	// compact box with the count); the others hide and its inner columns compact. sgHidden = non-rep member
 	// (skip everywhere); sgCount = member count on the rep (>0 => draw compact).
@@ -639,14 +641,31 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 					int remapIC[kRgDagMax]; int innerCols = 0;
 					for (int c = 0; c < rawCols; ++c) remapIC[c] = absorbed[c] ? innerCols - 1 : innerCols++;
 					for (int k = a; k < b; ++k) innerCol[k] = remapIC[innerCol[k]];
-					float maxColH = 0;
-					for (int ic = 0; ic < innerCols; ++ic) {
-						float ch = 0; int cnt = 0;
-						for (int k = a; k < b; ++k) if (innerCol[k] == ic && !sgHidden[k]) { ch += box[k].h; ++cnt; }
-						if (cnt > 1) ch += (cnt - 1) * kInnerGap;
-						if (ch > maxColH) maxColH = ch;
+					// lay out the interior with the shared layered relax (innerCol = layer) so members align to
+					// their internal edges instead of a naive per-column stack; the region height then fits it.
+					// (routing internal edges through dummy lanes is phase 2b -- here members just get good y's.)
+					static std::vector<int> ilcol[kRgDagMax]; for (int c = 0; c < innerCols; ++c) ilcol[c].clear();
+					static int inode[kRgDagMax]; static std::vector<int> imem; imem.clear(); static std::vector<float> ih; ih.clear();
+					for (int k = a; k < b; ++k) { inode[k] = -1; if (sgHidden[k]) continue; inode[k] = (int)imem.size(); ilcol[innerCol[k]].push_back((int)imem.size()); imem.push_back(k); ih.push_back(box[k].h); }
+					int iN = (int)imem.size();
+					static std::vector<std::vector<int>> illeft, ilright; illeft.assign(iN, {}); ilright.assign(iN, {});
+					for (int k = a; k < b; ++k) {
+						if (sgHidden[k]) continue;
+						PassNode* pk = box[k].p;
+						for (uint32_t ci = 0; ci < pk->accessCount; ++ci) {
+							if (!rg_access_reads(pk->accesses[ci])) continue;
+							int prod = rg_producer_of(box, n, pk, pk->accesses[ci].handle.id);
+							if (prod < a || prod >= b || sgHidden[prod] || innerCol[prod] >= innerCol[k]) continue;
+							ilright[inode[prod]].push_back(inode[k]); illeft[inode[k]].push_back(inode[prod]);
+						}
 					}
-					effH[a] = kHeaderH + 2.0f * kRegionPad + maxColH;
+					static std::vector<float> icy; icy.assign(iN, 0.0f);
+					rg_barycenter_relax(ilcol, innerCols - 1, illeft, ilright, ih, icy, kInnerGap);
+					float ymin = 1e30f, ymax = -1e30f;
+					for (int ni = 0; ni < iN; ++ni) { float t = icy[ni] - ih[ni] * 0.5f, bt = icy[ni] + ih[ni] * 0.5f; if (t < ymin) ymin = t; if (bt > ymax) ymax = bt; }
+					if (iN == 0) { ymin = ymax = 0; }
+					for (int ni = 0; ni < iN; ++ni) memRelY[imem[ni]] = icy[ni] - ih[ni] * 0.5f - ymin;   // icy is a centre; pos is top-left
+					effH[a] = kHeaderH + 2.0f * kRegionPad + (ymax - ymin);
 					effW[a] = 2.0f * kRegionPad + innerCols * kBoxW + (innerCols - 1) * kInnerColGap;
 					colOf[a] = colMin; for (int k = a + 1; k < b; ++k) { effH[k] = 0.0f; effW[k] = 0.0f; colOf[k] = colMin; }   // leftmost member, not first (see collapsed branch)
 				}
@@ -951,14 +970,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			// height on the group's own column pre-layout, so nothing outside the group overlaps the border.
 			ImU32 gcol = group_color(pre);
 			float rx = rgn[gi].pos.x, ry = rgn[gi].pos.y, rh = effH[gi], rw = effW[gi];   // canvas-local region rect
-			// members at their inner-column x (left->right dependency flow), stacking vertically when several
-			// share an inner column (parallel members like cascades).
-			float colYrun[kRgDagMax]; for (int c = 0; c < kRgDagMax; ++c) colYrun[c] = ry + kHeaderH + kRegionPad;
-			for (int k = gi; k < gj; ++k) {
-				int ic = innerCol[k];
-				rgn[k].pos = ImVec2(rx + kRegionPad + ic * (kBoxW + kInnerColGap), colYrun[ic]);
-				if (!sgHidden[k]) colYrun[ic] += rgn[k].h + kInnerGap;
-			}
+			// members at their inner-column x; relaxed y from the recursive interior layout (memRelY).
+			for (int k = gi; k < gj; ++k)
+				rgn[k].pos = ImVec2(rx + kRegionPad + innerCol[k] * (kBoxW + kInnerColGap), ry + kHeaderH + kRegionPad + memRelY[k]);
 			ImVec2 a(origin.x + rx, origin.y + ry), b(a.x + rw, a.y + rh);
 			dl->AddRectFilled(a, b, rg_with_alpha(gcol, 22), 6.0f);
 			dl->AddRect(a, b, gcol, 6.0f, 0, 2.0f);
@@ -2109,6 +2123,8 @@ static void imgui_layer_draw_graph(RenderGraph* rg)
 
 	ImGui::Begin("RenderGraph");
 	ImGui::Text(" %.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+	ImGui::Text(" compile %.0f us  realize %.0f us  execute %.0f us",
+	            s.timing_compile_us, s.timing_realize_us, s.timing_execute_us);
 	rg_draw_arena(*s.m_allocator);
 	ImGui::Separator();
 

@@ -598,6 +598,10 @@ static bool  fogOn = true;   // froxel volumetric fog; default on so the new pas
 static bool  aliasDemoOn = false;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
 static bool  forceKeepDemoOn = false;   // Q1: a side-effect-only pass kept alive by force_keep() (else culled)
 static bool  bufAliasDemoOn = true;   // B4: transient-BUFFER disjoint-lifetime chain (exercises buffer aliasing)
+// Q6: history invalidation epoch. bumped on frame gap (demo switch) or manual reset; used as the hash
+// for temporal resources so the pool destroys+recreates both layers (zeros .prev).
+static uint64_t historyEpoch = 1;
+static uint64_t lastBuildFrame = 0;
 static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f, fogAmbient = 0.02f, fogNoise = 0.8f;
 
 // the gbuffer's four outputs, threaded through the chain as one value.
@@ -826,7 +830,7 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
         .dimension = WGPUTextureDimension_3D, .format = kFogFormat,
         .sizeKind = SizeKind::Absolute, .absolute = { kFroxelX, kFroxelY, kFroxelZ }, .mipLevelCount = 1,
     };
-    auto scatter  = rg->create_temporal_image(WEBGPU_STR("fog.scatter"), desc3d);   // .curr write, .prev history
+    auto scatter  = rg->create_temporal_image(WEBGPU_STR("fog.scatter"), desc3d, historyEpoch);
     auto volInteg = rg->create_image(WEBGPU_STR("fog.integrated"), desc3d);
     const uint32_t ix = (kFroxelX + 3) / 4, iy = (kFroxelY + 3) / 4, iz = (kFroxelZ + 3) / 4;   // inject 4x4x4
     const uint32_t cx = (kFroxelX + 7) / 8, cy = (kFroxelY + 7) / 8;                            // integrate 8x8x1
@@ -1082,12 +1086,10 @@ static ResourceHandle build_taa(RenderGraph* rg, const DemoEnv& env, ResourceHan
 {
     if (!enabled) return scene;
     WGPUDevice dev = env.device;
-    // history: ping-pong temporal resource. .curr = this frame's write target, .prev = last frame's
-    // result; the pool swaps the two physical textures each frame.
     auto hist = rg->create_temporal_image(WEBGPU_STR("taa.history"), {
         .dimension = WGPUTextureDimension_2D, .format = kSwapFormat,
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swap,
-    });
+    }, historyEpoch);
     rg->add_pass(WEBGPU_STR("taa"), PassKind::Graphics,
         [&](GraphBuilder& b) {
             b.sampled(scene);                    // this frame's shaded colour
@@ -1563,6 +1565,11 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     using namespace def_demo;
     WGPUDevice dev = env.device;
 
+    // Q6: bump the history epoch on frame gap (demo switch / re-entry) so temporal resources
+    // (TAA history, fog scatter) get their pools destroyed+recreated → both layers zeroed.
+    if (env.frame != lastBuildFrame + 1) ++historyEpoch;
+    lastBuildFrame = env.frame;
+
     // host-upload the scene + a static directional light into the demo-owned UBO, then import it. The
     // spheres are packed into a pile resting ON the ground so they overlap into tight concave necks --
     // that's where SSAO actually darkens.
@@ -1646,9 +1653,10 @@ static void deferred_ui()
     ImGui::Checkbox("Bloom", &bloomOn);
     ImGui::Checkbox("Cubemap", &cubeOn);
     ImGui::Checkbox("Volumetric Fog", &fogOn);
-    ImGui::Checkbox("Alias test (phase-4 demo)", &aliasDemoOn);
-    ImGui::Checkbox("force_keep test (Q1 demo)", &forceKeepDemoOn);
-    ImGui::Checkbox("Buffer alias test (B4 demo)", &bufAliasDemoOn);
+    ImGui::Checkbox("Alias test", &aliasDemoOn);
+    ImGui::Checkbox("force_keep test", &forceKeepDemoOn);
+    ImGui::Checkbox("Buffer alias test", &bufAliasDemoOn);
+    if (ImGui::Button("Reset history")) ++historyEpoch;
     if (fogOn) {
         ImGui::SliderFloat("Fog density",    &fogDensity,       0.0f, 0.5f);
         ImGui::SliderFloat("Fog anisotropy", &fogAnisotropy,   -0.9f, 0.9f);

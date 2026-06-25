@@ -123,17 +123,16 @@ struct GraphBuilder
     void index_buffer(ResourceHandle handle);
     void indirect_buffer(ResourceHandle handle);
 
-    // mark this pass as the initializer for a persistent resource (create_persistent_image/_buffer): it
-    // runs only when the target needs (re)baking, then compile() skips it. `hash` is a digest of the
-    // settings the baked content depends on (IBL quality, sun direction, ...): the pass runs while the
-    // target is unrealized (first frame, or after the pool evicts/recreates it) OR while `hash` differs
-    // from the hash last baked into it -- so changing a setting re-bakes, a steady setting bakes once.
-    // `hash == 0` (the default) never changes => pure bake-once. the baked result persists in the pool, so
-    // readers bind to it with no in-graph writer (legal for a persistent/external resource). declare the
-    // write to `target` as usual (color()/storage_write()); this only gates. `target` must be persistent
-    // (asserted) and should be the pass's only written sink. one target per pass; write only it.
-    // CAVEAT: fold EVERY setting the baked content reads into `hash` -- an omitted one silently keeps a stale
-    // bake (the pass never re-runs). a (re)created target (resize/eviction/descriptor change) always re-bakes.
+    // mark this pass as the initializer for a persistent or temporal resource: it runs only when the
+    // target needs (re)baking, then compile() skips it. `hash` is a digest of the settings the baked
+    // content depends on: the pass runs while the target is unrealized (first frame, or after the pool
+    // evicts/recreates it) OR while `hash` differs from the hash last baked into it -- so changing a
+    // setting re-bakes, a steady setting bakes once. `hash == 0` (the default) never changes => pure
+    // bake-once. the baked result persists in the pool, so readers bind to it with no in-graph writer
+    // (legal for a persistent/external resource). declare the write to `target` as usual
+    // (color()/storage_write()); this only gates. `target` must be pool-backed (persistent or temporal
+    // .curr); one target per pass, write only it. for temporal resources this fills .curr on a camera
+    // cut / first frame; combine with the history hash on create_temporal_image for full invalidation.
     void initialize(ResourceHandle target, uint64_t hash = 0);
 
     // keep this pass even when nothing in the graph reads its output and it writes no imported/persistent
@@ -188,16 +187,16 @@ struct RenderGraph
     // textures. Write `.curr`, read `.prev`. Survives the per-frame teardown (realize()/release_resources()
     // defer to the pool the allocator owns). Writing `.prev` is an authoring
     // error (it backs a future frame's curr): compile() reports it under RG_VALIDATE.
-    // ponytail: ping-pong only. N-deep history (checkerboard reconstruction, frame-gen reading 2 frames
-    // back) was removed for simplicity; reinstate a `layers` count + indexed accessor if ever needed.
-    TemporalResource create_temporal_image(WGPUStringView name, const TextureDesc& desc);
+    // `hash`: nonzero = camera-cut invalidation. on mismatch the pool destroys and recreates both
+    // physical layers (Dawn zeros them), clearing stale .prev. 0 (default) = no invalidation.
+    // ponytail: ping-pong only. N-deep history reinstate a `layers` count if ever needed.
+    TemporalResource create_temporal_image(WGPUStringView name, const TextureDesc& desc, uint64_t hash = 0);
 
     // Temporal (history) BUFFER: the GPU-buffer twin of create_temporal_image -- two physical buffers
     // the PersistentResourcePool ping-pongs each frame, same contract (write `.curr`, read `.prev`;
-    // writing `.prev` is an authoring error, reported under RG_VALIDATE). For GPU-authored cross-frame
-    // state -- accumulators, particle systems -- the graph owns the storage, no caller-side double-buffer.
-    // GPU-authored only: no host-upload affordance (host-written UBOs stay imported).
-    TemporalResource create_temporal_buffer(WGPUStringView name, const BufferDesc& desc);
+    // writing `.prev` is an authoring error, reported under RG_VALIDATE). `hash`: same camera-cut
+    // invalidation as create_temporal_image (nonzero = destroy+recreate on mismatch, 0 = off).
+    TemporalResource create_temporal_buffer(WGPUStringView name, const BufferDesc& desc, uint64_t hash = 0);
 
     // Persistent (cross-frame) SINGLE GPU buffer the graph owns: one pool-backed buffer (no ping-pong),
     // survives the per-frame teardown, auto-evicted once no pass declares it. Read AND write it in one pass

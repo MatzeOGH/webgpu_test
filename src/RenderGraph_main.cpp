@@ -243,6 +243,7 @@ int main()
             [&](GraphBuilder& b) { b.color(swapchain, WGPULoadOp_Load, WGPUStoreOp_Store); },
             [](PassContext& ctx) { ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), ctx.render); });
 
+        auto t0 = std::chrono::steady_clock::now();
         if (!rg->compile(enableAlias)) {
             // ordering error (compile() already printed it). skip this frame's GPU work.
             wgpuTextureViewRelease(view);
@@ -251,7 +252,14 @@ int main()
             imgui_layer_end_frame();
             continue;
         }
+        auto t1 = std::chrono::steady_clock::now();
         rg->realize(dev);     // creates this frame's transient textures
+        auto t2 = std::chrono::steady_clock::now();
+        {
+            auto& s = *storage(rg);
+            s.timing_compile_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
+            s.timing_realize_us = std::chrono::duration<float, std::micro>(t2 - t1).count();
+        }
 
         imgui_layer_draw_graph(rg);   // build the DAG window now the graph is compiled + realized
         imgui_layer_end_frame();      // ImGui::Render(); the "imgui" pass consumes the draw data at execute
@@ -278,7 +286,10 @@ int main()
         }
 
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev, nullptr);
+        auto te0 = std::chrono::steady_clock::now();
         rg->execute(enc, q);
+        auto te1 = std::chrono::steady_clock::now();
+        storage(rg)->timing_execute_us = std::chrono::duration<float, std::micro>(te1 - te0).count();
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
         wgpuQueueSubmit(q, 1, &cmd);
         wgpuSurfacePresent(surf);

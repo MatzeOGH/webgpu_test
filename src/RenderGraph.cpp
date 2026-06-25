@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include "AlpUtils.h"
 
 // Graph validation: the post-cull "reads a resource before any pass writes it" check in compile().
@@ -111,6 +112,7 @@ struct PersistentResourcePool
         uint32_t             layers = kLayers;    // physical instances: kLayers = ping-pong (temporal), 1 = single in-place
         uint64_t             initHash = 0;        // initialize(): settings hash of the content baked in (recorded at execute)
         bool                 baked = false;       // initialize(): true once an init pass baked content in; cleared on (re)create
+        uint64_t             historyHash = 0;     // temporal invalidation: mismatch -> destroy+recreate (zeros .prev)
 
         WGPUTexture          tex[kLayers]  = {};
         WGPUTextureView      view[kLayers] = {};
@@ -153,14 +155,19 @@ struct PersistentResourcePool
     // Declaring the same name twice in a frame (or once as an image and once as a buffer) is an authoring
     // error: it double-rotates the slot mapping, and a cross-kind name clash thrashes the shared `created`
     // flag. Unenforced -- ponytail: add a kind tag + assert if a real collision ever happens.
-    Entry* touch(WGPUStringView name, uint32_t layers = kLayers)
+    Entry* touch(WGPUStringView name, uint32_t layers = kLayers, uint64_t hash = 0)
     {
-        if (Entry* e = find(name)) { ++e->frame; e->lastTouched = evictClock; e->layers = layers; return e; }   // next frame: rotate
+        if (Entry* e = find(name)) {
+            ++e->frame; e->lastTouched = evictClock; e->layers = layers;
+            if (hash && e->historyHash != hash) { destroy(e); e->historyHash = hash; }
+            return e;
+        }
         entries.emplace_back();
         Entry& e = entries.back();
         e.name.assign(name.data ? name.data : "", sv_length(name));   // WGPU_STRLEN -> measured, not SIZE_MAX
         e.lastTouched = evictClock;
         e.layers = layers;
+        e.historyHash = hash;
         return &e;                                             // first frame: no rotation yet
     }
 
@@ -682,6 +689,9 @@ struct RenderGraphStorage
     // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
     WGPUTextureView         viewScratch[PassNode::kMaxAccess]{};
     uint32_t                viewScratchN{};
+    float                   timing_compile_us{};
+    float                   timing_realize_us{};
+    float                   timing_execute_us{};
 };
 
 static RenderGraphStorage* storage(RenderGraph* rg)
@@ -869,10 +879,10 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 // temporal/history resource: two rotating physical textures owned by the PersistentResourcePool. allocates
 // two ResourceNodes (curr = layer 0, prev = layer 1); the pool backs them and swaps which physical texture
 // each maps to every frame (see realize()), so this frame's curr is next frame's prev.
-TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc)
+TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc, uint64_t hash)
 {
     RenderGraphStorage& s = *storage(this);
-    s.m_allocator->pool.touch(name);   // ensure the pool entry exists + advance its rotation
+    s.m_allocator->pool.touch(name, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
@@ -904,10 +914,10 @@ TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const T
 // temporal/history BUFFER: the GPU-buffer twin of create_temporal_image. two rotating physical buffers
 // owned by the PersistentResourcePool; allocates two ResourceNodes (curr = layer 0, prev = layer 1) and
 // the pool swaps which physical buffer each maps to every frame, so this frame's curr is next frame's prev.
-TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const BufferDesc& desc)
+TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const BufferDesc& desc, uint64_t hash)
 {
     RenderGraphStorage& s = *storage(this);
-    s.m_allocator->pool.touch(name);   // ensure the pool entry exists + advance its rotation
+    s.m_allocator->pool.touch(name, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
@@ -1130,8 +1140,8 @@ bool RenderGraph::compile(bool enableAlias)
         if (!p->initTarget.id) continue;
         for (ResourceNode* r = s.m_resouces; r; r = r->next)        // byId isn't built until phase 3 -> linear
             if (r->handle.id == p->initTarget.id) {
-                assert(r->persistent && "initialize() target must be a persistent resource "
-                                        "(create_persistent_image/_buffer); else the pass never caches");
+                assert(r->persistent && "initialize() target must be persistent or temporal "
+                                        "(create_persistent_image/_buffer or create_temporal_image/_buffer)");
                 PersistentResourcePool::Entry* e = s.m_allocator->pool.find(r->name);
                 // skip only when the target is realized AND holds content baked with this exact hash.
                 // `baked` (cleared by destroy()) re-arms after any (re)create, so a recreated-blank texture
