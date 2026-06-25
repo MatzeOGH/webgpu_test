@@ -772,12 +772,12 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 // temporal/history resource: two rotating physical textures owned by the PersistentResourcePool. allocates
 // two ResourceNodes (curr = layer 0, prev = layer 1); the pool backs them and swaps which physical texture
 // each maps to every frame (see realize()), so this frame's curr is next frame's prev.
-TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc)
+TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
     s.m_allocator->pool.touch(name);   // ensure the pool entry exists + advance its rotation
 
-    TemporalImage out{};
+    TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
         resouce->handle = { s.next_id++ };
@@ -807,12 +807,12 @@ TemporalImage RenderGraph::create_temporal_image(WGPUStringView name, const Text
 // temporal/history BUFFER: the GPU-buffer twin of create_temporal_image. two rotating physical buffers
 // owned by the PersistentResourcePool; allocates two ResourceNodes (curr = layer 0, prev = layer 1) and
 // the pool swaps which physical buffer each maps to every frame, so this frame's curr is next frame's prev.
-TemporalBuffer RenderGraph::create_temporal_buffer(WGPUStringView name, const BufferDesc& desc)
+TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const BufferDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
     s.m_allocator->pool.touch(name);   // ensure the pool entry exists + advance its rotation
 
-    TemporalBuffer out{};
+    TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
         resouce->handle = { s.next_id++ };

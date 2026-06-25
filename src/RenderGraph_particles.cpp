@@ -79,9 +79,9 @@ fn turb(p : vec3f, t : f32, freq : f32) -> vec3f {
 fn spawn(i : u32, salt : u32) -> Particle {
     let h = h3(i * 3u + salt);
     var p : Particle;
-    p.pos  = u.emitter.xyz + (h3(i * 7u + salt) - 0.5) * 0.08;             // small nozzle jitter
+    p.pos  = u.emitter.xyz + (h3(i * 7u + salt) - 0.5) * 0.4;             // small nozzle jitter
     let dir = normalize(vec3f((h.x - 0.5) * 0.7, 1.0, (h.z - 0.5) * 0.7)); // upward cone
-    p.vel  = dir * mix(1.6, 3.6, h.y);
+    p.vel  = dir * mix(1.6, 3.6, h.y) * 0;
     p.life = mix(1.5, 4.0, h1(i ^ (salt * 2246822519u)));
     p.age  = 0.0;
     return p;
@@ -176,10 +176,10 @@ static WGPURenderPipeline  drawPipe = nullptr;
 static WGPUBuffer          uboBuf   = nullptr;   // demo-owned, imported into the graph each frame
 
 // ---- tunables (ImGui) + reset bookkeeping ----
-static float    gravityY  = -2.5f;
-static float    turbAmp   = 1.5f;
-static float    turbFreq  = 0.6f;
-static float    spriteSize = 0.04f;
+static float    gravityY  = -0.0f;
+static float    turbAmp   = 3.0f;
+static float    turbFreq  = 12.0f;
+static float    spriteSize = 0.01f;
 static bool     burst     = false;     // re-seed the whole pool on demand
 static uint64_t lastFrame = 0;         // last frame this demo was active (gap => re-entry -> reset)
 static bool     seeded    = false;     // false until the first build seeds the pool
@@ -310,7 +310,7 @@ static void particles_ui()
     ImGui::Text("particles: %u (GPU-resident)", kParticleCount);
     ImGui::SliderFloat("Gravity Y",   &gravityY,   -8.0f, 2.0f);
     ImGui::SliderFloat("Turbulence",  &turbAmp,     0.0f, 4.0f);
-    ImGui::SliderFloat("Turb freq",   &turbFreq,    0.1f, 2.0f);
+    ImGui::SliderFloat("Turb freq",   &turbFreq,    0.1f, 16.0f);
     ImGui::SliderFloat("Sprite size", &spriteSize,  0.01f, 0.15f);
     if (ImGui::Button("Reset / burst")) burst = true;
 }

@@ -41,17 +41,9 @@ struct ResourceHandle
     uint32_t id{};
 };
 
-// a ping-pong temporal (history) resource: two physical textures the PersistentResourcePool rotates
-// each frame. write `curr`, read `prev`. returned by create_temporal_image.
-struct TemporalImage
-{
-    ResourceHandle curr;   // this frame's WRITE target
-    ResourceHandle prev;   // last frame's result, READ-only this frame
-};
-
-// the GPU-buffer twin of TemporalImage: two physical buffers the PersistentResourcePool rotates each
-// frame, same contract -- write `curr`, read `prev`. returned by create_temporal_buffer.
-struct TemporalBuffer
+// a ping-pong temporal (history) resource: two physical textures or buffers the PersistentResourcePool rotates
+// each frame. write `curr`, read `prev`. returned by create_temporal_image / create_temporal_buffer
+struct TemporalResource
 {
     ResourceHandle curr;   // this frame's WRITE target
     ResourceHandle prev;   // last frame's result, READ-only this frame
@@ -187,14 +179,14 @@ struct RenderGraph
     // error (it backs a future frame's curr): compile() reports it under RG_VALIDATE.
     // ponytail: ping-pong only. N-deep history (checkerboard reconstruction, frame-gen reading 2 frames
     // back) was removed for simplicity; reinstate a `layers` count + indexed accessor if ever needed.
-    TemporalImage create_temporal_image(WGPUStringView name, const TextureDesc& desc);
+    TemporalResource create_temporal_image(WGPUStringView name, const TextureDesc& desc);
 
     // Temporal (history) BUFFER: the GPU-buffer twin of create_temporal_image -- two physical buffers
     // the PersistentResourcePool ping-pongs each frame, same contract (write `.curr`, read `.prev`;
     // writing `.prev` is an authoring error, reported under RG_VALIDATE). For GPU-authored cross-frame
     // state -- accumulators, particle systems -- the graph owns the storage, no caller-side double-buffer.
     // GPU-authored only: no host-upload affordance (host-written UBOs stay imported).
-    TemporalBuffer create_temporal_buffer(WGPUStringView name, const BufferDesc& desc);
+    TemporalResource create_temporal_buffer(WGPUStringView name, const BufferDesc& desc);
 
     // Persistent (cross-frame) SINGLE GPU buffer the graph owns: one pool-backed buffer (no ping-pong),
     // survives the per-frame teardown, auto-evicted once no pass declares it. Read AND write it in one pass
@@ -270,8 +262,7 @@ private:
     void end_pass(GraphBuilder& builder);
 };
 
-// Creates an instance of the `GraphAllocator` with a given areana size
-// default to to 1MB
+// Creates an instance of the `GraphAllocator` with a given areana size default to to 1MB
 GraphAllocator* create_allocator(size_t arenaSize = 1u << 20);
 RenderGraph* create_render_graph(GraphAllocator* allocator);
 
