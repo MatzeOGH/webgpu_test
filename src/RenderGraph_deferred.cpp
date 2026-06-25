@@ -594,7 +594,8 @@ static WGPUBuffer          uboBuf = nullptr;       // demo-owned scene UBO, impo
 // feature toggles (ImGui checkboxes in deferred_ui; persist across demo switches).
 static bool ssaoOn = true, taaOn = true, bloomOn = false, cubeOn = false;
 static bool  fogOn = true;   // froxel volumetric fog; default on so the new passes run out of the box
-static bool  aliasDemoOn = true;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
+static bool  aliasDemoOn = false;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
+static bool  forceKeepDemoOn = false;   // Q1: a side-effect-only pass kept alive by force_keep() (else culled)
 static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f, fogAmbient = 0.02f, fogNoise = 0.8f;
 
 // the gbuffer's four outputs, threaded through the chain as one value.
@@ -1157,6 +1158,23 @@ static ResourceHandle build_alias_test(RenderGraph* rg, const DemoEnv& env, Reso
     return accum;
 }
 
+// force_keep (Q1): a side-effect-only pass -- clears a scratch nothing reads and writes no imported/
+// persistent resource, so it is unreachable from any sink. without force_keep() compile() culls it;
+// b.force_keep() makes it a phase-2 cull root so it survives. stand-in for a readback / timestamp /
+// indirect-arg pass whose result leaves the graph off-book. returns scene unchanged (a side pass).
+static ResourceHandle build_forcekeep_test(RenderGraph* rg, ResourceHandle scene, ResourceHandle swap, bool enabled)
+{
+    if (!enabled) return scene;
+    ResourceHandle scratch = screen_tex(rg, "keep.scratch", kSwapFormat, swap);
+    rg->add_pass(WEBGPU_STR("keep.side"), PassKind::Graphics,
+        [&](GraphBuilder& b) {
+            b.force_keep();   // remove this line -> the pass vanishes from execution order (culled)
+            b.color(scratch, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+        },
+        [](PassContext&) {});   // the LoadOp_Clear is the side effect; no draws
+    return scene;
+}
+
 // present: blit the final scene colour to the swapchain (the chain's sink).
 static void build_present(RenderGraph* rg, WGPUDevice dev, ResourceHandle scene, ResourceHandle swap)
 {
@@ -1522,6 +1540,7 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     scene = build_bloom(rg, env, scene, swap, bloomOn);
     scene = build_taa(rg, env, scene, swap, taaOn);
     scene = build_alias_test(rg, env, scene, swap, aliasDemoOn);   // R2: off by default; exercises phase-4 aliasing
+    scene = build_forcekeep_test(rg, scene, swap, forceKeepDemoOn);   // Q1: off by default; side pass kept by force_keep()
     build_present(rg, dev, scene, swap);
 }
 
@@ -1534,6 +1553,7 @@ static void deferred_ui()
     ImGui::Checkbox("Cubemap", &cubeOn);
     ImGui::Checkbox("Volumetric Fog", &fogOn);
     ImGui::Checkbox("Alias test (phase-4 demo)", &aliasDemoOn);
+    ImGui::Checkbox("force_keep test (Q1 demo)", &forceKeepDemoOn);
     if (fogOn) {
         ImGui::SliderFloat("Fog density",    &fogDensity,       0.0f, 0.5f);
         ImGui::SliderFloat("Fog anisotropy", &fogAnisotropy,   -0.9f, 0.9f);

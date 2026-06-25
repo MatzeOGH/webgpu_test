@@ -136,6 +136,12 @@ struct GraphBuilder
     // bake (the pass never re-runs). a (re)created target (resize/eviction/descriptor change) always re-bakes.
     void initialize(ResourceHandle target, uint64_t hash = 0);
 
+    // keep this pass even when nothing in the graph reads its output and it writes no imported/persistent
+    // resource: marks it an extra cull root so compile() never drops it (and keeps what it depends on).
+    // for side-effect-only passes -- GPU->CPU readback, timestamp/profiling resolve, indirect-arg gen
+    // consumed outside the graph. not an access (records no hazard/usage), just a marker.
+    void force_keep();
+
     PassNode* m_new_pass{};
 };
 struct GraphAllocator; // internal allocator: bump arena + the two resource pools (persistent + transient)

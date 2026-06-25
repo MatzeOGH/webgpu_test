@@ -599,6 +599,7 @@ struct PassNode
 
     bool placed{}; // topo sort: already emitted into execution order
     bool sink{}; // mark a pass as a sink
+    bool forceKeep{}; // force_keep(): extra cull root -- survives even with no reader and no imported/persistent write
 
     // initialize(): if set, this pass (re)bakes the persistent resource `initTarget`. compile() sets
     // skipInit (drops the pass this frame) once the target's pool entry is populated AND was baked with this
@@ -1122,7 +1123,7 @@ bool RenderGraph::compile(bool enableAlias)
         defer { s.m_allocator->reset_scratch(); };
         uint32_t count = 0;
         for (PassNode* p = s.m_passes; p; p = p->next)
-            if (!p->skipInit && is_sink(p, external))   // a satisfied initialize() pass is not a root (its target is already baked)
+            if (!p->skipInit && (is_sink(p, external) || p->forceKeep))   // satisfied initialize() pass is not a root; force_keep() keeps a reader-less side-effect pass alive
             {
                 p->sink = true;
                 topo_visit(p, order, count);          // only reaches passes that feed a sink
@@ -1965,6 +1966,15 @@ void GraphBuilder::initialize(ResourceHandle target, uint64_t hash)
 {
     m_new_pass->initTarget = target;
     m_new_pass->initHash   = hash;
+}
+
+// keep this pass even with no in-graph reader and no imported/persistent write: mark it an extra cull root
+// so compile() phase 2 never drops it (and keeps everything it depends on). not an access (records no
+// hazard/usage), just a marker. for side-effect-only passes: readback, timestamp/profiling resolve,
+// indirect-arg gen consumed outside the graph.
+void GraphBuilder::force_keep()
+{
+    m_new_pass->forceKeep = true;
 }
 
 } // RG
