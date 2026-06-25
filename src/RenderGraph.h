@@ -130,12 +130,18 @@ struct GraphBuilder
     void index_buffer(ResourceHandle handle);
     void indirect_buffer(ResourceHandle handle);
 
-    // mark this pass as a one-time initializer for a persistent resource (create_persistent_image/_buffer):
-    // it runs only while `target` is unrealized -- the first frame, or after the pool evicts/recreates it --
-    // then compile() skips it. the baked result persists in the pool, so readers bind to it with no in-graph
-    // writer (legal for a persistent/external resource). declare the write to `target` as usual (color() /
-    // storage_write()); this only gates the pass. one init target per pass; write only that target.
-    void init_once(ResourceHandle target);
+    // mark this pass as the initializer for a persistent resource (create_persistent_image/_buffer): it
+    // runs only when the target needs (re)baking, then compile() skips it. `hash` is a digest of the
+    // settings the baked content depends on (IBL quality, sun direction, ...): the pass runs while the
+    // target is unrealized (first frame, or after the pool evicts/recreates it) OR while `hash` differs
+    // from the hash last baked into it -- so changing a setting re-bakes, a steady setting bakes once.
+    // `hash == 0` (the default) never changes => pure bake-once. the baked result persists in the pool, so
+    // readers bind to it with no in-graph writer (legal for a persistent/external resource). declare the
+    // write to `target` as usual (color()/storage_write()); this only gates. `target` must be persistent
+    // (asserted) and should be the pass's only written sink. one target per pass; write only it.
+    // CAVEAT: fold EVERY setting the baked content reads into `hash` -- an omitted one silently keeps a stale
+    // bake (the pass never re-runs). a (re)created target (resize/eviction/descriptor change) always re-bakes.
+    void initialize(ResourceHandle target, uint64_t hash = 0);
 
     PassNode* m_new_pass{};
 };
@@ -205,9 +211,9 @@ struct RenderGraph
     // One pool-backed texture (no ping-pong), survives the per-frame teardown, auto-evicted once no pass
     // declares it. For a precomputed/baked resource written once then sampled every frame -- IBL / env map,
     // BRDF LUT, prefiltered specular. Declare it every frame (to read it), and fill it with a pass marked
-    // GraphBuilder::init_once(handle): that bake runs only when the texture is freshly (re)created, not every
-    // frame. ponytail: bake targets should be Absolute-sized -- a Relative one recreated on resize is not
-    // re-baked (the init pass was already culled that frame); fine for IBL/LUTs, which are size-independent.
+    // GraphBuilder::initialize(handle, hash): that bake runs only when the texture is freshly (re)created
+    // (first frame, eviction, or a descriptor/resize change -- the pool clears its `baked` flag) or the
+    // settings `hash` changes, not every frame.
     ResourceHandle create_persistent_image(WGPUStringView name, const TextureDesc& desc);
 
 

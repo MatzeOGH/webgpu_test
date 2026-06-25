@@ -109,6 +109,8 @@ struct PersistentResourcePool
         uint64_t             frame  = 0;          // rotation counter, bumped once per touch (declaration)
         uint64_t             lastTouched = 0;     // pool evictClock at the last touch; stale entries are freed
         uint32_t             layers = kLayers;    // physical instances: kLayers = ping-pong (temporal), 1 = single in-place
+        uint64_t             initHash = 0;        // initialize(): settings hash of the content baked in (recorded at execute)
+        bool                 baked = false;       // initialize(): true once an init pass baked content in; cleared on (re)create
 
         WGPUTexture          tex[kLayers]  = {};
         WGPUTextureView      view[kLayers] = {};
@@ -229,6 +231,7 @@ struct PersistentResourcePool
             if (e->buf[i])  { wgpuBufferRelease(e->buf[i]);       e->buf[i]  = nullptr; }
         }
         e->created = false;
+        e->baked   = false;   // content gone -> an initialize() pass must re-bake (re-armed even for hash 0)
     }
 
     // per-frame teardown: free entries no pass has declared (touched) for kRetain frames, then advance the
@@ -579,11 +582,12 @@ struct PassNode
     bool placed{}; // topo sort: already emitted into execution order
     bool sink{}; // mark a pass as a sink
 
-    // init_once: if set, this pass fills the persistent resource `initTarget` and runs ONLY while that
-    // target is unrealized. compile() sets skipInit (drops the pass for this frame) once the target's pool
-    // entry is already populated (baked on a prior frame). 0 = ordinary pass.
+    // initialize(): if set, this pass (re)bakes the persistent resource `initTarget`. compile() sets
+    // skipInit (drops the pass this frame) once the target's pool entry is populated AND was baked with this
+    // same initHash; a fresh/evicted target or a changed hash re-arms it. 0 target = ordinary pass.
     ResourceHandle initTarget{};
-    bool skipInit{};
+    uint64_t       initHash{};   // settings digest this bake produces (see GraphBuilder::initialize)
+    bool           skipInit{};
 
     PassNode* next{}; // ptr to the next pass node of the render graph
 };
@@ -848,7 +852,7 @@ ResourceHandle RenderGraph::create_persistent_buffer(WGPUStringView name, const 
 // persistent (cross-frame) SINGLE texture: the image twin of create_persistent_buffer -- one pool-backed
 // texture (no ping-pong), survives the per-frame teardown, auto-evicted when no longer declared. for a
 // precomputed/baked resource written once and sampled every frame (IBL/env map, BRDF LUT). pair it with an
-// init_once pass to fill it on the first frame (or after eviction/recreate). one ResourceNode, one texture.
+// initialize() pass to fill it on the first frame / after eviction / when its settings hash changes. one ResourceNode, one texture.
 ResourceHandle RenderGraph::create_persistent_image(WGPUStringView name, const TextureDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
@@ -932,7 +936,8 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
     NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_id);
     defer { alloc->reset_scratch(); };
 
-    for (PassNode* p = head; p; p = p->next)
+    for (PassNode* p = head; p; p = p->next) {
+        if (p->skipInit) continue;   // initialize() pass already satisfied -> treat as absent (no versions/edges)
         for (uint32_t i = 0; i < p->accessCount; ++i) {
             uint32_t id = p->accesses[i].handle.id;
             if (!id) continue;   // invalid/default handle: nothing to version (post-cull check skips id 0 too)
@@ -956,6 +961,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
                 link->pass = p; link->next = pendingReaders[id]; pendingReaders[id] = link;
             }
         }
+    }
 
     // both self-guards above are load-bearing: read-then-write of one handle in a single pass would
     // WAR-self-edge; write-then-write would WAW-self-edge. every edge points from a later- to an
@@ -1012,6 +1018,30 @@ bool RenderGraph::compile()
 {
     RenderGraphStorage& s = *storage(this);
 
+    // phase 0: resolve initialize() passes. such a pass (re)bakes a persistent target and should run only
+    // while that target needs it: skip it this frame iff the pool entry exists, was realized on a prior frame
+    // (`created`), AND was baked with the same settings hash (`initHash`). a fresh/evicted target or a changed
+    // hash leaves skipInit false -> the pass runs. when it runs, execute() records the new hash into the entry.
+    // the baked result lives in the pool, so on skipped frames readers bind to it with no in-graph writer
+    // (legal: persistent is external). skipped passes are then dropped: phase 1's sweep and phase 2's sink
+    // seeding both ignore skipInit, so the pass produces no version (no reader depends on it) and is not a
+    // root -> unreachable -> culled.
+    for (PassNode* p = s.m_passes; p; p = p->next) {
+        p->skipInit = false;
+        if (!p->initTarget.id) continue;
+        for (ResourceNode* r = s.m_resouces; r; r = r->next)        // byId isn't built until phase 3 -> linear
+            if (r->handle.id == p->initTarget.id) {
+                assert(r->persistent && "initialize() target must be a persistent resource "
+                                        "(create_persistent_image/_buffer); else the pass never caches");
+                PersistentResourcePool::Entry* e = s.m_allocator->pool.find(r->name);
+                // skip only when the target is realized AND holds content baked with this exact hash.
+                // `baked` (cleared by destroy()) re-arms after any (re)create, so a recreated-blank texture
+                // is re-baked even for hash 0 -- closes the resize/descriptor-change stale-bake hole.
+                p->skipInit = (e && e->created && e->baked && e->initHash == p->initHash);
+                break;
+            }
+    }
+
     // phase 1: build adjacency (pass dependency DAG, "depends-on" direction). The versioning sweep
     // (see sweep_resource_versions) discovers every RAW/WAW/WAR hazard in declaration order; here all
     // three collapse to add_dependency; its dedup folds multiple hazards between one pass pair into
@@ -1043,7 +1073,7 @@ bool RenderGraph::compile()
         defer { s.m_allocator->reset_scratch(); };
         uint32_t count = 0;
         for (PassNode* p = s.m_passes; p; p = p->next)
-            if (is_sink(p, external))
+            if (!p->skipInit && is_sink(p, external))   // a satisfied initialize() pass is not a root (its target is already baked)
             {
                 p->sink = true;
                 topo_visit(p, order, count);          // only reaches passes that feed a sink
@@ -1430,6 +1460,18 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
             openGroup = grp;
         }
 
+        // initialize() pass that survived the cull == it (re)bakes this frame: mark the target's pool entry
+        // baked + stamp the settings hash, so next frame's compile() skips the bake until the hash changes
+        // (or the entry is recreated, which clears `baked`). recorded here, not in compile(), so a frame that
+        // fails compile never claims a bake it didn't run; gated on exec_fn so a body-less pass can't claim
+        // one either. skipped (already-baked) init passes were culled -> not in this loop.
+        if (p->initTarget.id && p->exec_fn)
+            if (ResourceNode* t = find_node(this, p->initTarget))
+                if (PersistentResourcePool::Entry* e = s.m_allocator->pool.find(t->name)) {
+                    e->initHash = p->initHash;
+                    e->baked    = true;
+                }
+
         PassContext ctx{};
         ctx.encoder = encoder;
         ctx.graph = this;
@@ -1693,6 +1735,15 @@ void GraphBuilder::index_buffer(ResourceHandle handle)
 void GraphBuilder::indirect_buffer(ResourceHandle handle)
 {
     use(handle, AccessType::Indirect);
+}
+
+// gate this pass on a persistent target -- compile() runs it only while the target needs (re)baking: it is
+// unrealized, or `hash` differs from the hash last baked in. not an access (records no hazard/usage), just a
+// marker; declare the actual write to `target` separately. hash 0 (default) == bake once.
+void GraphBuilder::initialize(ResourceHandle target, uint64_t hash)
+{
+    m_new_pass->initTarget = target;
+    m_new_pass->initHash   = hash;
 }
 
 } // RG
