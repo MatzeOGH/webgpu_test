@@ -391,22 +391,18 @@ static void rg_arrowhead(ImDrawList* dl, ImVec2 from, ImVec2 tip, ImU32 col, flo
 	dl->AddTriangleFilled(tip, a, b, col);
 }
 
-// ---- DAG intermediate representation (see docs/rendergraph-nested-layout.md). built once per frame
-// from the passes + group tree + frame-boundary endpoints, laid out, then drawn. a node is a pass, a
-// group (container, collapsible), or a virtual endpoint (temporal/imported/present); pins + edges are
-// resolved here so the draw never re-scans. introduced as a strangler: P0 mirrors today's flat layout
-// 1:1, P1 takes over the layout, P2 adds the hierarchy/regions. unused until the draw is migrated.
-struct RgPin { uint32_t resId; uint16_t slot; bool isWrite; };
+// ---- DAG intermediate representation (see docs/rendergraph-nested-layout.md). built once per frame from
+// the passes + frame-boundary endpoints, then drawn. a node is a pass or a virtual endpoint (temporal/
+// imported/present), linked by RgEdges. the pass-graph (box[]) still drives layout; the draw consumes this
+// IR for the nodes + virtual links. groups live in the GView side-table, not here.
 struct RgNode {
 	enum class Kind : uint8_t { Pass, Group, Virtual };
 	Kind kind{};
 	PassNode*      pass{};      // Kind::Pass
 	ResourceNode*  res{};       // Kind::Virtual (the endpoint's resource)
-	WGPUStringView label{};     // Kind::Group full path / Kind::Virtual caption
-	int parent = -1, firstChild = -1, childCount = 0;            // hierarchy; subgroups are nested nodes
-	int nIn = 0, nOut = 0; RgPin in[kRgGPinMax], out[kRgGPinMax];   // interface pins, resolved once
-	bool collapsed = false;
+	WGPUStringView label{};     // Kind::Virtual caption
 	ImVec2 pos{}; float w = 0, h = 0; int col = 0;              // layout result -> consumed by draw
+	ImU32 tint = 0;             // Kind::Virtual base colour (read/write/imported/present)
 };
 struct RgEdge {
 	int srcNode = -1, dstNode = -1; uint16_t srcPin = 0, dstPin = 0; uint32_t resId = 0;
@@ -796,20 +792,14 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	}
 	if (gxMax < gxMin) { gxMin = gyMin = gxMax = gyMax = 0; }   // empty graph
 
-	// ---- IR mirror (P0b, strangler): build RgNodes (one per pass, index-aligned to box[]) + RgEdges from
-	// the layout just computed. UNUSED for now -- the draw still reads box[]/edge[]; P0c migrates it over,
-	// then P1 makes layout() produce the IR directly. virtual/group nodes fold in with their draw blocks.
+	// ---- IR mirror: build RgNodes (pass nodes index-aligned to box[], then Virtual endpoints) + RgEdges.
+	// the draw consumes this for the nodes + virtual links; the pass-graph (box[]/edge[]) still drives layout
+	// and the solid pass-edge routing. layout() producing the IR directly (retiring box[]) is future work.
 	static std::vector<RgNode> rgn; rgn.clear();
 	static std::vector<RgEdge> rge; rge.clear();
 	for (int i = 0; i < n; ++i) {
 		RgNode nd{}; nd.kind = RgNode::Kind::Pass; nd.pass = box[i].p;
 		nd.label = box[i].p->name; nd.pos = box[i].tl; nd.w = box[i].w; nd.h = box[i].h; nd.col = box[i].layer;
-		PassNode* p = box[i].p;
-		for (uint32_t k = 0; k < p->accessCount; ++k) {
-			const ResourceAccess& acc = p->accesses[k];
-			if (rg_access_reads(acc) && nd.nIn < kRgGPinMax)       { nd.in[nd.nIn]   = RgPin{ acc.handle.id, (uint16_t)nd.nIn,  false }; nd.nIn++; }
-			if (access_is_write(acc.type) && nd.nOut < kRgGPinMax) { nd.out[nd.nOut] = RgPin{ acc.handle.id, (uint16_t)nd.nOut, true  }; nd.nOut++; }
-		}
 		rgn.push_back(nd);
 	}
 	for (REdge& e : edge) {
@@ -817,27 +807,23 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		ge.srcPin = (uint16_t)e.sOut; ge.dstPin = (uint16_t)e.dIn; ge.resId = e.id; ge.kind = RgEdge::Kind::Raw;
 		rge.push_back(ge);
 	}
-
-	// ---- IR group nodes (P1): top-level dotted-prefix groups become Group RgNodes whose children are the
-	// member passes (rgn[firstChild .. firstChild+childCount)). subgroups (nested) land in P2; collapse is a
-	// tri-state keyed by the full path. positions/regions are filled by the layout -- this is just the node
-	// model the nesting hangs off; unused by the draw until P2.
-	{
-		for (int a = 0; a < n;) {
-			WGPUStringView pre = group_prefix(rgn[a].pass->name);
-			int b = a + 1;
-			while (b < n && sv_length(pre) && sv_eq(group_prefix(rgn[b].pass->name), pre)) ++b;
-			if (sv_length(pre) && b - a >= 2) {
-					int st = grpStore->GetInt(rg_grp_key(pre), 0);
-				RgNode gnd{}; gnd.kind = RgNode::Kind::Group; gnd.label = pre;
-				gnd.firstChild = a; gnd.childCount = b - a;
-				gnd.collapsed = (st == 2) || (st != 1 && collapseDefault);
-				int gidx = (int)rgn.size();
-				for (int k = a; k < b; ++k) rgn[k].parent = gidx;
-				rgn.push_back(gnd);
-			}
-			a = b;
-		}
+	// virtual endpoints mirror into the IR: one Virtual RgNode at its laid-out spot + an RgEdge per link to
+	// the anchor pass pin (a fan source emits one edge per reader). lets the draw + cones treat them like any
+	// node, retiring the parallel tnodes draw path (Phase C). additive here -- the draw still reads tnodes.
+	for (TNode& t : tnodes) {
+		int vi = (int)rgn.size();
+		RgNode nd{}; nd.kind = RgNode::Kind::Virtual; nd.res = t.res;
+		nd.label = WGPUStringView{ t.cap, t.cap ? strlen(t.cap) : 0 };
+		nd.pos = ImVec2(lnode[t.li].x - t.w * 0.5f, lnode[t.li].y - t.h * 0.5f);
+		nd.w = t.w; nd.h = t.h; nd.col = t.col; nd.tint = t.tint;
+		rgn.push_back(nd);
+		RgEdge::Kind ek = t.res->persistent ? RgEdge::Kind::Temporal : RgEdge::Kind::Raw;
+		bool fan = fanBuffers && t.isRead && t.res->imported && t.res->kind == ResourceNode::Kind::Buffer;
+		if (fan)
+			for (int i = 0; i < n; ++i) { int sl = rg_in_slot(box[i].p, t.res->handle.id); if (sl < 0) continue;
+				rge.push_back(RgEdge{ vi, i, 0, (uint16_t)sl, t.res->handle.id, RgEdge::Kind::Fanout }); }
+		else if (t.isRead) rge.push_back(RgEdge{ vi, t.passBox, 0, (uint16_t)t.pin, t.res->handle.id, ek });
+		else               rge.push_back(RgEdge{ t.passBox, vi, (uint16_t)t.pin, 0, t.res->handle.id, ek });
 	}
 
 	// toolbar: reset/centre the view + a name filter that dims non-matching passes.
@@ -1337,10 +1323,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		}
 	}
 
-	// ---- virtual endpoint nodes + dashed links, drawn from the layout positions computed above. most nodes
-	// attach to one pass pin in the adjacent column (a read/source node feeds an input pin from the left, a
-	// write/sink node is fed by an output pin from the left); an imported buffer fans to all readers (below).
-	// tint + caption come from the node's kind.
+	// ---- virtual endpoint nodes + dashed links, drawn from the IR mirror (rgn Virtual nodes + rge links).
+	// a read/source node feeds a pass input pin from the left; a write/sink node is fed by an output pin; an
+	// imported buffer fans one source to all readers. collapse-reroute + cone dimming reuse the pass helpers.
 	// interface-pin position of resource `id` on a collapsed group, or the group's box edge at height `y` when
 	// the resource crosses the boundary without a pin (e.g. a temporal write consumed only next frame).
 	auto grpPin = [&](GView& g, uint32_t id, bool write, float y) -> ImVec2 {
@@ -1348,47 +1333,47 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		if (sl >= 0) return write ? g.outC[sl] : g.inC[sl];
 		return ImVec2(write ? g.bb1.x : g.bb0.x, y);
 	};
-	for (TNode& t : tnodes) {
-		// with fan-out on, an imported buffer (a uniform read by many passes) is ONE source node fanning faint
-		// dashed edges to EVERY reader, so all consumers show without a node per use site; it's never wholesale-
-		// hidden by the pass filter (the per-reader gate just drops the edges to filtered passes). off -> it's a
-		// node per use site like a texture, taking the single-edge branch below.
-		const bool fan = fanBuffers && t.isRead && t.res->imported && t.res->kind == ResourceNode::Kind::Buffer;
-		if (!fan && fout(t.passBox)) continue;
-		// anchor pass hidden in a collapsed group: reroute the link onto the group instead of dropping the node.
-		GView* grp = (!fan && collapsedBox[t.passBox]) ? &groups[groupOf[t.passBox]] : nullptr;
-		ImVec2 c(origin.x + lnode[t.li].x, origin.y + lnode[t.li].y);
-		ImVec2 a(c.x - t.w * 0.5f, c.y - t.h * 0.5f), b(c.x + t.w * 0.5f, c.y + t.h * 0.5f);
-		if (fan) {
-			ImU32 fc = rg_with_alpha(t.tint, 90); ImVec2 p(b.x, c.y);
-			for (int i = 0; i < n; ++i) {
-				if (fout(i) || sgHidden[i]) continue;
-				ImVec2 q;
-				if (collapsedBox[i]) {   // collapsed reader: fan to the group's uniform in-pin, once per group
-					GView& g = groups[groupOf[i]]; int gs = gpin_slot(g.inId, g.nIn, t.res->handle.id);
-					if (gs < 0 || g.inDrawn[gs]) continue; g.inDrawn[gs] = true; q = g.inC[gs];
-				}
-				else { int sl = rg_in_slot(box[i].p, t.res->handle.id); if (sl < 0) continue; q = inPin(i, sl); }
-				float dx = (q.x - p.x) * 0.5f;
-				rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, fc, 1.5f);
-				rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, fc, 6.0f);
+	static std::vector<char> vLive; vLive.assign(rgn.size(), 0);
+	for (RgEdge& ge : rge) {
+		bool srcV = ge.srcNode >= n, dstV = ge.dstNode >= n;
+		if (!srcV && !dstV) continue;                 // pass<->pass edge: drawn earlier
+		int vi = srcV ? ge.srcNode : ge.dstNode, pe = srcV ? ge.dstNode : ge.srcNode;   // virtual node, anchor pass
+		bool faint = ge.kind == RgEdge::Kind::Fanout;   // imported-buffer fan: one faint edge per reader
+		if (fout(pe) || (faint && sgHidden[pe])) continue;
+		RgNode& vn = rgn[vi];
+		ImU32 tint = isDim(pe) ? rg_with_alpha(vn.tint, 40) : (faint ? rg_with_alpha(vn.tint, 90) : vn.tint);   // cone-dim with anchor
+		float vcy = origin.y + vn.pos.y + vn.h * 0.5f;
+		ImVec2 p, q;
+		if (srcV) {   // read: node right edge -> reader input pin
+			p = ImVec2(origin.x + vn.pos.x + vn.w, vcy);
+			if (collapsedBox[pe]) {
+				GView& g = groups[groupOf[pe]];
+				if (faint) { int s = gpin_slot(g.inId, g.nIn, ge.resId); if (s < 0 || g.inDrawn[s]) continue; g.inDrawn[s] = true; q = g.inC[s]; }
+				else q = grpPin(g, ge.resId, false, p.y);
 			}
+			else q = inPin(pe, ge.dstPin);
 		}
-		else {
-			ImVec2 p, q;
-			if (t.isRead) { q = grp ? grpPin(*grp, t.res->handle.id, false, c.y) : inPin(t.passBox, t.pin); p = ImVec2(b.x, c.y); }   // node -> reader input pin
-			else          { p = grp ? grpPin(*grp, t.res->handle.id, true,  c.y) : outPin(t.passBox, t.pin); q = ImVec2(a.x, c.y); }  // writer output pin -> node
-			float dx = (q.x - p.x) * 0.5f;
-			rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, t.tint, 2.0f);
-			rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, t.tint, 7.0f);
+		else {        // write: writer output pin -> node left edge
+			q = ImVec2(origin.x + vn.pos.x, vcy);
+			p = collapsedBox[pe] ? grpPin(groups[groupOf[pe]], ge.resId, true, q.y) : outPin(pe, ge.srcPin);
 		}
-
-		char nm[48]; std::snprintf(nm, sizeof nm, "%.*s", (int)t.res->name.length, t.res->name.data ? t.res->name.data : "?");
+		vLive[vi] = 1;
+		float dx = (q.x - p.x) * 0.5f;
+		rg_dashed_cubic(dl, p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, tint, faint ? 1.5f : 2.0f);
+		rg_arrowhead(dl, ImVec2(q.x - 8, q.y), q, tint, faint ? 6.0f : 7.0f);
+	}
+	for (int vi = n; vi < (int)rgn.size(); ++vi) {
+		if (!vLive[vi]) continue;   // node with no surviving link (all readers filtered/deduped) stays hidden
+		RgNode& vn = rgn[vi];
+		ImVec2 a(origin.x + vn.pos.x, origin.y + vn.pos.y), b(a.x + vn.w, a.y + vn.h);
+		char nm[48]; std::snprintf(nm, sizeof nm, "%.*s", (int)vn.res->name.length, vn.res->name.data ? vn.res->name.data : "?");
+		const char* cap = vn.label.data ? vn.label.data : "";
 		dl->AddRectFilled(a, b, IM_COL32(32, 30, 40, 240), 4.0f);
-		dl->AddRect(a, b, t.tint, 4.0f, 0, 1.5f);
-		ImVec2 ns = ImGui::CalcTextSize(nm), cs = ImGui::CalcTextSize(t.cap);
-		dl->AddText(ImVec2(c.x - ns.x * 0.5f, a.y + 3), IM_COL32(238, 236, 242, 255), nm);
-		dl->AddText(ImVec2(c.x - cs.x * 0.5f, b.y - cs.y - 3), rg_with_alpha(t.tint, 220), t.cap);
+		dl->AddRect(a, b, vn.tint, 4.0f, 0, 1.5f);
+		float cx = (a.x + b.x) * 0.5f;
+		ImVec2 ns = ImGui::CalcTextSize(nm), cs = ImGui::CalcTextSize(cap);
+		dl->AddText(ImVec2(cx - ns.x * 0.5f, a.y + 3), IM_COL32(238, 236, 242, 255), nm);
+		dl->AddText(ImVec2(cx - cs.x * 0.5f, b.y - cs.y - 3), rg_with_alpha(vn.tint, 220), cap);
 	}
 
 	// ---- tooltip: hovered pin wins; else fall back to the per-pass reads/writes list.

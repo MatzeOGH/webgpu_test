@@ -232,7 +232,7 @@ struct RenderGraph
     // transient resource before any pass writes it. messages are printed; on false skip this frame.
     // that check is a dev aid compiled out in release (NDEBUG) like assert; see RG_VALIDATE in the
     // .cpp; a release build skips the per-frame walk and compile() always returns true.
-    // IMPORTANT: if compile failes all cached resources as well as temporal and anything else gets perged.
+    // IMPORTANT: TODO: if compile failes all cached resources as well as temporal and anything else gets perged.
     bool compile();
 
     // create GPU resources from the usage + size that compile() worked out

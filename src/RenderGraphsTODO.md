@@ -8,7 +8,7 @@
 ## High Priority
 
 [] force_keep flag on passes / explicit mark_output(ResourceHandle) -- culling currently only roots at passes writing an *imported or temporal* resource, so side-effect-only passes (readback/debug/profiling/indirect-arg-gen) and non-external outputs get silently dropped
-[] persistent non-temporal resources: a pool-backed resource that survives the per-frame teardown but is NOT ping-pong rotated -- written once (or every N frames) and read for many frames after. unblocks compute-once/read-many bakes (BRDF LUT, prefiltered/irradiance IBL, SH, atlases) and reduced-cadence GI; today PersistentResourcePool only does 2-slot temporal history, so everything else must be imported caller-owned. add create_persistent_image (1-slot, no rotation, exempt from def-before-use like temporal)
+[x] persistent non-temporal resources: a pool-backed resource that survives the per-frame teardown but is NOT ping-pong rotated -- written once (or every N frames) and read for many frames after. unblocks compute-once/read-many bakes (BRDF LUT, prefiltered/irradiance IBL, SH, atlases) and reduced-cadence GI -- DONE: create_persistent_image/create_persistent_buffer (1-slot, no rotation, exempt from def-before-use like temporal) plus GraphBuilder::initialize(target, hash) for the compute-once/read-many bake itself (re-bakes on first creation, eviction, descriptor/resize change, or hash mismatch; skips otherwise). Demoed in RenderGraph_bake.cpp (procedural sky) and the path tracer's persistent accumulator buffer.
 [] kMaxAccess=16 per pass and the 1MB arena are fixed with no growth path; add an assert or grow-on-demand -- currently silently drops accesses past the cap
 [] review/critique the scratch_alloc implementation -- scrutinize the two-sided arena arithmetic (alignment round-down, unsigned-underflow guards, the capacity-scratchUsed vs capacity-used boundary checks in alloc_raw/scratch_alloc_raw), confirm no front/scratch overlap edge case, and sanity-check the per-scope defer reset_scratch() pattern in compile()/sweep_resource_versions()
 
@@ -17,7 +17,7 @@
 [] resource type validation: surface ResourceNode::Kind (Texture/Buffer) at the API layer and reject mismatched access (e.g. vertex_buffer() on a texture handle, sampled() on a buffer)
 [x] MSAA support: sampleCount on TextureDesc (threaded through both pools + realize()) + resolve attachment wiring (b.resolve() -> AccessType::ResolveAttachment -> WGPURenderPassColorAttachment.resolveTarget). depth/stencil attachment now also carries stencil load/store/clear ops. see docs/rendergraph-attachments.md
 [] add instrumentation to measure compile() time
-[] camera-cut null-reset for temporal/persistent resources: on a camera cut (or first frame) the history read is stale garbage -- a way to flag a temporal resource's prev as invalid so the pass clears/ignores it instead of smearing. see docs/rendergraph-null-textures.md
+[] camera-cut null-reset for temporal/persistent resources: on a camera cut (or first frame) the history read is stale garbage -- a way to flag a temporal resource's prev as invalid so the pass clears/ignores it instead of smearing. (note: docs/rendergraph-null-textures.md is a different mechanism -- WebGPU bind-group default-view trick, not this. this is now cheap to build on GraphBuilder::initialize()'s hash-invalidation machinery: model a cut as a hash change on the history resource instead of inventing a new flag)
 
 ## Low Priority
 
