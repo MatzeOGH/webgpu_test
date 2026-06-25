@@ -208,6 +208,8 @@ int main()
             if (ImGui::RadioButton(demos[i].name, active == i)) active = i;   // F1..Fn also switch
         }
         ImGui::Separator();
+        static bool enableAlias = false;   // phase-4 transient aliasing; folded into the reshape sig below
+        ImGui::Checkbox("alias transients", &enableAlias);
         demos[active].ui();
         ImGui::End();
 
@@ -241,7 +243,7 @@ int main()
             [&](GraphBuilder& b) { b.color(swapchain, WGPULoadOp_Load, WGPUStoreOp_Store); },
             [](PassContext& ctx) { ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), ctx.render); });
 
-        if (!rg->compile()) {
+        if (!rg->compile(enableAlias)) {
             // ordering error (compile() already printed it). skip this frame's GPU work.
             wgpuTextureViewRelease(view);
             wgpuTextureRelease(st.texture);
@@ -258,12 +260,19 @@ int main()
         // count). a pass-name signature diff catches it for ANY demo, no per-demo cooperation.
         std::string sig;
         for (PassNode* p = storage(rg)->m_passes; p; p = p->next) { sig.append(p->name.data, p->name.length); sig.push_back('|'); }
+        sig += enableAlias ? "A1" : "A0";   // fold the aliasing toggle in so flipping it reprints the pool stats
         if (sig != lastSig) {
             lastSig = sig;
             std::printf("execution order:");
             for (PassNode* p = storage(rg)->m_passes; p; p = p->next) std::printf(" %.*s", (int)p->name.length, p->name.data);
             std::printf("\ntransient pool: %zu textures, %u created this frame\n",
                         allocator->transient.entries.size(), allocator->transient.createdThisFrame);
+            if (storage(rg)->m_slotCount) {   // phase-4 aliasing ran (enableAlias): logical transients -> physical slots
+                uint32_t logical = 0;
+                for (ResourceNode* r = storage(rg)->m_resouces; r; r = r->next)
+                    if (r->aliasSlot != ResourceNode::kNoSlot) ++logical;
+                std::printf("aliasing: %u transients share %u physical slots\n", logical, storage(rg)->m_slotCount);
+            }
         }
 
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev, nullptr);

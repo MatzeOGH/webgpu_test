@@ -1443,22 +1443,6 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	ImGui::EndChild();
 }
 
-// imported/persistent resources are left out of compile()'s firstUse/lastUse (the graph doesn't own
-// their memory), so the lifetimes view recovers their span by walking the pass list -- only to draw a
-// bar, never for aliasing. false if no surviving pass touches the resource.
-static bool rg_external_span(RenderGraphStorage& s, ResourceNode* r, uint32_t& first, uint32_t& last)
-{
-	first = ResourceNode::kNoPass; last = 0;
-	uint32_t idx = 0;
-	for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
-		for (uint32_t i = 0; i < p->accessCount; ++i)
-			if (p->accesses[i].handle.id == r->handle.id) {
-				if (first == ResourceNode::kNoPass) first = idx;
-				last = idx;
-			}
-	return first != ResourceNode::kNoPass;
-}
-
 // what `p` does to resource `id`: bit 1 = reads, bit 2 = writes (0 = doesn't touch it this pass).
 static int rg_pass_access(PassNode* p, uint32_t id)
 {
@@ -1469,51 +1453,113 @@ static int rg_pass_access(PassNode* p, uint32_t id)
 	return a;
 }
 
-// Resource-lifetime grid. The top axis is the passes in execution order (named); each resource is a
-// bar across the passes it stays live for -- first touch to last. The bar is split per pass: a column
-// where a pass writes the resource is warm, a column it only reads is cool, read+write splits the
-// cell, and a faint kind-tinted band shows passes that merely keep it alive. Transient resources read
-// the firstUse/lastUse the aliasing analysis fills in compile() phase 3; imported + temporal are
-// caller-owned (toggle adds them, muted). Bars that never share a column are aliasing candidates.
+// distinct-ish colour per physical alias slot, so transients packed onto the same slot read as one hue
+// (swatch in the gutter + bar outline). cycles a small palette; adjacent slot indices stay distinguishable.
+static ImU32 rg_slot_color(uint32_t slot)
+{
+	static const ImU32 pal[] = {
+		IM_COL32( 90, 170, 250, 255), IM_COL32(250, 170,  90, 255), IM_COL32(130, 220, 130, 255),
+		IM_COL32(220, 130, 220, 255), IM_COL32(230, 210,  90, 255), IM_COL32(110, 210, 220, 255),
+		IM_COL32(240, 140, 140, 255), IM_COL32(170, 160, 250, 255),
+	};
+	return pal[slot % (sizeof pal / sizeof pal[0])];
+}
+
+// short format tag for the physical-slot row labels in the lifetime view (display only).
+static const char* rg_format_short(WGPUTextureFormat f)
+{
+	switch (f) {
+	  case WGPUTextureFormat_RGBA8Unorm:   return "RGBA8";
+	  case WGPUTextureFormat_BGRA8Unorm:   return "BGRA8";
+	  case WGPUTextureFormat_RGBA16Float:  return "RGBA16F";
+	  case WGPUTextureFormat_R32Float:     return "R32F";
+	  case WGPUTextureFormat_Depth32Float: return "D32F";
+	  case WGPUTextureFormat_Depth24Plus:  return "D24+";
+	  case WGPUTextureFormat_R8Unorm:      return "R8";
+	  default:                             return "tex";
+	}
+}
+
+// Lifetime grid over the graph's own per-frame GPU textures. Top axis = passes in execution order. Each
+// row is ONE dedicated allocation, never a bare logical handle:
+//   * aliasing ON  -> a physical slot ("image N (fmt)"), its bar showing every occupant's writes (warm)
+//     and reads (cool) with empty gaps where the texture is free between occupants;
+//   * aliasing OFF -> each realized transient is its own texture (one row, named for the resource).
+// Toggling 'alias transients' (Demos) collapses N transient rows into M shared textures -- that row-count
+// drop, plus the reuse gaps, is the aliasing made visible. Imported (caller-owned), temporal/persistent
+// (pool-backed) and dead/zero-usage resources have no dedicated per-frame allocation and are NOT shown.
+// firstUse/lastUse come from compile() phase 3; the slot table from phase 4.
 static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 {
 	constexpr int   kMax = 128;
 	constexpr float kLabelW = 150.0f, kColW = 88.0f, kRowH = 24.0f, kHeaderH = 24.0f;
 
-	static bool showExternal = true;
-	ImGui::Checkbox("show imported / temporal", &showExternal);
-	ImGui::SameLine();
 	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGWrite), "write");
 	ImGui::SameLine(0, 4);
 	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGRead), "read");
 	ImGui::SameLine();
-	ImGui::TextDisabled("(band = held alive)");
+	ImGui::TextDisabled("(rows = the graph's dedicated per-frame GPU textures)");
+
+	// header: rows below are physical slots (aliasing on) or per-transient textures (off). either way only
+	// dedicated, graph-owned allocations -- imported/temporal/dead excluded. the row-count + saved MB are
+	// the win; toggle 'alias transients' in Demos and watch the rows collapse.
+	if (s.m_slotCount) {
+		uint32_t logical = 0; uint64_t logicalBytes = 0, physicalBytes = 0;
+		for (uint32_t i = 0; i < s.m_slotCount; ++i) physicalBytes += texture_bytes(s.m_slots[i].size, s.m_slots[i].format);
+		for (ResourceNode* r = s.m_resouces; r; r = r->next)
+			if (r->aliasSlot != ResourceNode::kNoSlot) {
+				++logical;
+				logicalBytes += texture_bytes(s.m_slots[r->aliasSlot].size, s.m_slots[r->aliasSlot].format);
+			}
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(IM_COL32(150, 230, 150, 255)),
+			"aliasing ON: %u transients packed onto %u GPU textures, saved %.2f MB",
+			logical, s.m_slotCount, (double)(logicalBytes - physicalBytes) / (1024.0 * 1024.0));
+	} else {
+		uint32_t live = 0;
+		for (ResourceNode* r = s.m_resouces; r; r = r->next)
+			if (!r->is_external() && r->firstUse != ResourceNode::kNoPass) ++live;
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(IM_COL32(205, 205, 120, 255)),
+			"aliasing OFF: %u dedicated transient textures (tick 'alias transients' in Demos to pack)", live);
+	}
 
 	PassNode* passAt[kMax];
 	int nPass = 0;
 	for (PassNode* p = s.m_passes; p && nPass < kMax; p = p->next) passAt[nPass++] = p;
 
-	// rows top-to-bottom: live transients, then (if shown) imported/temporal with a span, then the
-	// span-less rows (dead transients, untouched externals) pooled at the bottom.
-	struct Row { ResourceNode* r; uint32_t first, last; bool bar; };
+	// rows = the graph's dedicated per-frame GPU textures. a physical slot is one row hosting >=1
+	// disjoint-lifetime transient (r == nullptr, slot >= 0); every realized transient not in a slot is its
+	// own texture (a logical row). with aliasing off there are no slots, so each realized transient is a row.
+	// imported/temporal/persistent (not graph-allocated this frame) and dead/zero-usage transients (never
+	// realized) are excluded -- only things with a real GPU texture behind them appear.
+	struct Row { ResourceNode* r; int slot; uint32_t first, last; bool bar; };
 	Row row[kMax];
 	int nRow = 0;
+	for (uint32_t si = 0; si < s.m_slotCount && nRow < kMax; ++si) {
+		uint32_t f = ResourceNode::kNoPass, l = 0;
+		for (ResourceNode* r = s.m_resouces; r; r = r->next)
+			if (r->aliasSlot == si) { if (r->firstUse < f) f = r->firstUse; if (r->lastUse > l) l = r->lastUse; }
+		if (f != ResourceNode::kNoPass) row[nRow++] = { nullptr, (int)si, f, l, true };
+	}
 	for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next)
-		if (!r->is_external() && r->firstUse != ResourceNode::kNoPass)
-			row[nRow++] = { r, r->firstUse, r->lastUse, true };
-	if (showExternal)
-		for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next) {
-			uint32_t f, l;
-			if (r->is_external() && rg_external_span(s, r, f, l)) row[nRow++] = { r, f, l, true };
-		}
-	for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next)
-		if (!r->is_external() && r->firstUse == ResourceNode::kNoPass)
-			row[nRow++] = { r, 0, 0, false };
-	if (showExternal)
-		for (ResourceNode* r = s.m_resouces; r && nRow < kMax; r = r->next) {
-			uint32_t f, l;
-			if (r->is_external() && !rg_external_span(s, r, f, l)) row[nRow++] = { r, 0, 0, false };
-		}
+		if (!r->is_external() && r->aliasSlot == ResourceNode::kNoSlot && r->firstUse != ResourceNode::kNoPass)
+			row[nRow++] = { r, -1, r->firstUse, r->lastUse, true };
+
+	// per-pass access bits for a row: a logical resource is one id; a physical slot ORs all its occupants.
+	auto rowAccess = [&](const Row& rw, uint32_t c) -> int {
+		if (rw.slot < 0) return rg_pass_access(passAt[c], rw.r->handle.id);
+		int a = 0;
+		for (ResourceNode* o = s.m_resouces; o; o = o->next)
+			if (o->aliasSlot == (uint32_t)rw.slot) a |= rg_pass_access(passAt[c], o->handle.id);
+		return a;
+	};
+	// is the row's storage live this pass? logical: always within [first,last]; slot: only while some
+	// occupant is live, so gaps between successive occupants render empty (the object is free to reuse).
+	auto rowLive = [&](const Row& rw, uint32_t c) -> bool {
+		if (rw.slot < 0) return true;
+		for (ResourceNode* o = s.m_resouces; o; o = o->next)
+			if (o->aliasSlot == (uint32_t)rw.slot && o->firstUse <= c && c <= o->lastUse) return true;
+		return false;
+	};
 
 	ImGui::BeginChild("rg_life", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
 	const ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -1546,28 +1592,44 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 	}
 	dl->AddLine(ImVec2(origin.x, gridT), ImVec2(gridR, gridT), IM_COL32(255, 255, 255, 40));   // axis underline
 
-	// one row per resource: name in the left gutter, a bar spanning [first, last] columns.
+	// one row per resource (logical view) or per physical slot (grouped view): name in the left gutter,
+	// a bar across the passes it stays live for; per-pass cells warm = write, cool = read, split = both.
 	for (int i = 0; i < nRow; ++i) {
-		ResourceNode* r = row[i].r;
-		const bool ext = r->is_external();
-		const float y = gridT + i * kRowH;
+		const bool    isSlot = row[i].slot >= 0;
+		ResourceNode* r      = row[i].r;                 // null for a physical-slot row
+		const bool    ext    = !isSlot && r->is_external();
+		const float   y      = gridT + i * kRowH;
 		if (i & 1) dl->AddRectFilled(ImVec2(origin.x, y), ImVec2(gridR, y + kRowH), IM_COL32(255, 255, 255, 10));
 
-		// name colour doubles as the legend: imported = amber, temporal = violet, transient = white,
-		// span-less = grey. temporal layers share a name, so tag them with their frame index.
-		WGPUStringView nm = r->name;
-		ImU32 nameCol = !row[i].bar   ? IM_COL32(135, 135, 135, 255)
-		              : r->imported   ? IM_COL32(240, 170, 90, 255)
-		              : r->persistent ? IM_COL32(180, 165, 245, 255)
-		              :                 IM_COL32(230, 230, 230, 255);
-		char label[96];
-		if (r->persistent)
-			std::snprintf(label, sizeof label, "%.*s #%u", (int)nm.length, nm.data ? nm.data : "", r->temporalIndex);
-		else
-			std::snprintf(label, sizeof label, "%.*s", (int)nm.length, nm.data ? nm.data : "");
+		// label + name colour. a slot row is named for the physical object ("image N (fmt WxH)") and tinted
+		// its slot colour; a logical row keeps the legend colours (imported=amber, temporal=violet, etc.).
+		char  label[96];
+		ImU32 nameCol;
+		if (isSlot) {
+			const PhysicalResource& ph = s.m_slots[row[i].slot];
+			std::snprintf(label, sizeof label, "image %d (%s %ux%u)", row[i].slot,
+			              rg_format_short(ph.format), ph.size.width, ph.size.height);
+			nameCol = rg_slot_color(row[i].slot);
+		} else {
+			WGPUStringView nm = r->name;
+			nameCol = !row[i].bar   ? IM_COL32(135, 135, 135, 255)
+			        : r->imported   ? IM_COL32(240, 170, 90, 255)
+			        : r->persistent ? IM_COL32(180, 165, 245, 255)
+			        :                 IM_COL32(230, 230, 230, 255);
+			if (r->persistent)
+				std::snprintf(label, sizeof label, "%.*s #%u", (int)nm.length, nm.data ? nm.data : "", r->temporalIndex);
+			else if (r->aliasSlot != ResourceNode::kNoSlot)
+				std::snprintf(label, sizeof label, "%.*s [s%u]", (int)nm.length, nm.data ? nm.data : "", r->aliasSlot);
+			else
+				std::snprintf(label, sizeof label, "%.*s", (int)nm.length, nm.data ? nm.data : "");
+		}
 		dl->PushClipRect(ImVec2(origin.x + 4, y), ImVec2(origin.x + kLabelW - 4, y + kRowH), true);
 		dl->AddText(ImVec2(origin.x + 6, y + 4), nameCol, label);
 		dl->PopClipRect();
+		if (isSlot)                                                // gutter tab in the slot colour
+			dl->AddRectFilled(ImVec2(origin.x + 1, y + 4), ImVec2(origin.x + 4, y + kRowH - 4), rg_slot_color(row[i].slot));
+		else if (row[i].bar && r->aliasSlot != ResourceNode::kNoSlot)
+			dl->AddRectFilled(ImVec2(origin.x + 1, y + 4), ImVec2(origin.x + 4, y + kRowH - 4), rg_slot_color(r->aliasSlot));
 
 		if (!row[i].bar) {   // no surviving pass touched it -> no bar.
 			dl->AddText(ImVec2(origin.x + kLabelW + 6, y + 4), nameCol, ext ? "(unused)" : "(dead)");
@@ -1584,19 +1646,21 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 		const bool hov = ImGui::IsItemHovered();
 		ImGui::PopID();
 
-		// base band = the lifetime itself, faintly kind-tinted so texture/buffer stays legible; held
-		// columns show only this. imported/temporal sit fainter still.
-		dl->AddRectFilled(tl, br, rg_with_alpha(rg_resource_color(r->kind), ext ? 32 : 60), 0.0f);
-
-		// per-pass cells on top: warm = write, cool = read, split = both. externals dimmed a touch.
-		const ImU32 wcol = rg_with_alpha(kRGWrite, ext ? 175 : 255);
-		const ImU32 rcol = rg_with_alpha(kRGRead,  ext ? 175 : 255);
+		// per-pass cells. base band = a faint fill on live passes (kind-tinted for a logical row, slot-tinted
+		// for a slot row); a slot row leaves the gaps between successive occupants empty, so the storage being
+		// freed and reused reads directly off the timeline. warm/cool/split overlays show write/read.
+		const ImU32 wcol    = rg_with_alpha(kRGWrite, ext ? 175 : 255);
+		const ImU32 rcol    = rg_with_alpha(kRGRead,  ext ? 175 : 255);
+		const ImU32 bandCol = isSlot ? rg_with_alpha(rg_slot_color(row[i].slot), 45)
+		                             : rg_with_alpha(rg_resource_color(r->kind), ext ? 32 : 60);
 		for (uint32_t c = row[i].first; c <= row[i].last; ++c) {
-			int acc = rg_pass_access(passAt[c], r->handle.id);
-			if (!acc) continue;   // held this pass -> band shows through
+			if (!rowLive(row[i], c)) continue;   // slot gap (free) -> empty column
 			float sx0 = (c == row[i].first) ? x0 : origin.x + kLabelW + c * kColW;
 			float sx1 = (c == row[i].last)  ? x1 : origin.x + kLabelW + (c + 1) * kColW;
-			if (acc == 3) {   // read + write -> split top (write) / bottom (read)
+			dl->AddRectFilled(ImVec2(sx0, y + 3.0f), ImVec2(sx1, y + kRowH - 3.0f), bandCol, 0.0f);
+			int acc = rowAccess(row[i], c);
+			if (!acc) continue;   // held this pass -> band only
+			if (acc == 3) {       // read + write -> split top (write) / bottom (read)
 				float mid = (tl.y + br.y) * 0.5f;
 				dl->AddRectFilled(ImVec2(sx0, tl.y), ImVec2(sx1, mid), wcol, 0.0f);
 				dl->AddRectFilled(ImVec2(sx0, mid), ImVec2(sx1, br.y), rcol, 0.0f);
@@ -1604,33 +1668,84 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 				dl->AddRectFilled(ImVec2(sx0, tl.y), ImVec2(sx1, br.y), acc == 2 ? wcol : rcol, 0.0f);
 		}
 
-		// outline marks transient vs imported/temporal (accent edge); white on hover.
-		ImU32 edge = hov ? IM_COL32(255, 255, 255, 255) : ext ? nameCol : IM_COL32(20, 20, 20, 160);
-		dl->AddRect(tl, br, edge, 0.0f, 0, hov ? 2.0f : 1.0f);
+		// outline. logical row: one accent box over the whole span (slot colour if aliased). slot row: one
+		// box per contiguous occupancy run, so the gaps stay open and each occupant reads as its own block.
+		if (isSlot) {
+			ImU32 segCol = hov ? IM_COL32(255, 255, 255, 255) : rg_slot_color(row[i].slot);
+			uint32_t c = row[i].first;
+			while (c <= row[i].last) {
+				if (!rowLive(row[i], c)) { ++c; continue; }
+				uint32_t segStart = c;
+				while (c <= row[i].last && rowLive(row[i], c)) ++c;
+				float sx0 = origin.x + kLabelW + segStart * kColW + 3.0f;
+				float sx1 = origin.x + kLabelW + c * kColW - 3.0f;
+				dl->AddRect(ImVec2(sx0, y + 3.0f), ImVec2(sx1, y + kRowH - 3.0f), segCol, 0.0f, 0, hov ? 2.0f : 1.0f);
+			}
+		} else {
+			const bool aliased = (r->aliasSlot != ResourceNode::kNoSlot);
+			ImU32 edge = hov ? IM_COL32(255, 255, 255, 255) : ext ? nameCol
+			           : aliased ? rg_slot_color(r->aliasSlot) : IM_COL32(20, 20, 20, 160);
+			dl->AddRect(tl, br, edge, 0.0f, 0, (hov || aliased) ? 2.0f : 1.0f);
+		}
 
 		if (hov) {
-			WGPUStringView f = pass_name_at(s.m_passes, row[i].first);
-			WGPUStringView l = pass_name_at(s.m_passes, row[i].last);
 			ImGui::BeginTooltip();
-			ImGui::Text("%s  [%s]", label, r->kind == ResourceNode::Kind::Texture ? "texture" : "buffer");
-			if (r->kind == ResourceNode::Kind::Texture)
-				ImGui::Text("%u x %u", r->resolved.width, r->resolved.height);
-			else
-				ImGui::Text("%llu bytes", (unsigned long long)r->bufferSize);
-			if (r->imported)        ImGui::TextDisabled("imported; caller-owned, not aliased");
-			else if (r->persistent) ImGui::TextDisabled("temporal layer %u; pool-owned, not aliased", r->temporalIndex);
-			ImGui::Separator();
-			if (row[i].first == row[i].last)
-				ImGui::Text("alive in %.*s", (int)f.length, f.data ? f.data : "");
-			else
-				ImGui::Text("alive %.*s .. %.*s",
-					(int)f.length, f.data ? f.data : "", (int)l.length, l.data ? l.data : "");
-			for (uint32_t c = row[i].first; c <= row[i].last; ++c) {   // per-pass read/write breakdown
-				int a = rg_pass_access(passAt[c], r->handle.id);
-				if (!a) continue;
-				WGPUStringView pn = passAt[c]->name;
-				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(a == 1 ? kRGRead : kRGWrite),
-					"  %s %.*s", a == 3 ? "rw" : a == 2 ? " w" : " r", (int)pn.length, pn.data ? pn.data : "");
+			if (isSlot) {
+				const PhysicalResource& ph = s.m_slots[row[i].slot];
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(rg_slot_color(row[i].slot)),
+					"image %d  %s  %ux%u  (one physical object)", row[i].slot, rg_format_short(ph.format), ph.size.width, ph.size.height);
+				ImGui::TextDisabled("hosts (disjoint lifetimes):");
+				for (ResourceNode* o = s.m_resouces; o; o = o->next)
+					if (o->aliasSlot == (uint32_t)row[i].slot) {
+						WGPUStringView of = pass_name_at(s.m_passes, o->firstUse);
+						WGPUStringView ol = pass_name_at(s.m_passes, o->lastUse);
+						ImGui::BulletText("%.*s  (%.*s .. %.*s)",
+							(int)o->name.length, o->name.data ? o->name.data : "",
+							(int)of.length, of.data ? of.data : "", (int)ol.length, ol.data ? ol.data : "");
+					}
+				ImGui::Separator();
+				ImGui::TextDisabled("writes/reads on this object (across all occupants):");
+				for (uint32_t c = row[i].first; c <= row[i].last; ++c) {
+					int a = rowAccess(row[i], c);
+					if (!a) continue;
+					WGPUStringView pn = passAt[c]->name;
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(a == 1 ? kRGRead : kRGWrite),
+						"  %s %.*s", a == 3 ? "rw" : a == 2 ? " w" : " r", (int)pn.length, pn.data ? pn.data : "");
+				}
+			} else {
+				WGPUStringView f = pass_name_at(s.m_passes, row[i].first);
+				WGPUStringView l = pass_name_at(s.m_passes, row[i].last);
+				ImGui::Text("%s  [%s]", label, r->kind == ResourceNode::Kind::Texture ? "texture" : "buffer");
+				if (r->kind == ResourceNode::Kind::Texture)
+					ImGui::Text("%u x %u", r->resolved.width, r->resolved.height);
+				else
+					ImGui::Text("%llu bytes", (unsigned long long)r->bufferSize);
+				if (r->imported)        ImGui::TextDisabled("imported; caller-owned, not aliased");
+				else if (r->persistent) ImGui::TextDisabled("temporal layer %u; pool-owned, not aliased", r->temporalIndex);
+				else if (r->aliasSlot != ResourceNode::kNoSlot) {
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(rg_slot_color(r->aliasSlot)),
+						"physical slot %u", r->aliasSlot);
+					int shared = 0;
+					for (ResourceNode* o = s.m_resouces; o; o = o->next)
+						if (o != r && o->aliasSlot == r->aliasSlot) {
+							ImGui::BulletText("%.*s", (int)o->name.length, o->name.data ? o->name.data : ""); ++shared;
+						}
+					ImGui::TextDisabled(shared ? "(shares storage with the above -- disjoint lifetimes)"
+					                           : "(its own object -- nothing else fit this slot)");
+				}
+				ImGui::Separator();
+				if (row[i].first == row[i].last)
+					ImGui::Text("alive in %.*s", (int)f.length, f.data ? f.data : "");
+				else
+					ImGui::Text("alive %.*s .. %.*s",
+						(int)f.length, f.data ? f.data : "", (int)l.length, l.data ? l.data : "");
+				for (uint32_t c = row[i].first; c <= row[i].last; ++c) {   // per-pass read/write breakdown
+					int a = rg_pass_access(passAt[c], r->handle.id);
+					if (!a) continue;
+					WGPUStringView pn = passAt[c]->name;
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(a == 1 ? kRGRead : kRGWrite),
+						"  %s %.*s", a == 3 ? "rw" : a == 2 ? " w" : " r", (int)pn.length, pn.data ? pn.data : "");
+				}
 			}
 			ImGui::EndTooltip();
 		}
@@ -1892,6 +2007,8 @@ static void imgui_layer_draw_graph(RenderGraph* rg)
 {
 	RenderGraphStorage& s = *storage(rg);
 
+	ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);        // TEMP-VISCHECK
+	ImGui::SetNextWindowSize(ImVec2(1180, 660), ImGuiCond_FirstUseEver);    // TEMP-VISCHECK
 	ImGui::Begin("RenderGraph");
 	ImGui::Text(" %.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
 	rg_draw_arena(*s.m_allocator);

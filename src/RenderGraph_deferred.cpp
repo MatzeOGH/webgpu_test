@@ -594,6 +594,7 @@ static WGPUBuffer          uboBuf = nullptr;       // demo-owned scene UBO, impo
 // feature toggles (ImGui checkboxes in deferred_ui; persist across demo switches).
 static bool ssaoOn = true, taaOn = true, bloomOn = false, cubeOn = false;
 static bool  fogOn = true;   // froxel volumetric fog; default on so the new passes run out of the box
+static bool  aliasDemoOn = true;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
 static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f, fogAmbient = 0.02f, fogNoise = 0.8f;
 
 // the gbuffer's four outputs, threaded through the chain as one value.
@@ -1107,6 +1108,55 @@ static ResourceHandle build_taa(RenderGraph* rg, const DemoEnv& env, ResourceHan
     return hist.curr;
 }
 
+// alias test (off by default): a short chain of same-signature screen RGBA8 scratch targets with STRICTLY
+// disjoint lifetimes, to exercise compile()'s phase-4 transient aliasing -- the real deferred graph aliases
+// almost nothing (g-buffer targets are mutually live; litColor is born where they die). NOT a naive
+// read-prev/write-cur chain: that makes lifetimes *touch* (scratch.lastUse == next scratch.firstUse), which
+// the strict freeFrom<firstUse test correctly refuses. Instead each scratch is filled FROM the running
+// accumulator and folded BACK into it; the accumulator RAW dependency forces fill_{i+1} a full pass after
+// fold_i, so scratch_i is dead before scratch_{i+1} is born -> all scratches collapse onto one slot. With
+// enableAlias on, the transient pool count drops; off, each scratch is its own texture. Returns the
+// accumulator for present to blit.
+static ResourceHandle build_alias_test(RenderGraph* rg, const DemoEnv& env, ResourceHandle scene, ResourceHandle swap, bool enabled)
+{
+    if (!enabled) return scene;
+    WGPUDevice dev = env.device;
+
+    // one reusable full-screen blit pass: sample `src`, clear + write `dst`. presentPipe already does
+    // exactly this (binding 0 texture -> color target, 3-vertex fullscreen triangle, textureLoad so no
+    // sampler binding), and every scratch is kSwapFormat like presentPipe's target.
+    auto blit = [&](const char* name, ResourceHandle src, ResourceHandle dst) {
+        rg->add_pass(WGPUStringView{ name, WGPU_STRLEN }, PassKind::Graphics,
+            [&](GraphBuilder& b) {
+                b.sampled(src);
+                b.color(dst, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
+            },
+            [dev, src](PassContext& ctx) {
+                WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(presentPipe, 0);
+                WGPUBindGroupEntry e[1] = { { .binding = 0, .textureView = ctx.view(src) } };
+                WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 1, .entries = e };
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
+                wgpuRenderPassEncoderSetPipeline(ctx.render, presentPipe);
+                wgpuRenderPassEncoderSetBindGroup(ctx.render, 0, bg, 0, nullptr);
+                wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
+                wgpuBindGroupRelease(bg);
+                wgpuBindGroupLayoutRelease(l);
+            });
+    };
+
+    // distinct names so the lifetime widget lists them individually; the pass names repeat (fine -- like
+    // bloom.down / shadow.cascade). 4 scratches -> all alias onto one physical slot.
+    static const char* kScratch[] = { "alias.s0", "alias.s1", "alias.s2", "alias.s3" };
+    ResourceHandle accum = screen_tex(rg, "alias.accum", kSwapFormat, swap);
+    blit("alias.seed", scene, accum);                                  // seed the accumulator from the scene
+    for (const char* nm : kScratch) {
+        ResourceHandle s = screen_tex(rg, nm, kSwapFormat, swap);
+        blit("alias.tap",  accum, s);   // fill scratch from the current accumulator (reads accum)
+        blit("alias.fold", s, accum);   // fold back -> new accum version, forcing the next tap to wait
+    }
+    return accum;
+}
+
 // present: blit the final scene colour to the swapchain (the chain's sink).
 static void build_present(RenderGraph* rg, WGPUDevice dev, ResourceHandle scene, ResourceHandle swap)
 {
@@ -1471,6 +1521,7 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     // ---- post chain: each effect inserts passes or returns the colour unchanged ----
     scene = build_bloom(rg, env, scene, swap, bloomOn);
     scene = build_taa(rg, env, scene, swap, taaOn);
+    scene = build_alias_test(rg, env, scene, swap, aliasDemoOn);   // R2: off by default; exercises phase-4 aliasing
     build_present(rg, dev, scene, swap);
 }
 
@@ -1482,6 +1533,7 @@ static void deferred_ui()
     ImGui::Checkbox("Bloom", &bloomOn);
     ImGui::Checkbox("Cubemap", &cubeOn);
     ImGui::Checkbox("Volumetric Fog", &fogOn);
+    ImGui::Checkbox("Alias test (phase-4 demo)", &aliasDemoOn);
     if (fogOn) {
         ImGui::SliderFloat("Fog density",    &fogDensity,       0.0f, 0.5f);
         ImGui::SliderFloat("Fog anisotropy", &fogAnisotropy,   -0.9f, 0.9f);
