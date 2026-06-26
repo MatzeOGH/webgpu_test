@@ -55,6 +55,14 @@ wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
             std::printf("GPU error (%d): %.*s\n", (int)t, (int)m.length, m.data);
         });
 
+    // opt-in per-pass GPU timing needs the TimestampQuery feature. request it only when the adapter has it
+    // -- requesting an unsupported feature fails device creation. main re-checks via wgpuDeviceHasFeature.
+    static const wgpu::FeatureName kTimestamp[] = { wgpu::FeatureName::TimestampQuery };
+    if (as.adapter.HasFeature(wgpu::FeatureName::TimestampQuery)) {
+        devDesc.requiredFeatures     = kTimestamp;
+        devDesc.requiredFeatureCount = 1;
+    }
+
     struct DevState { wgpu::Device device; bool done = false; } ds;
     as.adapter.RequestDevice(&devDesc, wgpu::CallbackMode::AllowSpontaneous,
         [](wgpu::RequestDeviceStatus s, wgpu::Device d, wgpu::StringView m, DevState* st){
@@ -114,6 +122,7 @@ int main()
     WGPUDevice  dev  = device.Get();
     WGPUQueue   q    = queue.Get();
     WGPUSurface surf = surface.Get();
+    const bool gpuTimingAvailable = wgpuDeviceHasFeature(dev, WGPUFeatureName_TimestampQuery);
 
     // ---- configure surface ----
     WGPUSurfaceConfiguration cfg{
@@ -210,6 +219,8 @@ int main()
         ImGui::Separator();
         static bool enableAlias = true;   // phase-4 transient aliasing; folded into the reshape sig below
         ImGui::Checkbox("alias transients", &enableAlias);
+        static bool enableProfiling = false;   // opt-in per-pass GPU timestamps; hidden if the adapter lacks the feature
+        if (gpuTimingAvailable) ImGui::Checkbox("gpu timings", &enableProfiling);
         demos[active].ui();
         ImGui::End();
 
@@ -287,11 +298,12 @@ int main()
 
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev, nullptr);
         auto te0 = std::chrono::steady_clock::now();
-        rg->execute(enc, q);
+        rg->execute(enc, q, enableProfiling && gpuTimingAvailable);
         auto te1 = std::chrono::steady_clock::now();
         storage(rg)->timing_execute_us = std::chrono::duration<float, std::micro>(te1 - te0).count();
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
         wgpuQueueSubmit(q, 1, &cmd);
+        rg->collect_gpu_timings();   // kick the async timestamp read-back now the copy is submitted
         wgpuSurfacePresent(surf);
 
         rg->release_resources();   // destroy this frame's graph textures (imported swapchain left alone)

@@ -309,6 +309,11 @@ struct TransientResourcePool
         eventLog[eventCount++ % kLog] = { frame, kind, e.size, e.format };
     }
 
+    void log_reset()
+    {
+        eventCount = 0;
+    }
+
     // hand out a free TEXTURE matching the descriptor, else create one.
     void acquire(WGPUDevice device, WGPUExtent3D size, WGPUTextureFormat format,
                  WGPUTextureDimension dim, uint32_t mipLevelCount, uint32_t sampleCount, WGPUTextureUsage usage,
@@ -392,6 +397,93 @@ struct TransientResourcePool
     ~TransientResourcePool() { for (Entry& e : entries) destroy(&e); }
 };
 
+// opt-in per-pass GPU timing. Two timestamp queries per executed pass (begin/end); resolved into a
+// staging buffer and copied into a ring of mappable read-back buffers so a frame never stalls waiting on
+// the GPU. Lives in GraphAllocator (cross-frame survivor) -- the query set + buffers outlive the per-frame
+// arena reset. Only created when profiling is first enabled AND the device has the TimestampQuery feature.
+// ponytail: kMaxPasses/kRing fixed; a pass past kMaxPasses is just left unprofiled, bump if a demo grows.
+struct GpuProfiler
+{
+    static constexpr uint32_t kMaxPasses = 64;   // -> 2*64 timestamps in the set
+    static constexpr uint32_t kRing      = 3;    // covers GPU read-back latency without stalling
+
+    WGPUQuerySet querySet{};                      // type Timestamp, count 2*kMaxPasses
+    WGPUBuffer   resolveBuf{};                     // 2*kMaxPasses*8, QueryResolve | CopySrc
+
+    struct Slot {
+        WGPUBuffer     buf{};                     // 2*kMaxPasses*8, MapRead | CopyDst
+        bool           pending{};                 // mapAsync in flight -> not reusable until the cb fires
+        uint32_t       count{};                   // passes captured into this fill
+        WGPUStringView names[kMaxPasses]{};       // captured pass names (literals -> ptr stable across frames)
+    } ring[kRing];
+    int pendingSlot{-1};                          // slot execute() filled this frame, awaiting the map kick
+
+    // last completed read-back, read by the debug UI
+    uint32_t       resultCount{};
+    WGPUStringView resultNames[kMaxPasses]{};
+    float          resultUs[kMaxPasses]{};
+
+    bool initialized{};
+
+    // --- timing history (recording), driven by the "Timings" tab ---
+    static constexpr uint32_t kHistory = 256;     // frames retained in the ring
+    bool     recording{};
+    uint32_t resultId{};                          // bumped by the read-back cb on each new sample; dedupes capture
+    struct Series { WGPUStringView name{}; bool enabled{ true }; float v[kHistory]{}; };
+    Series   series[kMaxPasses];
+    uint32_t seriesCount{};
+    uint32_t historyHead{};                       // next write column
+    uint32_t historyLen{};                        // valid columns (<= kHistory)
+    uint32_t lastSampledId{};                     // resultId already appended
+
+    void clear_history() { seriesCount = 0; historyHead = 0; historyLen = 0; lastSampledId = 0; }
+
+    // append one column iff recording AND a fresh read-back arrived since last call. Match each result to a
+    // series by name; new names get a new series (older columns stay 0), missing series get 0 this column.
+    // ponytail: series keyed by name; a demo switch just adds new series + zero-fills old ones. Clear resets.
+    void sample_history()
+    {
+        if (!recording || resultId == lastSampledId) return;
+        lastSampledId = resultId;
+        for (uint32_t s = 0; s < seriesCount; ++s) series[s].v[historyHead] = 0.0f;
+        for (uint32_t i = 0; i < resultCount; ++i) {
+            uint32_t s = 0;
+            for (; s < seriesCount; ++s)   // pointer+len compare: names are stable string literals
+                if (series[s].name.data == resultNames[i].data && series[s].name.length == resultNames[i].length) break;
+            if (s == seriesCount) {
+                if (seriesCount >= kMaxPasses) continue;
+                series[s] = {};
+                series[s].name = resultNames[i];
+                ++seriesCount;
+            }
+            series[s].v[historyHead] = resultUs[i];
+        }
+        historyHead = (historyHead + 1) % kHistory;
+        if (historyLen < kHistory) ++historyLen;
+    }
+
+    void init(WGPUDevice device)
+    {
+        if (initialized) return;
+        const uint64_t bytes = uint64_t(2) * kMaxPasses * sizeof(uint64_t);
+        WGPUQuerySetDescriptor qd{ .type = WGPUQueryType_Timestamp, .count = 2 * kMaxPasses };
+        querySet = wgpuDeviceCreateQuerySet(device, &qd);
+        WGPUBufferDescriptor rd{ .usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc, .size = bytes };
+        resolveBuf = wgpuDeviceCreateBuffer(device, &rd);
+        for (Slot& s : ring) {
+            WGPUBufferDescriptor bd{ .usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst, .size = bytes };
+            s.buf = wgpuDeviceCreateBuffer(device, &bd);
+        }
+        initialized = true;
+    }
+
+    int free_slot() const   // first ring slot not awaiting a map; -1 if all in flight (skip this frame)
+    {
+        for (uint32_t i = 0; i < kRing; ++i) if (!ring[i].pending) return (int)i;
+        return -1;
+    }
+};
+
 // arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
 // permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
 // for compile()-local temporaries, reset per-scope via defer (AlpUtils.h) instead of calloc/free.
@@ -414,6 +506,7 @@ struct GraphAllocator
     // because they cache GPU objects across frames on purpose (history ping-pong + transient reuse).
     PersistentResourcePool pool;        // name-keyed temporal/history textures + buffers
     TransientResourcePool  transient;   // descriptor-keyed per-frame texture + buffer cache (tagged by kind)
+    GpuProfiler            profiler;     // opt-in per-pass GPU timestamps; created lazily on first profiled frame
 
     // alignment must be a power of two
     static constexpr size_t align_up(size_t value, size_t alignment)
@@ -1733,14 +1826,30 @@ void RenderGraph::realize(WGPUDevice device)
 // PassContext. caller owns submit + present.
 // ponytail: mirrors RenderPassBuilder/ComputePassBuilder in Renderer.cpp; reimplemented inline
 // rather than shared because those live in Renderer.cpp (not a header) and this TU is standalone.
-void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
+void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enableProfiling)
 {
     RenderGraphStorage& s = *storage(this);
+
+    // opt-in GPU timing: lazily build the query set/buffers, then grab a free read-back ring slot. If every
+    // slot is still awaiting its map callback, skip profiling this frame rather than stall. `pi` is a dense
+    // begin/end pair index advanced only for passes that actually run -> the resolve range stays contiguous.
+    GpuProfiler& prof = s.m_allocator->profiler;
+    bool profiling = enableProfiling;
+    int  slotIdx = -1;
+    if (profiling) {
+        prof.init(s.m_device);
+        slotIdx = prof.free_slot();
+        if (slotIdx < 0) profiling = false;
+    }
+    GpuProfiler::Slot* slot = profiling ? &prof.ring[slotIdx] : nullptr;
+    uint32_t pi = 0;
+
     // bracket each contiguous run of same-prefix passes (shadow.cascade x3, bloom.*) in an encoder
     // debug group, so a RenderDoc/PIX capture shows collapsible regions over the per-pass labels.
     // push/pop happen between passes (no pass open at that point) -> balanced + nested by construction.
     WGPUStringView openGroup{};
     for (PassNode* p = s.m_passes; p; p = p->next) {
+        assert(p->kind != PassKind::None && "a pass of type none is not allowed; its a trap for bad data");
         WGPUStringView grp = group_prefix(p->name);
         if (!sv_eq(grp, openGroup)) {
             if (sv_length(openGroup)) wgpuCommandEncoderPopDebugGroup(encoder);
@@ -1767,8 +1876,14 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
         ctx.pass = p;
         s.viewScratchN = 0;   // per-pass: attachment + body ctx.view() views accumulate here, freed after the body
 
+        // time this pass iff profiling is live, the pass actually records a body, and we have a free pair in
+        // the set. begin/end ride the pass descriptor (render/compute) or bracket the encoder body (transfer).
+        const bool timeThis = profiling && p->exec_fn && pi < GpuProfiler::kMaxPasses;
+        WGPUPassTimestampWrites tw{ .querySet = prof.querySet, .beginningOfPassWriteIndex = 2 * pi, .endOfPassWriteIndex = 2 * pi + 1 };
+        if (timeThis) slot->names[pi] = p->name;
+
         if (p->kind == PassKind::Compute && p->exec_fn) {
-            WGPUComputePassDescriptor cd{ .label = p->name };
+            WGPUComputePassDescriptor cd{ .label = p->name, .timestampWrites = timeThis ? &tw : nullptr };
             ctx.compute = wgpuCommandEncoderBeginComputePass(encoder, &cd);
             p->exec_fn(p->exec_obj, ctx);
             wgpuComputePassEncoderEnd(ctx.compute);
@@ -1857,21 +1972,74 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue)
                 .colorAttachmentCount   = nc,
                 .colorAttachments       = color,
                 .depthStencilAttachment = hasDepth ? &depth : nullptr,
+                .timestampWrites        = timeThis ? &tw : nullptr,
             };
             ctx.render = wgpuCommandEncoderBeginRenderPass(encoder, &rd);
             p->exec_fn(p->exec_obj, ctx);
             wgpuRenderPassEncoderEnd(ctx.render);
             wgpuRenderPassEncoderRelease(ctx.render);
         }
-        else { // Transfer / None: body records straight onto the encoder
-            if (p->exec_fn) p->exec_fn(p->exec_obj, ctx);
+        else { // Transfer: body records straight onto the encoder. no pass object -> bracket with encoder timestamps.
+            if (p->exec_fn) {
+                if (timeThis) wgpuCommandEncoderWriteTimestamp(encoder, prof.querySet, 2 * pi);
+                p->exec_fn(p->exec_obj, ctx);
+                if (timeThis) wgpuCommandEncoderWriteTimestamp(encoder, prof.querySet, 2 * pi + 1);
+            }
         }
+
+        if (timeThis) ++pi;   // advance only for timed passes -> the resolve range below has no gaps
 
         // pass-scoped subresource views (attachments built above + any the body built via ctx.view()) -- free
         // them now the pass has ended. runs for every kind, so ctx.view() auto-releases in compute/transfer too.
         for (uint32_t i = 0; i < s.viewScratchN; ++i) wgpuTextureViewRelease(s.viewScratch[i]);
     }
     if (sv_length(openGroup)) wgpuCommandEncoderPopDebugGroup(encoder);   // close the last open group
+
+    // resolve the queries we wrote into the staging buffer, then stage them into the chosen ring slot. The
+    // copy rides this frame's submit; collect_gpu_timings() kicks the async map once that submit is queued.
+    if (profiling && pi > 0) {
+        wgpuCommandEncoderResolveQuerySet(encoder, prof.querySet, 0, 2 * pi, prof.resolveBuf, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(encoder, prof.resolveBuf, 0, slot->buf, 0, uint64_t(pi) * 2 * sizeof(uint64_t));
+        slot->count = pi;
+        prof.pendingSlot = slotIdx;
+    }
+}
+
+// kick the async read-back of the slot execute() just filled. Call AFTER the frame's queue submit -- the
+// copy must be queued first. The spontaneous callback fires during a later instance.ProcessEvents() pump
+// (a couple frames on, by which time the GPU is done) and unpacks ns pairs into the profiler's results.
+void RenderGraph::collect_gpu_timings()
+{
+    GpuProfiler& prof = storage(this)->m_allocator->profiler;
+    if (prof.pendingSlot < 0) return;
+    GpuProfiler::Slot* slot = &prof.ring[prof.pendingSlot];
+    prof.pendingSlot = -1;
+    slot->pending = true;   // off-limits for reuse until the callback clears it
+
+    WGPUBufferMapCallbackInfo cb{};
+    cb.mode = WGPUCallbackMode_AllowSpontaneous;
+    cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void* u2) {
+        auto* slot = static_cast<GpuProfiler::Slot*>(u1);
+        auto* prof = static_cast<GpuProfiler*>(u2);
+        if (status == WGPUMapAsyncStatus_Success) {
+            const auto* t = static_cast<const uint64_t*>(
+                wgpuBufferGetConstMappedRange(slot->buf, 0, slot->count * 2 * sizeof(uint64_t)));
+            if (t) {
+                prof->resultCount = slot->count;
+                for (uint32_t i = 0; i < slot->count; ++i) {
+                    const uint64_t b = t[2 * i], e = t[2 * i + 1];
+                    prof->resultUs[i]    = (e > b) ? float((e - b) / 1000.0) : 0.0f;   // ns -> us; clamp reorders
+                    prof->resultNames[i] = slot->names[i];
+                }
+                ++prof->resultId;   // signal the history sampler that a fresh read-back landed
+            }
+            wgpuBufferUnmap(slot->buf);
+        }
+        slot->pending = false;
+    };
+    cb.userdata1 = slot;
+    cb.userdata2 = &prof;
+    wgpuBufferMapAsync(slot->buf, WGPUMapMode_Read, 0, slot->count * 2 * sizeof(uint64_t), cb);
 }
 
 // release graph-created GPU handles (imported ones are caller-owned -> left alone). pairs with

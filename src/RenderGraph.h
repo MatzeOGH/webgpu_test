@@ -248,8 +248,13 @@ struct RenderGraph
 
     // create GPU resources from the usage + size that compile() worked out
     void realize(WGPUDevice device);
-    // record the compiled passes into a caller-owned encoder (caller submits + presents)
-    void execute(WGPUCommandEncoder encoder, WGPUQueue queue);
+    // record the compiled passes into a caller-owned encoder (caller submits + presents).
+    // enableProfiling: opt in to per-pass GPU timestamp queries (needs the device's TimestampQuery
+    // feature). Off = byte-identical to before. Pair with collect_gpu_timings() after the submit.
+    void execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enableProfiling = false);
+    // kick the async read-back of the last execute()'s GPU timestamps. Call AFTER queue submit; results
+    // surface a couple frames later via the instance's event pump. No-op if profiling was off that frame.
+    void collect_gpu_timings();
     // release graph-created textures/views/buffers (imported resources left alone)
     void release_resources();
     // No data members: state lives in a .cpp-private RenderGraphStorage (see RenderGraph.cpp).
