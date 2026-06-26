@@ -6,6 +6,7 @@
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_wgpu.h"
 #include <cstdio>   // snprintf for node labels
+#include <cstdarg>  // va_list for the details-panel line builder
 #include <cmath>    // fmod for the canvas grid
 
 static void imgui_layer_init(SDL_Window* window, WGPUDevice dev, WGPUTextureFormat swapFormat)
@@ -296,6 +297,45 @@ static int rg_in_slot(PassNode* p, uint32_t id)
 	return -1;
 }
 
+// external interface of the pass run [gi, gj): reads whose producer sits OUTSIDE the range become in-pins;
+// writes that are imported/persistent or consumed outside the range become out-pins. interior resources
+// (produced and consumed within the run, e.g. bloom's mip chain) get no pin. both lists dedup and cap at
+// kRgGPinMax (silently). one walk for every group node -- collapsed slot, expanded border, and the draw.
+static void rg_group_interface(RenderGraph* rg, const RgDagBox* box, int n, int gi, int gj,
+	uint32_t* inId, int& nIn, uint32_t* outId, int& nOut)
+{
+	nIn = 0; nOut = 0;
+	for (int k = gi; k < gj; ++k) {
+		PassNode* p = box[k].p;
+		for (uint32_t ai = 0; ai < p->accessCount; ++ai) {
+			if (!rg_access_reads(p->accesses[ai])) continue;
+			uint32_t id = p->accesses[ai].handle.id;
+			int prod = rg_producer_of(box, n, p, id);
+			if (prod >= gi && prod < gj) continue;
+			bool seen = false; for (int s = 0; s < nIn; ++s) seen |= inId[s] == id;
+			if (!seen && nIn < kRgGPinMax) inId[nIn++] = id;
+		}
+	}
+	for (int k = gi; k < gj; ++k) {
+		PassNode* p = box[k].p;
+		for (uint32_t ai = 0; ai < p->accessCount; ++ai) {
+			if (!access_is_write(p->accesses[ai].type)) continue;
+			uint32_t id = p->accesses[ai].handle.id;
+			ResourceNode* r = find_node(rg, { id });
+			bool external = r && (r->imported || r->persistent);   // temporal write leaves to next frame -> group output
+			for (int j = 0; j < n && !external; ++j) {
+				if (j >= gi && j < gj) continue;
+				if (rg_in_slot(box[j].p, id) < 0) continue;
+				int pr = rg_producer_of(box, n, box[j].p, id);
+				if (pr >= gi && pr < gj) external = true;
+			}
+			if (!external) continue;
+			bool seen = false; for (int s = 0; s < nOut; ++s) seen |= outId[s] == id;
+			if (!seen && nOut < kRgGPinMax) outId[nOut++] = id;
+		}
+	}
+}
+
 // mark seed + everything it transitively depends on (the upstream producer cone): DFS over predecessor
 // edges. iterative -- a long pass chain would overflow a recursive stack.
 static void rg_mark_cone(const RgDagBox* box, int n, int seed, bool* inCone)
@@ -449,6 +489,69 @@ static void rg_barycenter_relax(std::vector<int>* lcol, int maxCol,
 		}
 }
 
+// span of `name` covering its first `segs` dotted segments ("bloom.down.0" with segs=2 -> "bloom.down").
+// empty when the name has fewer than `segs` segments. group_prefix is the segs==1 case; this generalizes
+// it so a group tree can partition a deeper level (bloom.down vs bloom.up) at each recursion step.
+static WGPUStringView group_prefix_n(WGPUStringView name, int segs)
+{
+	size_t n = sv_length(name); int seen = 0;
+	for (size_t i = 0; i < n; ++i)
+		if (name.data[i] == '.' && ++seen == segs) return WGPUStringView{ name.data, i };
+	return (seen + 1 == segs) ? name : WGPUStringView{};   // exactly `segs` segments -> whole name is the prefix
+}
+
+// one node of the group tree: a contiguous run [gi, gj) of box[] (passes are declared grouped, so a
+// dotted-name group is always contiguous). gtree[0] is the root (whole graph, empty prefix). a node's
+// kids are deeper sub-runs; passes in [gi,gj) not covered by any kid are this node's leaf members. layout
+// fields are filled post-order by layout_gnode (w/h + interface pins, relative to the node's content origin).
+struct GNode {
+	WGPUStringView prefix;     // full dotted prefix at this depth ("bloom", "bloom.down"); empty at root
+	int gi, gj, depth;
+	bool collapsed;
+	std::vector<int> kids;     // child GNode indices in the gtree arena
+	float w, h;                // box (collapsed) or region (expanded) size, content-local
+	int nIn, nOut;
+	uint32_t inId[kRgGPinMax], outId[kRgGPinMax];
+	float inY[kRgGPinMax], outY[kRgGPinMax];   // interface pin y, relative to the node top
+};
+
+// build the group tree over box[gi, gj) at `depth`, appending nodes to gtree; returns the new node's index.
+// partitions the range into maximal sub-runs sharing their first (depth+1) name segments; a run of >=2 (that
+// isn't the whole range -- that would just re-wrap the same passes) becomes a child group and recurses.
+// collapse state is the same tri-state ImGuiStorage read the draw uses (0 follow-default / 1 open / 2 closed).
+static int build_gtree(std::vector<GNode>& gtree, const RgDagBox* box, int n,
+	ImGuiStorage* grpStore, bool collapseDefault, int gi, int gj, int depth, WGPUStringView prefix)
+{
+	int self = (int)gtree.size();
+	gtree.push_back(GNode{});
+	GNode g{};
+	g.prefix = prefix; g.gi = gi; g.gj = gj; g.depth = depth;
+	if (sv_length(prefix)) { int st = grpStore->GetInt(rg_grp_key(prefix), 0); g.collapsed = st == 2 ? true : st == 1 ? false : collapseDefault; }
+	for (int a = gi; a < gj;) {
+		WGPUStringView sub = group_prefix_n(box[a].p->name, depth + 1);
+		int b = a + 1;
+		while (b < gj && sv_length(sub) && sv_eq(group_prefix_n(box[b].p->name, depth + 1), sub)) ++b;
+		if (sv_length(sub) && b - a >= 2 && !(a == gi && b == gj))
+			g.kids.push_back(build_gtree(gtree, box, n, grpStore, collapseDefault, a, b, depth + 1, sub));
+		a = b;
+	}
+	gtree[self] = std::move(g);
+	return self;
+}
+
+// collOwner[k] = the OUTERMOST collapsed group ancestor of pass k (-1 = visible at every level). a pass with
+// an owner is hidden; the owner's first member (gtree[owner].gi) is the rep that stands in for the whole
+// collapsed subtree. one notion for collapse at any depth -- a top-level collapsed group and a collapsed
+// nested subgroup differ only in where their rep cell is laid out, not in how membership is decided.
+static void rg_mark_collapsed(const std::vector<GNode>& gt, int* collOwner, int node, int owner)
+{
+	const GNode& g = gt[node];
+	int myOwner = owner;
+	if (owner < 0 && sv_length(g.prefix) && g.collapsed) myOwner = node;
+	if (myOwner >= 0) for (int k = g.gi; k < g.gj; ++k) if (collOwner[k] < 0) collOwner[k] = myOwner;
+	for (int kid : g.kids) rg_mark_collapsed(gt, collOwner, kid, myOwner);
+}
+
 static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 {
 	float kBoxW = 190.0f, kColGap = 65.0f, kRowGap = 50.0f;
@@ -456,6 +559,37 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	float kPinR = 5.0f, kPinHit = 8.0f;
 	float kRegionPad = 14.0f, kInnerGap = 10.0f;   // region: inner padding + vertical gap between stacked members
 	float kInnerColGap = 46.0f;                    // horizontal gap between inner dependency columns (chain spacing)
+
+	// pan + zoom state, shared between the wheel handler here and the canvas below. kept at function scope so
+	// the wheel is resolved BEFORE layout -- positions, scrolling and font then all use one zoom this frame
+	// (resolving it after layout drew the graph at the old scale for a frame -> flicker).
+	static ImVec2 scrolling(0, 0);
+	static bool userMoved = false;          // true once the user pans/zooms; until then keep the graph centred
+	static bool s_canvasHovered = false;    // last frame's hover (input is read before the canvas item exists)
+	static ImVec2 s_winPos(0, 0);           // last frame's canvas top-left, for the cursor-anchored zoom
+
+	// zoom: 1.0 = closest (the authored sizes), the wheel only zooms OUT toward the cursor. every layout
+	// constant scales by it so layout + screen draw stay one coordinate system; text scales separately via
+	// the child font scale below (SetWindowFontScale).
+	static float zoom = 1.0f;
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		if (s_canvasHovered && io.MouseWheel != 0.0f) {
+			float z0 = zoom;
+			zoom *= io.MouseWheel > 0 ? 1.1f : 1.0f / 1.1f;
+			if (zoom > 1.0f) zoom = 1.0f;
+			if (zoom < 0.2f) zoom = 0.2f;
+			float r = zoom / z0;   // positions rescale by r this frame; anchor the canvas point under the cursor
+			scrolling.x = io.MousePos.x - s_winPos.x - (io.MousePos.x - s_winPos.x - scrolling.x) * r;
+			scrolling.y = io.MousePos.y - s_winPos.y - (io.MousePos.y - s_winPos.y - scrolling.y) * r;
+			userMoved = true;
+		}
+	}
+	const float z = zoom;
+	kBoxW *= z; kColGap *= z; kRowGap *= z;
+	kHeaderH *= z; kFooterH *= z; kPinRowH *= z; kMinBodyH *= z;
+	kPinR *= z; kPinHit *= z;
+	kRegionPad *= z; kInnerGap *= z; kInnerColGap *= z;
 
 
 	// virtual nodes (frame-boundary endpoints: temporal read/write so far) -- toggled from the toolbar.
@@ -538,6 +672,18 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	for (int i = 0; i < n; ++i) colOf[i] = remap[colOf[i]];
 	maxDist = nextCol ? nextCol - 1 : 0;
 
+	// group tree: the recursive replacement for the per-level group/subgroup detection scattered below. built
+	// here (columns are final) and consumed by the layout + draw. not yet wired into layout -- the reservation
+	// blocks below still run; this just stands up the structure (and asserts it covers every pass).
+	static std::vector<GNode> gtree; gtree.clear();
+	build_gtree(gtree, box, n, grpStore, collapseDefault, 0, n, 0, WGPUStringView{});
+	IM_ASSERT(gtree[0].gi == 0 && gtree[0].gj == n);
+	int collOwner[kRgDagMax]; for (int i = 0; i < n; ++i) collOwner[i] = -1;
+	rg_mark_collapsed(gtree, collOwner, 0, -1);
+	// a pass inside ANY collapsed group (top-level or subgroup) is not drawn as its own box -- the collapsed
+	// group draws one compact node in its place. unifies the old collapsedBox (top-level) + sgHidden (subgroup).
+	bool drawHidden[kRgDagMax]; for (int i = 0; i < n; ++i) drawHidden[i] = collOwner[i] >= 0;
+
 	// ---- collapsed-group slot reservation (pre-layout): a collapsed group must occupy ONE compact slot,
 	// like a virtual node -- otherwise its members overflow their boxes or span columns full of unrelated
 	// passes, and the group node collides. so BEFORE the slot packer runs, give each collapsed group's
@@ -562,7 +708,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// compact box with the count); the others hide and its inner columns compact. sgHidden = non-rep member
 	// (skip everywhere); sgCount = member count on the rep (>0 => draw compact).
 	bool sgHidden[kRgDagMax]; int sgCount[kRgDagMax];
-	for (int i = 0; i < n; ++i) { sgHidden[i] = false; sgCount[i] = 0; }
+	float repH[kRgDagMax];   // collapsed subgroup: the rep cell's compact-node height (sized from its interface, not the rep pass box)
+	for (int i = 0; i < n; ++i) { sgHidden[i] = false; sgCount[i] = 0; repH[i] = 0.0f; }
 	{
 		for (int a = 0; a < n;) {
 			WGPUStringView pre = group_prefix(box[a].p->name);
@@ -572,33 +719,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 					int st = grpStore->GetInt(rg_grp_key(pre), 0);
 				if (st == 2 || (st != 1 && collapseDefault)) {
 					uint32_t inId[kRgGPinMax], outId[kRgGPinMax]; int ni = 0, no = 0;
-					for (int k = a; k < b; ++k) { PassNode* p = box[k].p;
-						for (uint32_t ci = 0; ci < p->accessCount; ++ci) {
-							if (!rg_access_reads(p->accesses[ci])) continue;
-							uint32_t id = p->accesses[ci].handle.id;
-							int pr = rg_producer_of(box, n, p, id);
-							if (pr >= a && pr < b) continue;
-							bool sn = false; for (int x = 0; x < ni; ++x) sn |= inId[x] == id;
-							if (!sn && ni < kRgGPinMax) inId[ni++] = id;
-						}
-					}
-					for (int k = a; k < b; ++k) { PassNode* p = box[k].p;
-						for (uint32_t ci = 0; ci < p->accessCount; ++ci) {
-							if (!access_is_write(p->accesses[ci].type)) continue;
-							uint32_t id = p->accesses[ci].handle.id;
-							ResourceNode* r = find_node(rg, { id });
-							bool ext = r && (r->imported || r->persistent);   // temporal write leaves to next frame -> group output
-							for (int j = 0; j < n && !ext; ++j) {
-								if (j >= a && j < b) continue;
-								if (rg_in_slot(box[j].p, id) < 0) continue;
-								int pr = rg_producer_of(box, n, box[j].p, id);
-								if (pr >= a && pr < b) ext = true;
-							}
-							if (!ext) continue;
-							bool sn = false; for (int x = 0; x < no; ++x) sn |= outId[x] == id;
-							if (!sn && no < kRgGPinMax) outId[no++] = id;
-						}
-					}
+					rg_group_interface(rg, box, n, a, b, inId, ni, outId, no);
 					int rows = ni > no ? ni : no;
 					effH[a] = kHeaderH + (rows ? rows * kPinRowH : kMinBodyH) + kFooterH;
 					for (int k = a + 1; k < b; ++k) effH[k] = 0.0f;
@@ -630,19 +751,26 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 					int colMin = colOf[a]; for (int k = a; k < b; ++k) if (colOf[k] < colMin) colMin = colOf[k];
 					int rawCols = 1;
 					for (int k = a; k < b; ++k) { innerCol[k] = colOf[k] - colMin; if (innerCol[k] + 1 > rawCols) rawCols = innerCol[k] + 1; }
-					// fold collapsed subgroups (same-name runs): pull members onto the run's first inner column,
-					// hide all but the first (the rep), and mark the vacated columns so the remap compacts them.
+					// fold collapsed subgroups: each outermost collapsed descendant (collOwner) pulls its whole
+					// subtree onto its leftmost inner column, hides the rest (the rep stays), and marks the vacated
+					// columns so the remap compacts them. tree-driven, so it nests to any depth.
 					bool absorbed[kRgDagMax]; for (int c = 0; c < rawCols; ++c) absorbed[c] = false;
 					for (int sa = a; sa < b;) {
-						int sb = sa + 1; while (sb < b && sv_eq(box[sb].p->name, box[sa].p->name)) ++sb;
-						if (sb - sa >= 2 && !(sa == a && sb == b) && grpStore->GetInt(rg_grp_key(box[sa].p->name), 0) == 2) {
-							int rmin = innerCol[sa], rmax = innerCol[sa];
-							for (int k = sa; k < sb; ++k) { if (innerCol[k] < rmin) rmin = innerCol[k]; if (innerCol[k] > rmax) rmax = innerCol[k]; }
-							for (int c = rmin + 1; c <= rmax; ++c) absorbed[c] = true;
-							for (int k = sa; k < sb; ++k) innerCol[k] = rmin;
-							sgCount[sa] = sb - sa; for (int k = sa + 1; k < sb; ++k) sgHidden[k] = true;
+						int o = collOwner[sa];
+						if (o < 0) { ++sa; continue; }
+						int sgi = gtree[o].gi, sgj = gtree[o].gj;   // collapsed subtree -> one rep cell at sgi
+						int rmin = innerCol[sgi], rmax = innerCol[sgi];
+						for (int k = sgi; k < sgj; ++k) { if (innerCol[k] < rmin) rmin = innerCol[k]; if (innerCol[k] > rmax) rmax = innerCol[k]; }
+						for (int c = rmin + 1; c <= rmax; ++c) absorbed[c] = true;
+						for (int k = sgi; k < sgj; ++k) innerCol[k] = rmin;
+						sgCount[sgi] = sgj - sgi; for (int k = sgi + 1; k < sgj; ++k) sgHidden[k] = true;
+						{   // size the rep cell as a compact node (header + interface rows + footer), like a collapsed top-level group
+							uint32_t ii[kRgGPinMax], oo[kRgGPinMax]; int gni = 0, gno = 0;
+							rg_group_interface(rg, box, n, sgi, sgj, ii, gni, oo, gno);
+							int grows = gni > gno ? gni : gno;
+							repH[sgi] = kHeaderH + (grows ? grows * kPinRowH : kMinBodyH) + kFooterH;
 						}
-						sa = sb;
+						sa = sgj;
 					}
 					int remapIC[kRgDagMax]; int innerCols = 0;
 					for (int c = 0; c < rawCols; ++c) remapIC[c] = absorbed[c] ? innerCols - 1 : innerCols++;
@@ -652,7 +780,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 					// (routing internal edges through dummy lanes is phase 2b -- here members just get good y's.)
 					static std::vector<int> ilcol[kRgDagMax]; for (int c = 0; c <= innerCols; ++c) ilcol[c].clear();
 					static int inode[kRgDagMax]; static std::vector<int> imem; imem.clear(); static std::vector<float> ih; ih.clear();
-					for (int k = a; k < b; ++k) { inode[k] = -1; if (sgHidden[k]) continue; inode[k] = (int)imem.size(); ilcol[innerCol[k]].push_back((int)imem.size()); imem.push_back(k); ih.push_back(box[k].h); }
+					for (int k = a; k < b; ++k) { inode[k] = -1; if (sgHidden[k]) continue; inode[k] = (int)imem.size(); ilcol[innerCol[k]].push_back((int)imem.size()); imem.push_back(k); ih.push_back(sgCount[k] > 0 ? repH[k] : box[k].h); }
 					int iNm = (int)imem.size(); struct IEB { int srcN, dstN, src, dst; uint32_t id; int ndum, dum[8]; }; static std::vector<IEB> ieb; ieb.clear();
 					static std::vector<std::vector<int>> illeft, ilright; illeft.assign(kRgDagMax, {}); ilright.assign(kRgDagMax, {});
 					for (int k = a; k < b; ++k) {
@@ -708,7 +836,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	auto push_tnode = [&](bool isRead, int passBox, int pin, ResourceNode* res, const char* cap, ImU32 tint) {
 		char b[48]; std::snprintf(b, sizeof b, "%.*s", (int)res->name.length, res->name.data ? res->name.data : "?");
 		ImVec2 ns = ImGui::CalcTextSize(b), cs = ImGui::CalcTextSize(cap);
-		float w = (ns.x > cs.x ? ns.x : cs.x) + 16, h = ns.y + cs.y + 10;
+		float w = ((ns.x > cs.x ? ns.x : cs.x) + 16) * zoom, h = (ns.y + cs.y + 10) * zoom;
 		tnodes.push_back({ isRead, passBox, pin, res, isRead ? colOf[passBox] - 1 : colOf[passBox] + 1, w, h, cap, tint, -1 });
 	};
 	if (showVirtual)
@@ -774,11 +902,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// temporal nodes join the layered list as their own (box == -1, tn >= 0) layered nodes.
 	for (int ti = 0; ti < (int)tnodes.size(); ++ti) { tnodes[ti].li = (int)lnode.size(); lnode.push_back({ tnodes[ti].col, -1, ti, 0, 0 }); }
 
-	// per-column members (reals + dummies + temporal) + left/right neighbour lists for the barycenter.
+	// left/right neighbour lists for the barycenter (per-column members built after the per-component remap below).
 	const int LN = (int)lnode.size();
-	static std::vector<int> lcol[kRgDagMax];
-	for (int c = 0; c <= maxDist; ++c) lcol[c].clear();
-	for (int li = 0; li < LN; ++li) lcol[lnode[li].col].push_back(li);
 	static std::vector<std::vector<int>> lleft, lright; lleft.assign(LN, {}); lright.assign(LN, {});
 	for (REdge& e : edge) {
 		int prev = e.src;
@@ -791,13 +916,56 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		if (t.isRead) { lright[t.li].push_back(t.passBox); lleft[t.passBox].push_back(t.li); }
 		else          { lright[t.passBox].push_back(t.li); lleft[t.li].push_back(t.passBox); }
 
+	// ---- independent work graphs: lay each out on its own. disconnected components (separate frame pipelines
+	// sharing no resource) were right-anchored to the global sink column, so they shared column buckets -- the
+	// barycenter + column-width passes then cross-influenced them. union nodes over the adjacency, then give
+	// each component its OWN disjoint, dense column range starting at its base. a component is gap-free within
+	// its span (every skipped column carries an edge dummy), so base + (col - min) densely remaps it and the
+	// per-component ranges sum to <= n columns. now each column bucket holds one component => the relax + colW
+	// see only that component; the x write left-aligns each to its base, and a vertical band separates them.
+	static std::vector<int> comp; comp.assign(LN, 0);
+	static std::vector<int> compMinCol; compMinCol.assign(LN, 1 << 30);
+	{
+		for (int li = 0; li < LN; ++li) comp[li] = li;
+		auto cfind = [&](int x) { while (comp[x] != x) { comp[x] = comp[comp[x]]; x = comp[x]; } return x; };
+		for (int li = 0; li < LN; ++li) { for (int x : lleft[li]) comp[cfind(li)] = cfind(x); for (int x : lright[li]) comp[cfind(li)] = cfind(x); }
+		for (int li = 0; li < LN; ++li) comp[li] = cfind(li);
+		// compact each component root to a first-seen id (reals come first, so this is exec order).
+		static std::vector<int> cid; cid.assign(LN, -1); int numComp = 0;
+		for (int li = 0; li < LN; ++li) if (cid[comp[li]] < 0) cid[comp[li]] = numComp++;
+		static std::vector<int> cMin, cMax; cMin.assign(numComp, 1 << 30); cMax.assign(numComp, -1);
+		for (int li = 0; li < LN; ++li) { int c = cid[comp[li]], oc = lnode[li].col; if (oc < cMin[c]) cMin[c] = oc; if (oc > cMax[c]) cMax[c] = oc; }
+		static std::vector<int> cBase; cBase.assign(numComp, 0); int acc = 0;
+		for (int c = 0; c < numComp; ++c) { cBase[c] = acc; acc += cMax[c] - cMin[c] + 1; }
+		for (int li = 0; li < LN; ++li) { int c = cid[comp[li]]; lnode[li].col = cBase[c] + (lnode[li].col - cMin[c]); }
+		for (int i = 0; i < n; ++i) colOf[i] = lnode[i].col;   // reals: lnode i == box i; keep colW indexing in sync
+		maxDist = acc > 0 ? acc - 1 : 0;
+		for (int li = 0; li < LN; ++li) if (lnode[li].col < compMinCol[comp[li]]) compMinCol[comp[li]] = lnode[li].col;
+	}
+
+	// per-column members (reals + dummies + temporal), now that columns are final per-component.
+	static std::vector<int> lcol[kRgDagMax];
+	for (int c = 0; c <= maxDist; ++c) lcol[c].clear();
+	for (int li = 0; li < LN; ++li) lcol[lnode[li].col].push_back(li);
+
 	// barycenter crossing-reduction + y-relax, factored out so each expanded group's interior reuses it.
 	// materialize node heights first: a box -> its reserved height, a temporal node -> its own, dummy -> a lane.
-	const float kLane = 16.0f;
+	const float kLane = 16.0f * zoom;
 	static std::vector<float> lh; lh.assign(LN, 0.0f);
 	for (int li = 0; li < LN; ++li) { int b = lnode[li].box; lh[li] = b >= 0 ? effH[b] : (lnode[li].tn >= 0 ? tnodes[lnode[li].tn].h : kLane); }
 	static std::vector<float> cy; cy.assign(LN, 0.0f);
 	rg_barycenter_relax(lcol, maxDist, lleft, lright, lh, cy, kRowGap);
+
+	// stack the components into disjoint vertical bands (the relax floats every column from y=0). running cursor,
+	// first-seen order, each component shifted below the previous one's extent.
+	{
+		static std::vector<float> cTop, cBot, cOff; static std::vector<char> seen;
+		cTop.assign(LN, 1e30f); cBot.assign(LN, -1e30f); cOff.assign(LN, 0.0f); seen.assign(LN, 0);
+		for (int li = 0; li < LN; ++li) { float t = cy[li] - lh[li] * 0.5f, b = cy[li] + lh[li] * 0.5f; if (t < cTop[comp[li]]) cTop[comp[li]] = t; if (b > cBot[comp[li]]) cBot[comp[li]] = b; }
+		float cursor = 0.0f;
+		for (int li = 0; li < LN; ++li) { int c = comp[li]; if (seen[c]) continue; seen[c] = 1; cOff[c] = cursor - cTop[c]; cursor += (cBot[c] - cTop[c]) + kRowGap * 2.0f; }
+		for (int li = 0; li < LN; ++li) cy[li] += cOff[comp[li]];
+	}
 
 	// write positions + the graph's bounding box (canvas-local), used to centre the view.
 	float gxMin = 1e30f, gyMin = 1e30f, gxMax = -1e30f, gyMax = -1e30f;
@@ -808,8 +976,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	for (int i = 0; i < n; ++i) if (effW[i] > colW[colOf[i]]) colW[colOf[i]] = effW[i];
 	colX[0] = 0; for (int c = 1; c <= maxDist; ++c) colX[c] = colX[c - 1] + colW[c - 1] + kColGap;
 	for (int c = 0; c <= maxDist; ++c) {
-		float cx = colX[c];
 		for (int li : lcol[c]) {
+			float cx = colX[c] - colX[compMinCol[comp[li]]];   // left-align this component to x=0
 			if (lnode[li].box >= 0) {
 				int b = lnode[li].box; box[b].tl = ImVec2(cx, cy[li] - effH[b] * 0.5f); box[b].layer = c;
 				if (cx < gxMin) gxMin = cx; if (cx + effW[b] > gxMax) gxMax = cx + effW[b];
@@ -873,29 +1041,30 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	ImGui::SameLine(); ImGui::Checkbox("collapse groups", &collapseDefault);   // default state; a group header click overrides
 	const bool filterActive = filter[0] != 0;
 
-	// pannable canvas: a static scroll offset (drag left/middle to pan) + a grid, after the imgui node-
-	// graph example. no scrollbar -- navigation is panning, so a big graph isn't boxed in.
-	static ImVec2 scrolling(0, 0);
-	static bool userMoved = false;   // true once the user pans; until then keep the graph centred
+	// pannable canvas: drag left/middle to pan, wheel to zoom (handled at the top, before layout) + a grid,
+	// after the imgui node-graph example. no scrollbar -- navigation is panning, so a big graph isn't boxed in.
 	ImGui::BeginChild("rg_canvas", ImVec2(0, 0), true,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove);
+	ImGui::SetWindowFontScale(zoom);   // text scales with the canvas; restored to 1.0 before the overlays
 	ImGuiIO& io = ImGui::GetIO();
 	const ImVec2 winPos = ImGui::GetCursorScreenPos();
 	const ImVec2 winSize = ImGui::GetContentRegionAvail();
 	ImGui::InvisibleButton("canvas", ImVec2(winSize.x > 0 ? winSize.x : 1, winSize.y > 0 ? winSize.y : 1));
 	const bool canvasHovered = ImGui::IsItemHovered();
 	const bool canvasActive = ImGui::IsItemActive();
+	s_canvasHovered = canvasHovered; s_winPos = winPos;   // for next frame's wheel zoom (resolved pre-layout)
 	bool panned = false;
 	if (canvasActive && (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f))) {
 		scrolling.x += io.MouseDelta.x; scrolling.y += io.MouseDelta.y; userMoved = true; panned = true;
 	}
-	// keep the graph centred in the viewport until the user pans. this rides through the first frames where
-	// the child's content region is still settling (a one-shot centre there latches against a bogus size).
-	// the Reset button and a double-click re-arm it.
+	// snap to the graph's top-left corner (small margin) until the user pans. this rides through the first
+	// frames where the child's content region is still settling. the Reset button + a double-click re-arm it.
 	if (doReset || (canvasHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) userMoved = false;
+	if (doReset) zoom = 1.0f;   // Reset view also returns to the closest zoom
 	if (!userMoved && !panned && winSize.x > 1 && winSize.y > 1) {
-		scrolling.x = winSize.x * 0.5f - (gxMin + gxMax) * 0.5f;
-		scrolling.y = winSize.y * 0.5f - (gyMin + gyMax) * 0.5f;
+		const float kCornerPad = 40.0f;
+		scrolling.x = kCornerPad - gxMin;
+		scrolling.y = kCornerPad - gyMin;
 	}
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	const ImVec2 origin(winPos.x + scrolling.x, winPos.y + scrolling.y);   // panned top-left; node coords add this
@@ -914,16 +1083,14 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// is a tri-state in ImGuiStorage (0 follow-default, 1 force-open, 2 force-closed) so it survives the
 	// per-frame rebuild and the toolbar default can flip every group at once.
 	struct GView {
-		int gi, gj; WGPUStringView prefix; bool collapsed; ImGuiID key;
+		int gi, gj, depth; WGPUStringView prefix; bool collapsed; ImGuiID key;   // depth 1 = top-level group, >=2 = subgroup
 		ImVec2 bb0, bb1, h0, h1;                                    // box rect + header (click) rect, screen
 		int nIn, nOut; uint32_t inId[kRgGPinMax], outId[kRgGPinMax];
 		ImVec2 inC[kRgGPinMax], outC[kRgGPinMax]; bool inDrawn[kRgGPinMax];
 	};
 	static std::vector<GView> groups; groups.clear();
-	struct SgClick { ImVec2 h0, h1; ImGuiID key; };   // subgroup label click target (toggles its collapse)
-	static std::vector<SgClick> sgClicks; sgClicks.clear();
-	int collapsedBox[kRgDagMax], mapTo[kRgDagMax], groupOf[kRgDagMax];
-	for (int i = 0; i < n; ++i) { collapsedBox[i] = 0; mapTo[i] = i; groupOf[i] = -1; }
+	static std::vector<int> nodeGView; nodeGView.assign(gtree.size(), -1);   // gtree node index -> its GView in groups (subgroups), else -1
+	int groupOf[kRgDagMax]; for (int i = 0; i < n; ++i) groupOf[i] = -1;
 	for (int gi = 0; gi < n;) {
 		WGPUStringView pre = group_prefix(box[gi].p->name);
 		int gj = gi + 1;
@@ -937,42 +1104,14 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			if (ax + box[k].w > x1) x1 = ax + box[k].w; if (ay + box[k].h > y1) y1 = ay + box[k].h;
 		}
 
-		GView g{}; g.gi = gi; g.gj = gj; g.prefix = pre; g.key = rg_grp_key(pre);
+		GView g{}; g.gi = gi; g.gj = gj; g.depth = 1; g.prefix = pre; g.key = rg_grp_key(pre);
 		int st = grpStore->GetInt(g.key, 0);
 		g.collapsed = st == 2 ? true : st == 1 ? false : collapseDefault;
 
 		// external interface pins, computed for collapsed AND expanded groups: a member read whose producer
 		// is outside the group -> in-pin; an external/imported/persistent member write -> out-pin. interior
 		// resources (produced + consumed within the group, e.g. bloom's mips) get no pin.
-		for (int k = gi; k < gj; ++k) {
-			PassNode* p = box[k].p;
-			for (uint32_t ai = 0; ai < p->accessCount; ++ai) {
-				if (!rg_access_reads(p->accesses[ai])) continue;
-				uint32_t id = p->accesses[ai].handle.id;
-				int prod = rg_producer_of(box, n, p, id);
-				if (prod >= gi && prod < gj) continue;
-				bool seen = false; for (int s = 0; s < g.nIn; ++s) seen |= g.inId[s] == id;
-				if (!seen && g.nIn < kRgGPinMax) g.inId[g.nIn++] = id;
-			}
-		}
-		for (int k = gi; k < gj; ++k) {
-			PassNode* p = box[k].p;
-			for (uint32_t ai = 0; ai < p->accessCount; ++ai) {
-				if (!access_is_write(p->accesses[ai].type)) continue;
-				uint32_t id = p->accesses[ai].handle.id;
-				ResourceNode* r = find_node(rg, { id });
-				bool external = r && (r->imported || r->persistent);   // temporal write leaves to next frame -> group output
-				for (int j = 0; j < n && !external; ++j) {
-					if (j >= gi && j < gj) continue;
-					if (rg_in_slot(box[j].p, id) < 0) continue;
-					int pr = rg_producer_of(box, n, box[j].p, id);
-					if (pr >= gi && pr < gj) external = true;
-				}
-				if (!external) continue;
-				bool seen = false; for (int s = 0; s < g.nOut; ++s) seen |= g.outId[s] == id;
-				if (!seen && g.nOut < kRgGPinMax) g.outId[g.nOut++] = id;
-			}
-		}
+		rg_group_interface(rg, box, n, gi, gj, g.inId, g.nIn, g.outId, g.nOut);
 
 		if (!g.collapsed) {
 			// exclusive bordered region: members stacked vertically inside it. the slot was reserved at region
@@ -987,39 +1126,11 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			dl->AddRect(a, b, gcol, 6.0f, 0, 2.0f);
 			char lbl[64]; std::snprintf(lbl, sizeof lbl, "[-] %.*s  x%d", (int)sv_length(pre), pre.data, gj - gi);
 			dl->AddText(ImVec2(a.x + 6, a.y + 3), gcol, lbl);
-			// subgroups: a same-name run (>=2) of members inside the region gets its own nested border
-			// (bloom.down, bloom.up). being chains, they occupy disjoint contiguous inner columns, so the
-			// nested borders never overlap; the suffix colour (group_color of the full name) distinguishes them.
-			for (int sa = gi; sa < gj;) {
-				int sb = sa + 1;
-				while (sb < gj && sv_eq(rgn[sb].pass->name, rgn[sa].pass->name)) ++sb;
-				if (sb - sa >= 2 && !(sa == gi && sb == gj)) {   // skip a run that IS the whole group (no sub-structure)
-					float sx0 = 1e30f, sy0 = 1e30f, sx1 = -1e30f, sy1 = -1e30f;
-					for (int k = sa; k < (sgCount[sa] > 0 ? sa + 1 : sb); ++k) {   // collapsed -> frame only the rep
-						float kx = origin.x + rgn[k].pos.x, ky = origin.y + rgn[k].pos.y;
-						if (kx < sx0) sx0 = kx; if (ky < sy0) sy0 = ky;
-						if (kx + rgn[k].w > sx1) sx1 = kx + rgn[k].w; if (ky + rgn[k].h > sy1) sy1 = ky + rgn[k].h;
-					}
-					dl->AddRect(ImVec2(sx0 - 6, sy0 - 6), ImVec2(sx1 + 6, sy1 + 6), group_color(rgn[sa].pass->name), 5.0f, 0, 1.5f);
-					{   // clickable [-]/[+] badge above the subgroup that toggles its collapse
-						WGPUStringView snm = rgn[sa].pass->name; size_t off = sv_length(pre) + 1;
-						char slbl[40]; std::snprintf(slbl, sizeof slbl, "%s %.*s x%d", sgCount[sa] > 0 ? "[+]" : "[-]",
-							off < sv_length(snm) ? (int)(sv_length(snm) - off) : (int)sv_length(snm),
-							off < sv_length(snm) ? snm.data + off : snm.data, sb - sa);
-						ImVec2 sts = ImGui::CalcTextSize(slbl), slp(sx0 - 6, sy0 - 6 - sts.y - 1);
-						ImVec2 c0(slp.x - 2, slp.y - 1), c1(slp.x + sts.x + 2, slp.y + sts.y + 1);
-						dl->AddRectFilled(c0, c1, IM_COL32(18, 20, 28, 230), 3.0f);
-						dl->AddText(slp, group_color(snm), slbl);
-						sgClicks.push_back({ c0, c1, rg_grp_key(snm) });
-					}
-				}
-				sa = sb;
-			}
 			g.bb0 = a; g.bb1 = b; g.h0 = a; g.h1 = ImVec2(b.x, a.y + kHeaderH);
-			// border interface pins: distribute evenly down the left (in) / right (out) region edges so the
-			// dots always fit regardless of region height. ponytail: even spread, not aligned to the member.
-			for (int s = 0; s < g.nIn; ++s)  g.inC[s]  = ImVec2(a.x, a.y + kHeaderH + kRegionPad + gInY[gi][s]);   // border-in pin y from the interior relax
-			for (int s = 0; s < g.nOut; ++s) g.outC[s] = ImVec2(b.x, a.y + kHeaderH + kRegionPad + gOutY[gi][s]);   // border-out pin y from the interior relax
+			// border interface pins, top-aligned in rows like a pass node + collapsed group (reads down the left,
+			// writes down the right). starts just under the header label.
+			for (int s = 0; s < g.nIn; ++s)  g.inC[s]  = ImVec2(a.x, a.y + kHeaderH + s * kPinRowH + kPinRowH * 0.5f);
+			for (int s = 0; s < g.nOut; ++s) g.outC[s] = ImVec2(b.x, a.y + kHeaderH + s * kPinRowH + kPinRowH * 0.5f);
 		}
 		else {
 			int rows = g.nIn > g.nOut ? g.nIn : g.nOut;
@@ -1037,8 +1148,65 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		}
 
 		int idxG = (int)groups.size(); groups.push_back(g);
-		for (int k = gi; k < gj; ++k) { groupOf[k] = idxG; if (g.collapsed) { collapsedBox[k] = 1; mapTo[k] = gi; } }
+		for (int k = gi; k < gj; ++k) groupOf[k] = idxG;
 		gi = gj;
+	}
+
+	// subgroups as first-class groups: every gtree node below the top level becomes a GView too, so the same
+	// draw / click / pin passes treat it exactly like a top-level group. collapsed -> a compact node (members
+	// hidden); expanded -> a bordered region with border pins. tree-driven, nests to any depth.
+	// pass 1: rects, deepest-first (reverse gtree order = children before parents) so a parent's border encloses
+	// its child borders with a gap and members never sit flush. pass 2 builds the GViews parent-first.
+	static std::vector<ImVec2> subA, subB; subA.assign(gtree.size(), ImVec2(0, 0)); subB.assign(gtree.size(), ImVec2(0, 0));
+	const float kSubPad = 11.0f * zoom;   // gap from a subgroup border to its members / nested child borders
+	for (int gni = (int)gtree.size() - 1; gni >= 1; --gni) {
+		GNode& g2 = gtree[gni];
+		if (g2.depth < 2 || !sv_length(g2.prefix)) continue;
+		if (collOwner[g2.gi] >= 0 && collOwner[g2.gi] != gni) continue;   // inside a collapsed ancestor -> not drawn
+		if (g2.collapsed) {   // compact node over the rep cell (sized compact at layout time via repH)
+			uint32_t ii[kRgGPinMax], oo[kRgGPinMax]; int ni = 0, no = 0; rg_group_interface(rg, box, n, g2.gi, g2.gj, ii, ni, oo, no);
+			int rows = ni > no ? ni : no;
+			ImVec2 a(origin.x + rgn[g2.gi].pos.x, origin.y + rgn[g2.gi].pos.y);
+			subA[gni] = a; subB[gni] = ImVec2(a.x + kBoxW, a.y + kHeaderH + (rows ? rows * kPinRowH : kMinBodyH) + kFooterH);
+			continue;
+		}
+		float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+		for (int k = g2.gi; k < g2.gj; ++k) {
+			if (collOwner[k] >= 0 && k != gtree[collOwner[k]].gi) continue;   // folded member -> not framed
+			float kx = origin.x + rgn[k].pos.x, ky = origin.y + rgn[k].pos.y;
+			if (kx < x0) x0 = kx; if (ky < y0) y0 = ky;
+			if (kx + rgn[k].w > x1) x1 = kx + rgn[k].w; if (ky + rgn[k].h > y1) y1 = ky + rgn[k].h;
+		}
+		for (int kid : g2.kids) {   // enclose child subgroup borders (computed already, this pass runs deepest-first)
+			if (subB[kid].x < subA[kid].x) continue;
+			if (subA[kid].x < x0) x0 = subA[kid].x; if (subA[kid].y < y0) y0 = subA[kid].y;
+			if (subB[kid].x > x1) x1 = subB[kid].x; if (subB[kid].y > y1) y1 = subB[kid].y;
+		}
+		if (x1 < x0) continue;
+		subA[gni] = ImVec2(x0 - kSubPad, y0 - kSubPad - kHeaderH); subB[gni] = ImVec2(x1 + kSubPad, y1 + kSubPad);
+	}
+	for (int gni = 1; gni < (int)gtree.size(); ++gni) {
+		GNode& g2 = gtree[gni];
+		if (g2.depth < 2 || !sv_length(g2.prefix)) continue;
+		if (collOwner[g2.gi] >= 0 && collOwner[g2.gi] != gni) continue;
+		if (subB[gni].x < subA[gni].x) continue;   // nothing visible
+		GView g{}; g.gi = g2.gi; g.gj = g2.gj; g.depth = g2.depth; g.prefix = g2.prefix;
+		g.key = rg_grp_key(g2.prefix); g.collapsed = g2.collapsed;
+		rg_group_interface(rg, box, n, g2.gi, g2.gj, g.inId, g.nIn, g.outId, g.nOut);
+		ImVec2 a = subA[gni], b = subB[gni];
+		g.bb0 = a; g.bb1 = b; g.h0 = a; g.h1 = ImVec2(b.x, a.y + kHeaderH);
+		if (!g.collapsed) {   // expanded: bordered region + label (the compact-node pass draws the collapsed ones)
+			ImU32 sc = group_color(g2.prefix);
+			dl->AddRect(a, b, sc, 5.0f, 0, 1.5f);
+			WGPUStringView sn = g2.prefix; size_t off = 0; for (size_t i = 0; i < sv_length(sn); ++i) if (sn.data[i] == '.') off = i + 1;
+			char slbl[48]; std::snprintf(slbl, sizeof slbl, "[-] %.*s x%d", (int)(sv_length(sn) - off), sn.data + off, g2.gj - g2.gi);
+			dl->AddText(ImVec2(a.x + 4, a.y + 1), sc, slbl);
+		}
+		// border pins top-aligned in rows, like pass nodes and collapsed groups.
+		for (int s = 0; s < g.nIn; ++s)  g.inC[s]  = ImVec2(a.x, a.y + kHeaderH + s * kPinRowH + kPinRowH * 0.5f);
+		for (int s = 0; s < g.nOut; ++s) g.outC[s] = ImVec2(b.x, a.y + kHeaderH + s * kPinRowH + kPinRowH * 0.5f);
+		nodeGView[gni] = (int)groups.size();
+		groups.push_back(g);
 	}
 
 	// pin centres, screen space. reads fill input slots (left) in encounter order; writes fill output
@@ -1062,7 +1230,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	int hovB = -1, hovSlot = -1; bool hovWrite = false; uint32_t hovId = 0, hovMip = 0, hovLayer = 0; AccessType hovType{};
 	if (canvasHovered && !canvasActive) {
 		for (int i = 0; i < n && hovB < 0; ++i) {
-			if (collapsedBox[i] || sgHidden[i]) continue;   // hidden inside a collapsed group
+			if (drawHidden[i]) continue;   // hidden inside a collapsed group
 			int inS = 0, outS = 0; PassNode* p = rgn[i].pass;
 			for (uint32_t k = 0; k < p->accessCount && hovB < 0; ++k) {
 				const ResourceAccess& acc = p->accesses[k];
@@ -1112,7 +1280,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	int hovBox = -1;
 	if (hovB < 0 && canvasHovered && !canvasActive)
 		for (int i = 0; i < n; ++i) {
-			if (collapsedBox[i] || sgHidden[i]) continue;   // hidden inside a collapsed group
+			if (drawHidden[i]) continue;   // hidden inside a collapsed group
 			ImVec2 tl(origin.x + rgn[i].pos.x, origin.y + rgn[i].pos.y);
 			if (ImGui::IsMouseHoveringRect(tl, ImVec2(tl.x + rgn[i].w, tl.y + rgn[i].h))) { hovBox = i; break; }
 		}
@@ -1125,19 +1293,18 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		pressed = false;
 		float mdx = io.MousePos.x - pressAt.x, mdy = io.MousePos.y - pressAt.y;
 		if (mdx * mdx + mdy * mdy < 16) {   // a click, not a pan
-			int hitSg = -1;   // a subgroup badge click toggles just that subgroup's collapse
-			for (int sI = 0; sI < (int)sgClicks.size(); ++sI)
-				if (io.MousePos.x >= sgClicks[sI].h0.x && io.MousePos.x <= sgClicks[sI].h1.x &&
-					io.MousePos.y >= sgClicks[sI].h0.y && io.MousePos.y <= sgClicks[sI].h1.y) hitSg = sI;
 			int hitG = -1;   // a group header click toggles that group's collapse state, overriding the default
 			for (int gI = 0; gI < (int)groups.size(); ++gI)
 				if (io.MousePos.x >= groups[gI].h0.x && io.MousePos.x <= groups[gI].h1.x &&
 					io.MousePos.y >= groups[gI].h0.y && io.MousePos.y <= groups[gI].h1.y) hitG = gI;
-			if (hitSg >= 0) { int cur = grpStore->GetInt(sgClicks[hitSg].key, 0); grpStore->SetInt(sgClicks[hitSg].key, cur == 2 ? 0 : 2); }
-			else if (hitG >= 0) grpStore->SetInt(groups[hitG].key, groups[hitG].collapsed ? 1 : 2);   // flip effective state
+			if (hitG >= 0) grpStore->SetInt(groups[hitG].key, groups[hitG].collapsed ? 1 : 2);   // flip effective state
 			else if (hovB >= 0) {
 				if (lockB == hovB && lockWrite == hovWrite && lockSlot == hovSlot) lockB = -1;   // toggle off
 				else { lockB = hovB; lockWrite = hovWrite; lockSlot = hovSlot; lockId = hovId; }
+			}
+			else if (hovBox >= 0) {   // a pass-body click selects the whole pass (lockSlot -1 / lockId 0 = no pin)
+				if (lockB == hovBox && lockSlot == -1) lockB = -1;   // toggle off
+				else { lockB = hovBox; lockWrite = false; lockSlot = -1; lockId = 0; }
 			}
 			else lockB = -1;
 		}
@@ -1149,7 +1316,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	if (hovB < 0 && hovBox < 0 && canvasHovered && !canvasActive) {
 		float best = 6.0f * 6.0f;
 		for (int ei = 0; ei < (int)edge.size(); ++ei) {
-			if (collapsedBox[edge[ei].src] || collapsedBox[edge[ei].dst] || sgHidden[edge[ei].src] || sgHidden[edge[ei].dst]) continue;
+			if (drawHidden[edge[ei].src] || drawHidden[edge[ei].dst]) continue;
 			ImVec2 pts[2 * kRgDagMax + 2]; int np = edgePoints(edge[ei], pts);
 			for (int t = 0; t + 1 < np; ++t) {
 				ImVec2 a2 = pts[t], b2 = pts[t + 1]; float dx = (b2.x - a2.x) * 0.5f;
@@ -1169,11 +1336,12 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	int coneB = hovB >= 0 ? hovB : lockB;
 	bool coneWrite = hovB >= 0 ? hovWrite : lockWrite;
 	uint32_t coneId = hovB >= 0 ? hovId : lockId;
+	const bool conePass = hovB < 0 && lockB >= 0 && lockSlot == -1;   // whole-pass selection: both cones from the pass
 	bool inCone[kRgDagMax] = {}, downCone[kRgDagMax] = {}; bool coneActive = false;
 	if (coneB >= 0) {
-		int seed = coneWrite ? coneB : rg_producer_of(box, n, box[coneB].p, coneId);
+		int seed = (coneWrite || conePass) ? coneB : rg_producer_of(box, n, box[coneB].p, coneId);
 		if (seed >= 0) { rg_mark_cone(box, n, seed, inCone); inCone[coneB] = true; coneActive = true; }   // include the hovered node so its immediate edge lights
-		if (coneActive && coneWrite) {   // downstream descendants over the data edges
+		if (coneActive && (coneWrite || conePass)) {   // downstream descendants over the data edges
 			int st[kRgDagMax], sp = 0; st[sp++] = coneB;
 			while (sp) { int u = st[--sp]; for (REdge& e : edge) if (e.src == u && !downCone[e.dst]) { downCone[e.dst] = true; st[sp++] = e.dst; } }
 		}
@@ -1184,12 +1352,34 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	auto inDn  = [&](int i) { return coneActive && (downCone[i] || (coneWrite && i == coneB)) && !fout(i); };
 	// slot of resource `id` among a collapsed group's interface pins (-1 = none), for edge rerouting.
 	auto gpin_slot = [](const uint32_t* ids, int cnt, uint32_t id) { for (int i = 0; i < cnt; ++i) if (ids[i] == id) return i; return -1; };
-	// collapsed-subgroup fold: rep of each member (rep maps to itself, -1 = not in a collapsed subgroup). a
-	// boundary edge reroutes onto the rep box edge (right=producer, left=consumer); interior edges vanish.
-	int sgRep[kRgDagMax]; for (int i = 0; i < n; ++i) sgRep[i] = -1;
-	for (int i = 0; i < n; ++i) if (sgCount[i] > 0) for (int k = i; k < i + sgCount[i]; ++k) sgRep[k] = i;
-	auto sgEdgePt = [&](int rep, bool out) { return ImVec2(origin.x + rgn[rep].pos.x + (out ? rgn[rep].w : 0.0f),
-		origin.y + rgn[rep].pos.y + rgn[rep].h * 0.5f); };
+	// pin a member's edge attaches to: if the member sits in a collapsed group (its own box isn't drawn), the
+	// group's compact-node pin for that resource; otherwise the member's own pass pin. makes a collapsed
+	// subgroup wire up exactly like a collapsed top-level group.
+	auto memberOut = [&](int k, uint32_t id) -> ImVec2 {
+		if (collOwner[k] >= 0) { int gv = nodeGView[collOwner[k]]; if (gv >= 0) { int sl = gpin_slot(groups[gv].outId, groups[gv].nOut, id); if (sl >= 0) return groups[gv].outC[sl]; } }
+		int ss = rg_out_slot(rgn[k].pass, id); return outPin(k, ss >= 0 ? ss : 0);
+	};
+	auto memberIn = [&](int k, uint32_t id) -> ImVec2 {
+		if (collOwner[k] >= 0) { int gv = nodeGView[collOwner[k]]; if (gv >= 0) { int sl = gpin_slot(groups[gv].inId, groups[gv].nIn, id); if (sl >= 0) return groups[gv].inC[sl]; } }
+		int ds = rg_in_slot(rgn[k].pass, id); return inPin(k, ds >= 0 ? ds : 0);
+	};
+	// the drawn group (subgroup, collapsed or expanded) whose boundary an edge crosses on `inside`'s side: the
+	// outermost group containing `inside` but NOT `outside` that carries a matching pin for the resource. so an
+	// edge leaving a group attaches to that group's border pin instead of piercing it. -1 = no boundary crossed.
+	auto boundaryGV = [&](int inside, int outside, uint32_t id, bool wantOut) -> int {
+		int best = -1, bestDepth = 1 << 30;
+		for (int gni = 1; gni < (int)gtree.size(); ++gni) {
+			int gv = nodeGView[gni]; if (gv < 0) continue;
+			GNode& g2 = gtree[gni];
+			if (!(g2.gi <= inside && inside < g2.gj)) continue;             // must contain `inside`
+			if (outside >= 0 && g2.gi <= outside && outside < g2.gj) continue;   // ...but not `outside`
+			int sl = gpin_slot(wantOut ? groups[gv].outId : groups[gv].inId, wantOut ? groups[gv].nOut : groups[gv].nIn, id);
+			if (sl >= 0 && g2.depth < bestDepth) { best = gv; bestDepth = g2.depth; }
+		}
+		return best;
+	};
+	auto exitPin  = [&](int prod, int k, uint32_t id) -> ImVec2 { int gv = boundaryGV(prod, k, id, true);  return gv >= 0 ? groups[gv].outC[gpin_slot(groups[gv].outId, groups[gv].nOut, id)] : memberOut(prod, id); };
+	auto entryPin = [&](int k, int prod, uint32_t id) -> ImVec2 { int gv = boundaryGV(k, prod, id, false); return gv >= 0 ? groups[gv].inC [gpin_slot(groups[gv].inId,  groups[gv].nIn,  id)] : memberIn(k, id); };
 
 	// ---- data edges, routed through their dummy waypoints so none hides behind a box. gold = upstream
 	// cone, teal = downstream consumers, white = hovered, dim otherwise. an edge touching a collapsed
@@ -1199,8 +1389,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	static std::vector<int> inDrawnKeys; inDrawnKeys.clear();
 	for (int ei = 0; ei < (int)edge.size(); ++ei) {
 		REdge& e = edge[ei];
-		if ((sgHidden[e.src] || sgHidden[e.dst]) && sgRep[e.src] == sgRep[e.dst]) continue;   // interior to one collapsed subgroup
-		if ((collapsedBox[e.src] || collapsedBox[e.dst]) && mapTo[e.src] == mapTo[e.dst]) continue;   // interior
+		if (collOwner[e.src] >= 0 && collOwner[e.src] == collOwner[e.dst]) continue;   // interior to one collapsed group (any level) -> vanishes
 		bool eup = inUp(e.src) && inUp(e.dst), edn = inDn(e.src) && inDn(e.dst);
 		ImU32 col; float th;
 		if (ei == hovEdge)                     { col = IM_COL32(255, 255, 255, 255); th = 3.0f; }
@@ -1216,11 +1405,11 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		if (sExit || dExit || sgHidden[e.src] || sgHidden[e.dst]) {
 			ImVec2 p, q;
 			if (sExit) { GView& g = groups[groupOf[e.src]]; int sl = gpin_slot(g.outId, g.nOut, e.id); if (sl < 0) continue; p = g.outC[sl]; }
-			else if (sgHidden[e.src]) p = sgEdgePt(sgRep[e.src], true);
+			else if (collOwner[e.src] >= 0) p = memberOut(e.src, e.id);
 			else p = outPin(e.src, e.sOut);
 			if (dExit) { int gx = groupOf[e.dst]; GView& g = groups[gx]; int sl = gpin_slot(g.inId, g.nIn, e.id); if (sl < 0) continue;
 				int key = (gx << 12) | (sl << 7) | e.src; bool dup = false; for (int kk : inDrawnKeys) if (kk == key) { dup = true; break; } if (dup) continue; inDrawnKeys.push_back(key); q = g.inC[sl]; }
-			else if (sgHidden[e.dst]) q = sgEdgePt(sgRep[e.dst], false);
+			else if (collOwner[e.dst] >= 0) q = memberIn(e.dst, e.id);
 			else q = inPin(e.dst, e.dIn);
 			float dx = (q.x - p.x) * 0.5f;
 			dl->AddBezierCubic(p, ImVec2(p.x + dx, p.y), ImVec2(q.x - dx, q.y), q, col, th);
@@ -1236,7 +1425,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// ---- internal group edges: the routed pass above skips intra-group edges (an expanded group's members
 	// share a column), so draw a group's member->member flow here, on the IR's stacked pin positions.
 	for (GView& g : groups) {
-		if (g.collapsed) continue;
+		if (g.collapsed || g.depth != 1) continue;   // subgroups handled within their top-level parent's scan
 		ImU32 ec = rg_with_alpha(group_color(g.prefix), 170);
 		for (int k = g.gi; k < g.gj; ++k) {
 			PassNode* p = rgn[k].pass;
@@ -1245,12 +1434,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 				uint32_t id = p->accesses[ai].handle.id;
 				int prod = rg_producer_of(box, n, p, id);
 				if (prod < g.gi || prod >= g.gj) continue;   // intra-group only
-				bool hk = sgHidden[k], hp = sgHidden[prod];
-				if ((hk || hp) && sgRep[k] == sgRep[prod]) continue;   // interior to one collapsed subgroup
-					if (!hk && !hp) continue;   // visible-visible internal edge now routed via iroutes (dummy lanes)
-				ImVec2 q, pt;   // a collapsed subgroup's boundary edge reroutes onto the rep box edge
-				if (hk) q = sgEdgePt(sgRep[k], false); else { int ds = rg_in_slot(rgn[k].pass, id); if (ds < 0) continue; q = inPin(k, ds); }
-				if (hp) pt = sgEdgePt(sgRep[prod], true); else { int ss = rg_out_slot(rgn[prod].pass, id); if (ss < 0) continue; pt = outPin(prod, ss); }
+				if (!sgHidden[k] && !sgHidden[prod]) continue;   // both are interior cells (incl reps) -> routed via iroutes
+				if (collOwner[k] >= 0 && collOwner[k] == collOwner[prod]) continue;   // interior to one collapsed group
+				ImVec2 pt = exitPin(prod, k, id), q = entryPin(k, prod, id);   // attach to the crossed group's border/compact pin
 				float dx = (q.x - pt.x) * 0.5f;
 				dl->AddBezierCubic(pt, ImVec2(pt.x + dx, pt.y), ImVec2(q.x - dx, q.y), q, ec, 2.0f);
 			}
@@ -1263,14 +1449,42 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		int mem = r.src >= 0 ? r.src : r.dst; int gx = groupOf[mem]; if (gx < 0) continue; GView& g = groups[gx];
 		ImVec2 src0, dst0;
 		if (r.src < 0) { int sl = gpin_slot(g.inId, g.nIn, r.id); if (sl < 0) continue; src0 = g.inC[sl]; }
-		else { int ss = rg_out_slot(rgn[r.src].pass, r.id); if (ss < 0) continue; src0 = outPin(r.src, ss); }
+		else if (r.dst >= 0) src0 = exitPin(r.src, r.dst, r.id);   // internal edge: exit the crossed subgroup via its border pin
+		else src0 = memberOut(r.src, r.id);
 		if (r.dst < 0) { int so = gpin_slot(g.outId, g.nOut, r.id); if (so < 0) continue; dst0 = g.outC[so]; }
-		else { int ds = rg_in_slot(rgn[r.dst].pass, r.id); if (ds < 0) continue; dst0 = inPin(r.dst, ds); }
+		else if (r.src >= 0) dst0 = entryPin(r.dst, r.src, r.id);
+		else dst0 = memberIn(r.dst, r.id);
 		ImU32 ec = rg_with_alpha(group_color(g.prefix), 170);
 		ImVec2 pts[20]; int np = 0; pts[np++] = src0;
 		for (int t = 0; t < r.ndum && np < 18; ++t) { float dxp = g.bb0.x + kRegionPad + r.dcol[t] * (kBoxW + kInnerColGap), dyp = g.bb0.y + kHeaderH + kRegionPad + r.dy[t]; pts[np++] = ImVec2(dxp, dyp); pts[np++] = ImVec2(dxp + kBoxW, dyp); }
 		pts[np++] = dst0;
 		for (int t = 0; t + 1 < np; ++t) { ImVec2 A = pts[t], B = pts[t + 1]; float hx = (B.x - A.x) * 0.5f; dl->AddBezierCubic(A, ImVec2(A.x + hx, A.y), ImVec2(B.x - hx, B.y), B, ec, 2.0f); }
+	}
+
+	// subgroup interior stubs: the outside half of a boundary edge ends at the subgroup's border pin (above);
+	// this draws the inside half -- border pin -> the interior member that actually reads/writes the resource.
+	// (top-level groups get this for free from the interior border-node lanes; subgroups don't, so wire it here.)
+	for (GView& g : groups) {
+		if (g.collapsed || g.depth < 2) continue;
+		ImU32 sc = rg_with_alpha(group_color(g.prefix), 150);
+		for (int s = 0; s < g.nIn; ++s) {
+			uint32_t id = g.inId[s];
+			for (int k = g.gi; k < g.gj; ++k) {
+				if (rg_in_slot(rgn[k].pass, id) < 0) continue;
+				int prod = rg_producer_of(box, n, rgn[k].pass, id);
+				if (prod >= g.gi && prod < g.gj) continue;   // produced inside the subgroup -> not an entry
+				ImVec2 m = memberIn(k, id), p0 = g.inC[s]; float dx = (m.x - p0.x) * 0.5f;
+				dl->AddBezierCubic(p0, ImVec2(p0.x + dx, p0.y), ImVec2(m.x - dx, m.y), m, sc, 1.5f);
+			}
+		}
+		for (int s = 0; s < g.nOut; ++s) {
+			uint32_t id = g.outId[s];
+			for (int k = g.gi; k < g.gj; ++k) {
+				if (rg_out_slot(rgn[k].pass, id) < 0) continue;
+				ImVec2 m = memberOut(k, id), p0 = g.outC[s]; float dx = (p0.x - m.x) * 0.5f;
+				dl->AddBezierCubic(m, ImVec2(m.x + dx, m.y), ImVec2(p0.x - dx, p0.y), p0, sc, 1.5f);
+			}
+		}
 	}
 
 	// expanded group border stubs: the short hop from a border pin into the region, to the member(s) that
@@ -1298,7 +1512,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 
 	// ---- boxes.
 	for (int i = 0; i < n; ++i) {
-		if (collapsedBox[i] || sgHidden[i]) continue;   // hidden inside a collapsed group node (drawn separately below)
+		if (drawHidden[i]) continue;   // hidden inside a collapsed group node (drawn separately below)
 		ImVec2 tl(origin.x + rgn[i].pos.x, origin.y + rgn[i].pos.y), br(tl.x + rgn[i].w, tl.y + rgn[i].h);
 		bool dim = isDim(i), up = inUp(i), dn = inDn(i);
 
@@ -1306,6 +1520,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		dl->AddRectFilled(tl, br, dim ? rg_with_alpha(fill, 55) : fill, 5.0f);
 		ImU32 edgec = up ? IM_COL32(255, 255, 255, 255) : dn ? IM_COL32(120, 222, 180, 255) : dim ? IM_COL32(40, 40, 40, 120) : IM_COL32(20, 20, 20, 255);
 		dl->AddRect(tl, br, edgec, 5.0f, 0, (up || dn) ? 2.5f : 1.0f);
+		if (lockB == i && lockSlot == -1)   // whole-pass selection (body click): blue selection ring
+			dl->AddRect(ImVec2(tl.x - 2, tl.y - 2), ImVec2(br.x + 2, br.y + 2), IM_COL32(90, 200, 230, 255), 6.0f, 0, 2.0f);
 		dl->AddLine(ImVec2(tl.x, tl.y + kHeaderH), ImVec2(br.x, tl.y + kHeaderH), IM_COL32(255, 255, 255, dim ? 18 : 40));
 
 		// sinks: red halo. imported writers only -- temporal/history writers are sinks to the culler
@@ -1329,7 +1545,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 
 	// ---- pins + resource labels.
 	for (int i = 0; i < n; ++i) {
-		if (collapsedBox[i] || sgHidden[i]) continue;   // hidden inside a collapsed group node (drawn separately below)
+		if (drawHidden[i]) continue;   // hidden inside a collapsed group node (drawn separately below)
 		PassNode* p = rgn[i].pass; bool dim = isDim(i);
 		const float mid = origin.x + rgn[i].pos.x + rgn[i].w * 0.5f;
 		int inS = 0, outS = 0;
@@ -1539,6 +1755,90 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			e.dst, (int)dn.length, dn.data ? dn.data : "");
 		ImGui::EndTooltip();
 	}
+
+	ImGui::SetWindowFontScale(1.0f);   // overlays (details panel, zoom indicator) stay readable at any zoom
+
+	// ---- details panel: persistent info for the locked (selected) pin + its pass. top-right overlay,
+	// drawn with the canvas draw list (no nested child). click a pin to fill it; click empty canvas clears.
+	if (lockB >= 0 && lockB < n) {
+		PassNode* p = rgn[lockB].pass;
+		ResourceNode* r = find_node(rg, { lockId });
+		// the access this pin stands for (match id + read/write side) -> type + touched subresource.
+		AccessType selType{}; uint32_t selMip = 0, selLayer = 0;
+		for (uint32_t k = 0; k < p->accessCount; ++k) {
+			const ResourceAccess& a = p->accesses[k];
+			if (a.handle.id == lockId && access_is_write(a.type) == lockWrite)
+				{ selType = a.type; selMip = a.baseMip; selLayer = a.baseLayer; break; }
+		}
+
+		char ln[48][128]; ImU32 lc[48]; int nl = 0;
+		const ImU32 cTitle = IM_COL32(238, 236, 242, 255), cDim = IM_COL32(150, 150, 162, 255),
+		            cHead = IM_COL32(120, 200, 190, 255);
+		auto add = [&](ImU32 col, const char* fmt, ...) {
+			if (nl >= 48) return;
+			va_list ap; va_start(ap, fmt); std::vsnprintf(ln[nl], sizeof ln[nl], fmt, ap); va_end(ap);
+			lc[nl++] = col;
+		};
+
+		const bool pinSel = lockSlot >= 0;   // a specific pin vs. a whole-pass selection (body click)
+		WGPUStringView pn = p->name;
+		add(cTitle, "P%d  %.*s  [%s]", lockB, (int)pn.length, pn.data ? pn.data : "", rg_kind_name(p->kind));
+		add(cDim, "");
+		if (pinSel) {
+			add(cHead, "SELECTED PIN");
+			WGPUStringView rn = r ? r->name : WGPUStringView{};
+			add(r ? rg_resource_color(r->kind) : cDim, "%.*s", (int)rn.length, rn.data ? rn.data : "?");
+			if (r) {
+				if (r->kind == ResourceNode::Kind::Texture) add(cDim, "texture  %u x %u", r->resolved.width, r->resolved.height);
+				else                                         add(cDim, "buffer  %llu bytes", (unsigned long long)r->bufferSize);
+			}
+			if (r && r->kind == ResourceNode::Kind::Texture) {
+				uint32_t layers = r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1;
+				uint32_t mips   = r->mipLevelCount ? r->mipLevelCount : 1;
+				if (layers > 1 || mips > 1 || selLayer > 0 || selMip > 0)
+					add(cDim, "layer %u / %u    mip %u / %u", selLayer, layers, selMip, mips);
+			}
+			const char* verb = lockWrite ? "write"
+				: (selType == AccessType::ColorAttachment || selType == AccessType::DepthStencilAttachment) ? "load" : "read";
+			add(cDim, "%s  (%s)", verb, rg_access_name(selType));
+			if (lockWrite) add(cDim, "produced here");
+			else {
+				int prod = rg_producer_of(box, n, p, lockId);
+				if (prod >= 0) { WGPUStringView qn = rgn[prod].pass->name; add(cDim, "produced by P%d %.*s", prod, (int)qn.length, qn.data ? qn.data : ""); }
+				else add(cDim, r && r->imported ? "imported (external input)" : "external input");
+			}
+			add(cDim, "");
+		}
+		add(cHead, "PASS ACCESSES");
+		for (uint32_t k = 0; k < p->accessCount; ++k) {
+			const ResourceAccess& acc = p->accesses[k];
+			ResourceNode* ar = find_node(rg, acc.handle);
+			WGPUStringView arn = ar ? ar->name : WGPUStringView{};
+			bool sel = acc.handle.id == lockId && access_is_write(acc.type) == lockWrite;
+			add(sel ? cTitle : cDim, "%s [%s] %.*s (%s)%s", sel ? ">" : " ",
+				access_is_write(acc.type) ? "W" : "R", (int)arn.length, arn.data ? arn.data : "",
+				rg_access_name(acc.type), ar ? (ar->imported ? " [imp]" : ar->persistent ? " [tmp]" : "") : "");
+		}
+
+		// size to content, place top-right (clamped into the canvas), draw bg + border + lines.
+		float lineH = ImGui::GetTextLineHeightWithSpacing(), maxW = 0;
+		for (int i = 0; i < nl; ++i) { float w = ImGui::CalcTextSize(ln[i]).x; if (w > maxW) maxW = w; }
+		const float padX = 10, padY = 8;
+		float panelW = maxW + padX * 2, panelH = nl * lineH + padY * 2;
+		ImVec2 tl(winPos.x + winSize.x - panelW - 8, winPos.y + 8);
+		if (tl.x < winPos.x + 8) tl.x = winPos.x + 8;
+		dl->AddRectFilled(tl, ImVec2(tl.x + panelW, tl.y + panelH), IM_COL32(24, 26, 32, 235), 5.0f);
+		dl->AddRect(tl, ImVec2(tl.x + panelW, tl.y + panelH), IM_COL32(80, 86, 100, 255), 5.0f);
+		float y = tl.y + padY;
+		for (int i = 0; i < nl; ++i) { dl->AddText(ImVec2(tl.x + padX, y), lc[i], ln[i]); y += lineH; }
+	}
+
+	// ---- zoom level, bottom-right corner.
+	char zb[16]; std::snprintf(zb, sizeof zb, "%d%%", (int)(zoom * 100.0f + 0.5f));
+	ImVec2 zs = ImGui::CalcTextSize(zb);
+	ImVec2 zp(winPos.x + winSize.x - zs.x - 10, winPos.y + winSize.y - zs.y - 8);
+	dl->AddRectFilled(ImVec2(zp.x - 6, zp.y - 4), ImVec2(zp.x + zs.x + 6, zp.y + zs.y + 4), IM_COL32(24, 26, 32, 200), 4.0f);
+	dl->AddText(zp, IM_COL32(220, 220, 230, 255), zb);
 
 	ImGui::EndChild();
 }
@@ -1876,10 +2176,10 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 	// transient pool: textures + buffers in one descriptor-keyed cache, tagged by Entry::isBuffer. one
 	// physical object per entry; idle ones retained kRetain frames. tally each kind (held includes idle).
 	int held = 0, inUse = 0, texHeld = 0, bufHeld = 0;
-	uint64_t texBytes = 0, texInUseBytes = 0, bufBytes = 0;
+	uint64_t texBytes = 0, texInUseBytes = 0, bufBytes = 0, bufInUseBytes = 0;
 	for (const TransientResourcePool::Entry& e : tp.entries) {
 		++held; if (e.inUse) ++inUse;
-		if (e.isBuffer) { ++bufHeld; bufBytes += e.bufferSize; }
+		if (e.isBuffer) { ++bufHeld; bufBytes += e.bufferSize; if (e.inUse) bufInUseBytes += e.bufferSize; }
 		else {
 			const uint64_t b = rg_entry_bytes(e);
 			++texHeld; texBytes += b;
@@ -1887,8 +2187,9 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 		}
 	}
 
-	// temporal/history resources: kLayers physical textures OR buffers per entry (current + previous),
-	// ping-ponged. the buffer arm leaves size {} / format Undefined, so split on bufferSize to size each right.
+	// persistent + temporal resources share one name-keyed pool: a temporal entry holds kLayers physical
+	// objects (current + previous, ping-ponged), a persistent entry holds 1 (single in-place). the buffer arm
+	// leaves size {} / format Undefined, so split on bufferSize to size each right; mem already scales by layers.
 	int tmpTexCount = 0, tmpBufCount = 0;
 	uint64_t tmpTexBytes = 0, tmpBufBytes = 0;
 	for (const PersistentResourcePool::Entry& e : pool.entries) {
@@ -1908,18 +2209,36 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 
 	char gb[24]; rg_bytes_str(grand, gb, sizeof gb);
 	ImGui::Text("VRAM %s total", gb);
+	ImGui::SameLine(); ImGui::TextDisabled("(graph-allocated; imported/caller-owned excluded -- listed below)");
 	{
-		char a[24], ib[24], idb[24], bb[24], cb[24], cbb[24];
+		char a[24], ib[24], idb[24], bb[24], bib[24], bidb[24], cb[24], cbb[24];
 		rg_bytes_str(texBytes, a, sizeof a);
 		rg_bytes_str(texInUseBytes, ib, sizeof ib);
 		rg_bytes_str(texBytes - texInUseBytes, idb, sizeof idb);   // in use is a subset sum -> no underflow
 		rg_bytes_str(bufBytes, bb, sizeof bb);
+		rg_bytes_str(bufInUseBytes, bib, sizeof bib);
+		rg_bytes_str(bufBytes - bufInUseBytes, bidb, sizeof bidb);
 		rg_bytes_str(tmpTexBytes, cb, sizeof cb);
 		rg_bytes_str(tmpBufBytes, cbb, sizeof cbb);
 		ImGui::BulletText("transient tex  %-9s  %d held (%s in use, %s idle)", a, texHeld, ib, idb);
-		ImGui::BulletText("transient buf  %-9s  %d held", bb, bufHeld);
-		ImGui::BulletText("temporal tex   %-9s  %d entries", cb, tmpTexCount);
-		ImGui::BulletText("temporal buf   %-9s  %d entries", cbb, tmpBufCount);
+		ImGui::BulletText("transient buf  %-9s  %d held (%s in use, %s idle)", bb, bufHeld, bib, bidb);
+		ImGui::BulletText("pool tex       %-9s  %d entries", cb, tmpTexCount);
+		ImGui::BulletText("pool buf       %-9s  %d entries", cbb, tmpBufCount);
+	}
+
+	// memory saved by aliasing: each packed transient would otherwise own a slot-sized object, so the win is
+	// the slot bytes counted once per logical member minus once per physical slot. mirrors the lifetime view.
+	if (s.m_slotCount) {
+		auto phBytes = [](const PhysicalResource& ph) -> uint64_t {
+			return ph.kind == ResourceNode::Kind::Buffer ? ph.bufferSize : texture_bytes(ph.size, ph.format);
+		};
+		uint32_t logical = 0; uint64_t logicalBytes = 0, physicalBytes = 0;
+		for (uint32_t i = 0; i < s.m_slotCount; ++i) physicalBytes += phBytes(s.m_slots[i]);
+		for (ResourceNode* r = s.m_resouces; r; r = r->next)
+			if (r->aliasSlot != ResourceNode::kNoSlot) { ++logical; logicalBytes += phBytes(s.m_slots[r->aliasSlot]); }
+		char sb[24]; rg_bytes_str(logicalBytes - physicalBytes, sb, sizeof sb);
+		ImGui::TextColored(ImVec4(0.59f, 0.90f, 0.59f, 1),
+			"aliasing: %u transients packed onto %u objects, saved %s", logical, s.m_slotCount, sb);
 	}
 
 	ImGui::TextDisabled("tex usage A=attach T=sampled S=storage r=copy-src w=copy-dst   |   buf usage U=uniform S=storage V=vertex I=index X=indirect   |   evict after %llu idle frames",
@@ -1987,9 +2306,10 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 		if (!any) ImGui::TextDisabled("(none)");
 	}
 
-	// temporal/history textures (PersistentResourcePool): one row per name, kLayers physical textures each.
+	// persistent + temporal textures (PersistentResourcePool): one row per name; the layers column reads 2 for
+	// a ping-pong history entry, 1 for a persistent (single in-place) one.
 	ImGui::Spacing();
-	ImGui::TextDisabled("temporal (history) textures");
+	ImGui::TextDisabled("persistent + temporal textures  (layers: 2 = history ping-pong, 1 = persistent)");
 	if (ImGui::BeginTable("tp_tmp", 7, tf)) {
 		ImGui::TableSetupColumn("name");
 		ImGui::TableSetupColumn("size");
@@ -2020,9 +2340,10 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 		if (!any) ImGui::TextDisabled("(none)");
 	}
 
-	// temporal/history buffers (PersistentResourcePool buffer arm): one row per name, kLayers buffers each.
+	// persistent + temporal buffers (PersistentResourcePool buffer arm): one row per name; mem already scales
+	// by layers (2 = history ping-pong, 1 = persistent single in-place).
 	ImGui::Spacing();
-	ImGui::TextDisabled("temporal (history) buffers");
+	ImGui::TextDisabled("persistent + temporal buffers");
 	if (ImGui::BeginTable("tp_tmpbuf", 3, tf)) {
 		ImGui::TableSetupColumn("name");
 		ImGui::TableSetupColumn("usage");
@@ -2043,27 +2364,31 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 		if (!any) ImGui::TextDisabled("(none)");
 	}
 
-	// transient buffers (per-frame, not pooled). walk the resource nodes for graph-owned buffers.
+	// imported (caller-owned) resources -- the swapchain target + any import_image/import_buffer. real GPU
+	// memory the graph writes but does NOT allocate, so it sits outside the VRAM total above. importe_image
+	// records a size but no format, import_buffer records neither, and the graph never owns the bytes, so the
+	// mem column stays blank here; the point is only to make the caller-owned surface visible, not double-count.
 	ImGui::Spacing();
-	ImGui::TextDisabled("transient buffers (by name, this frame)");
-	if (ImGui::BeginTable("tp_buf_frame", 3, tf)) {
+	ImGui::TextDisabled("imported (caller-owned, not in VRAM total)");
+	if (ImGui::BeginTable("tp_imported", 3, tf)) {
 		ImGui::TableSetupColumn("name");
-		ImGui::TableSetupColumn("usage");
+		ImGui::TableSetupColumn("kind");
 		ImGui::TableSetupColumn("size");
 		ImGui::TableHeadersRow();
 		bool any = false;
 		for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-			if (r->kind != ResourceNode::Kind::Buffer || r->is_external() || !r->buffer) continue;
+			if (!r->imported) continue;
 			any = true;
-			char ub[12]; rg_buf_usage_str(r->bufUsage, ub, sizeof ub);
-			char mb[24]; rg_bytes_str(r->bufferSize, mb, sizeof mb);
+			const bool isBuf = r->kind == ResourceNode::Kind::Buffer;
 			ImGui::TableNextRow();
 			ImGui::TableNextColumn(); ImGui::Text("%.*s", (int)r->name.length, r->name.data ? r->name.data : "");
-			ImGui::TableNextColumn(); ImGui::Text("%s", ub);
-			ImGui::TableNextColumn(); ImGui::Text("%s", mb);
+			ImGui::TableNextColumn(); ImGui::Text("%s", isBuf ? "buffer" : "texture");
+			ImGui::TableNextColumn();
+			if (isBuf) ImGui::TextDisabled("-");
+			else       ImGui::Text("%u x %u", r->resolved.width, r->resolved.height);
 		}
 		ImGui::EndTable();
-		if (!any) ImGui::TextDisabled("(none this frame)");
+		if (!any) ImGui::TextDisabled("(none)");
 	}
 
 	ImGui::Spacing();
@@ -2164,3 +2489,4 @@ static void imgui_layer_shutdown()
 	ImGui_ImplSDL3_Shutdown();
 	ImGui::DestroyContext();
 }
+
