@@ -1344,8 +1344,11 @@ bool RenderGraph::compile(bool enableAlias)
         for (ResourceNode* r = s.m_resouces; r; r = r->next) {
             if (r->is_external() || r->firstUse == ResourceNode::kNoPass || !r->hasWriter || !r->firstDefines)
                 continue;
-            if (r->kind == ResourceNode::Kind::Texture && (r->mipLevelCount != 1 || r->sampleCount != 1))
-                continue;   // mip chain / MSAA: keeps its own texture (a slot's default view wouldn't fit)
+            if (r->kind == ResourceNode::Kind::Texture
+                && (r->mipLevelCount != 1 || r->sampleCount != 1 || r->resolved.depthOrArrayLayers > 1))
+                continue;   // mip chain / MSAA: a slot's default view wouldn't fit. array: a first-touch
+                            // clear defines only one layer, so a successor reading other layers would see
+                            // the previous occupant's bytes (firstDefines checks the first access only).
             elig[nElig++] = r;
         }
 

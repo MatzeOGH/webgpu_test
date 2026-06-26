@@ -552,6 +552,10 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	for (int i = 0; i < n; ++i) { effW[i] = kBoxW; innerCol[i] = 0; }
 	// expanded-group member's y offset within its region body, from the recursive interior layout (phase 2).
 	float memRelY[kRgDagMax]; for (int i = 0; i < n; ++i) memRelY[i] = 0.0f;
+	// routed internal edges of expanded groups: per edge, the dummy-lane waypoints (inner column + body-
+	// relative y) the interior relax produced, so the draw threads them between members. (phase 2b)
+	struct RgIRoute { int src, dst; uint32_t id; int ndum; int dcol[8]; float dy[8]; };
+	static std::vector<RgIRoute> iroutes; iroutes.clear();
 	// subgroup collapse: a collapsed subgroup (same-name run) folds to its first member (the rep, shown as a
 	// compact box with the count); the others hide and its inner columns compact. sgHidden = non-rep member
 	// (skip everywhere); sgCount = member count on the rep (>0 => draw compact).
@@ -647,8 +651,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 					static std::vector<int> ilcol[kRgDagMax]; for (int c = 0; c < innerCols; ++c) ilcol[c].clear();
 					static int inode[kRgDagMax]; static std::vector<int> imem; imem.clear(); static std::vector<float> ih; ih.clear();
 					for (int k = a; k < b; ++k) { inode[k] = -1; if (sgHidden[k]) continue; inode[k] = (int)imem.size(); ilcol[innerCol[k]].push_back((int)imem.size()); imem.push_back(k); ih.push_back(box[k].h); }
-					int iN = (int)imem.size();
-					static std::vector<std::vector<int>> illeft, ilright; illeft.assign(iN, {}); ilright.assign(iN, {});
+					int iNm = (int)imem.size(); struct IEB { int srcN, dstN, src, dst; uint32_t id; int ndum, dum[8]; }; static std::vector<IEB> ieb; ieb.clear();
+					static std::vector<std::vector<int>> illeft, ilright; illeft.assign(kRgDagMax, {}); ilright.assign(kRgDagMax, {});
 					for (int k = a; k < b; ++k) {
 						if (sgHidden[k]) continue;
 						PassNode* pk = box[k].p;
@@ -656,16 +660,19 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 							if (!rg_access_reads(pk->accesses[ci])) continue;
 							int prod = rg_producer_of(box, n, pk, pk->accesses[ci].handle.id);
 							if (prod < a || prod >= b || sgHidden[prod] || innerCol[prod] >= innerCol[k]) continue;
-							ilright[inode[prod]].push_back(inode[k]); illeft[inode[k]].push_back(inode[prod]);
+							IEB e{ inode[prod], inode[k], prod, k, pk->accesses[ci].handle.id, 0, {} };
+								int pv = e.srcN;
+								for (int c = innerCol[prod] + 1; c < innerCol[k] && e.ndum < 8 && (int)ih.size() < kRgDagMax; ++c) { int d = (int)ih.size(); ih.push_back(10.0f); ilcol[c].push_back(d); ilright[pv].push_back(d); illeft[d].push_back(pv); pv = d; e.dum[e.ndum++] = d; }
+								ilright[pv].push_back(e.dstN); illeft[e.dstN].push_back(pv); ieb.push_back(e);
 						}
 					}
-					static std::vector<float> icy; icy.assign(iN, 0.0f);
+					int iN = (int)ih.size(); static std::vector<float> icy; icy.assign(iN, 0.0f);
 					rg_barycenter_relax(ilcol, innerCols - 1, illeft, ilright, ih, icy, kInnerGap);
 					float ymin = 1e30f, ymax = -1e30f;
 					for (int ni = 0; ni < iN; ++ni) { float t = icy[ni] - ih[ni] * 0.5f, bt = icy[ni] + ih[ni] * 0.5f; if (t < ymin) ymin = t; if (bt > ymax) ymax = bt; }
 					if (iN == 0) { ymin = ymax = 0; }
-					for (int ni = 0; ni < iN; ++ni) memRelY[imem[ni]] = icy[ni] - ih[ni] * 0.5f - ymin;   // icy is a centre; pos is top-left
-					effH[a] = kHeaderH + 2.0f * kRegionPad + (ymax - ymin);
+					for (int ni = 0; ni < iNm; ++ni) memRelY[imem[ni]] = icy[ni] - ih[ni] * 0.5f - ymin;   // icy is a centre; pos is top-left
+					for (IEB& e : ieb) { RgIRoute r{ e.src, e.dst, e.id, e.ndum, {}, {} }; for (int t = 0; t < e.ndum; ++t) { r.dcol[t] = innerCol[e.src] + 1 + t; r.dy[t] = icy[e.dum[t]] - ymin; } iroutes.push_back(r); }						effH[a] = kHeaderH + 2.0f * kRegionPad + (ymax - ymin);
 					effW[a] = 2.0f * kRegionPad + innerCols * kBoxW + (innerCols - 1) * kInnerColGap;
 					colOf[a] = colMin; for (int k = a + 1; k < b; ++k) { effH[k] = 0.0f; effW[k] = 0.0f; colOf[k] = colMin; }   // leftmost member, not first (see collapsed branch)
 				}
@@ -1238,6 +1245,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 				if (prod < g.gi || prod >= g.gj) continue;   // intra-group only
 				bool hk = sgHidden[k], hp = sgHidden[prod];
 				if ((hk || hp) && sgRep[k] == sgRep[prod]) continue;   // interior to one collapsed subgroup
+					if (!hk && !hp) continue;   // visible-visible internal edge now routed via iroutes (dummy lanes)
 				ImVec2 q, pt;   // a collapsed subgroup's boundary edge reroutes onto the rep box edge
 				if (hk) q = sgEdgePt(sgRep[k], false); else { int ds = rg_in_slot(rgn[k].pass, id); if (ds < 0) continue; q = inPin(k, ds); }
 				if (hp) pt = sgEdgePt(sgRep[prod], true); else { int ss = rg_out_slot(rgn[prod].pass, id); if (ss < 0) continue; pt = outPin(prod, ss); }
@@ -1245,6 +1253,19 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 				dl->AddBezierCubic(pt, ImVec2(pt.x + dx, pt.y), ImVec2(q.x - dx, q.y), q, ec, 2.0f);
 			}
 		}
+	}
+
+	// routed internal edges (expanded groups): src out-pin -> dummy lanes -> dst in-pin, threading between
+	// members instead of crossing them (phase 2b).
+	for (RgIRoute& r : iroutes) {
+		int gx = groupOf[r.src]; if (gx < 0) continue; GView& g = groups[gx];
+		int ss = rg_out_slot(rgn[r.src].pass, r.id), ds = rg_in_slot(rgn[r.dst].pass, r.id);
+		if (ss < 0 || ds < 0) continue;
+		ImU32 ec = rg_with_alpha(group_color(g.prefix), 170);
+		ImVec2 pts[20]; int np = 0; pts[np++] = outPin(r.src, ss);
+		for (int t = 0; t < r.ndum && np < 18; ++t) { float dxp = g.bb0.x + kRegionPad + r.dcol[t] * (kBoxW + kInnerColGap), dyp = g.bb0.y + kHeaderH + kRegionPad + r.dy[t]; pts[np++] = ImVec2(dxp, dyp); pts[np++] = ImVec2(dxp + kBoxW, dyp); }
+		pts[np++] = inPin(r.dst, ds);
+		for (int t = 0; t + 1 < np; ++t) { ImVec2 A = pts[t], B = pts[t + 1]; float hx = (B.x - A.x) * 0.5f; dl->AddBezierCubic(A, ImVec2(A.x + hx, A.y), ImVec2(B.x - hx, B.y), B, ec, 2.0f); }
 	}
 
 	// expanded group border stubs: the short hop from a border pin into the region, to the member(s) that
@@ -1263,12 +1284,16 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 					int sl = gpin_slot(g.inId, g.nIn, id); if (sl < 0) continue;
 					int ds = rg_in_slot(rgn[k].pass, id); if (ds < 0) continue;
 					ImVec2 pt = g.inC[sl], q = inPin(k, ds); float dx = (q.x - pt.x) * 0.5f;
+						if (q.x - pt.x > 1.5f * (kBoxW + kInnerColGap)) { float by = g.bb0.y + kHeaderH + 2.0f; dl->AddBezierCubic(pt, ImVec2(pt.x, by), ImVec2(q.x, by), q, sc, 1.5f); }   // far member: arc over the row, not through the boxes
+						else
 					dl->AddBezierCubic(pt, ImVec2(pt.x + dx, pt.y), ImVec2(q.x - dx, q.y), q, sc, 1.5f);
 				}
 				else if (access_is_write(p->accesses[ai].type)) {
 					int sl = gpin_slot(g.outId, g.nOut, id); if (sl < 0) continue;   // interior write: no border pin
 					int ss = rg_out_slot(rgn[k].pass, id); if (ss < 0) continue;
 					ImVec2 pt = outPin(k, ss), q = g.outC[sl]; float dx = (q.x - pt.x) * 0.5f;
+						if (q.x - pt.x > 1.5f * (kBoxW + kInnerColGap)) { float by = g.bb0.y + kHeaderH + 2.0f; dl->AddBezierCubic(pt, ImVec2(pt.x, by), ImVec2(q.x, by), q, sc, 1.5f); }   // far member: arc over the row
+						else
 					dl->AddBezierCubic(pt, ImVec2(pt.x + dx, pt.y), ImVec2(q.x - dx, q.y), q, sc, 1.5f);
 				}
 			}
@@ -2024,8 +2049,8 @@ static void rg_draw_transient_pool(RenderGraphStorage& s)
 
 	// transient buffers (per-frame, not pooled). walk the resource nodes for graph-owned buffers.
 	ImGui::Spacing();
-	ImGui::TextDisabled("transient buffers");
-	if (ImGui::BeginTable("tp_buf", 3, tf)) {
+	ImGui::TextDisabled("transient buffers (by name, this frame)");
+	if (ImGui::BeginTable("tp_buf_frame", 3, tf)) {
 		ImGui::TableSetupColumn("name");
 		ImGui::TableSetupColumn("usage");
 		ImGui::TableSetupColumn("size");

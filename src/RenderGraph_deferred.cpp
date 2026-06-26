@@ -593,7 +593,7 @@ static WGPUSampler         linSampler = nullptr;   // linear/clamp on all 3 axes
 static WGPUBuffer          uboBuf = nullptr;       // demo-owned scene UBO, imported into the graph each frame
 
 // feature toggles (ImGui checkboxes in deferred_ui; persist across demo switches).
-static bool ssaoOn = true, taaOn = true, bloomOn = false, cubeOn = false;
+static bool ssaoOn = true, taaOn = true, bloomOn = true, cubeOn = false;
 static bool  fogOn = true;   // froxel volumetric fog; default on so the new passes run out of the box
 static bool  aliasDemoOn = false;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
 static bool  forceKeepDemoOn = false;   // Q1: a side-effect-only pass kept alive by force_keep() (else culled)
