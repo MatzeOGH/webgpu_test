@@ -5,6 +5,11 @@
 // without thrashing the memory.
 // RULE: dont abstract the webgpu api
 
+// Major Refactor before v0
+// calling add_{resource} to the rendergraph gives to opportunity to call it after compile by mistake where the graph
+// is in read mode onaly and it is not allowed to add new passes or resources
+
+
 #pragma once
 
 #ifndef RENDERGRAPH_H
@@ -14,6 +19,7 @@
 #include <new>
 #include <utility>
 #include <type_traits>
+#include <assert.h>
 
 #include <webgpu/webgpu.h>
 
@@ -30,30 +36,38 @@ enum struct PassKind : uint8_t
     Compute,
     Transfer
 };
+
 enum struct SizeKind : uint8_t
 {
     Absolute,
     Relative
 };
 
-struct ResourceHandle
-{
-    uint32_t id{};
+//
+enum struct ResourceKind : uint8_t {
+    None,       // invalide!
+    Texture,    // tages `ResourceHandle` as a texture
+    Buffer,     // tags `ResourceHandle` as a buffer
 };
 
-// a ping-pong temporal (history) resource: two physical textures or buffers the PersistentResourcePool rotates
-// each frame. write `curr`, read `prev`. returned by create_temporal_image / create_temporal_buffer
+
+// Resource Handle
+struct ResourceHandle
+{
+    uint32_t id{}; // internal index 
+    ResourceKind kind{}; // type tag for error checking
+    // TODO: maybe add the `ResourceUsage` as a field to the `ResourceHandle`
+};
+
+
+
+// a ping-pong temporal (history) resource: two physical textures or buffers rotate each frame.
+// write `curr`, read `prev`. returned by create_temporal_image / create_temporal_buffer
 struct TemporalResource
 {
     ResourceHandle curr;   // this frame's WRITE target
     ResourceHandle prev;   // last frame's result, READ-only this frame
 };
-
-// how a pass touches a resource (read/write hazards + WGPU usage flags). The enumerators encode
-// WebGPU usage-scope semantics used only by RenderGraph.cpp's hazard/usage passes, so the full
-// definition -- and ResourceAccess, the recorded access -- live there; the header needs just the
-// type name for GraphBuilder::use below.
-enum struct AccessType : uint8_t;
 
 struct ResourceNode;
 struct PassNode;
@@ -73,30 +87,14 @@ struct PassContext
     WGPUTextureView view(ResourceHandle h) const;   // resolved view
     WGPUTexture texture(ResourceHandle h) const;    // resolved texture (copies need the texture, not a view)
     WGPUBuffer buffer(ResourceHandle h) const;  // resolved buffer
-    WGPUExtent3D size(ResourceHandle h) const;  // resolved extent -- derive a compute dispatch / scissor from a relative-sized target
+    WGPUExtent3D texture_size(ResourceHandle h) const;  // resolved extent -- derive a compute dispatch / scissor from a relative-sized target
+    uint32_t buffer_size(ResourceHandle h) const;
 };
 
 struct GraphBuilder
 {
-    // single primitive every helper below is a thin wrapper over. load/store/clear/clearDepth only
-    // matter for the two attachment AccessTypes; leave them defaulted for every other access.
-    // baseMip/baseLayer pick one texture subresource: for an attachment they choose the view execute()
-    // renders into; for a read (sampled/storage) they only feed the in-pass conflict check (the pass body
-    // builds its own view), so declare the level/layer the body will actually read. default 0 = mip 0 /
-    // layer 0 = today's whole-resource behavior.
-    void use(ResourceHandle handle, AccessType type,
-             WGPULoadOp load = WGPULoadOp_Undefined, WGPUStoreOp store = WGPUStoreOp_Undefined,
-             WGPUColor clear = {}, float clearDepth = {},
-             uint32_t baseMip = 0, uint32_t baseLayer = 0,
-             WGPULoadOp stencilLoad = WGPULoadOp_Undefined, WGPUStoreOp stencilStore = WGPUStoreOp_Undefined,
-             uint32_t stencilClear = 0);
-
     // color attachment
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1}, uint32_t baseMip = 0, uint32_t baseLayer = 0);
-    // MSAA resolve target for the preceding color() (positional: call right after the color() it resolves).
-    // the target must be single-sample, same format + size as that multisample color; Dawn validates. the
-    // target may be imported (e.g. resolve a multisample color straight into the swapchain).
-    void resolve(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // depth stencil attachment. for a depth+stencil format pass the stencil load/store/clear too (a
     // depth-only format leaves them Undefined/0); the bound pipeline's depthStencil state drives the actual
     // stencil test/write -- the graph only carries the attachment's load/store/clear ops.
@@ -104,6 +102,10 @@ struct GraphBuilder
     // depth stencil attachment, read-only (depth/stencil test, no write; e.g. lighting depth-testing
     // a prepass depth). no load/store/clear: WebGPU requires depthLoadOp/StoreOp Undefined when read-only.
     void depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    // MSAA resolve target for the preceding color() (positional: call right after the color() it resolves).
+    // the target must be single-sample, same format + size as that multisample color; Dawn validates. the
+    // target may be imported (e.g. resolve a multisample color straight into the swapchain).
+    void resolve(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // sampled resouces
     void sampled(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     void storage_read(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
@@ -151,7 +153,8 @@ struct TextureDesc
     WGPUTextureFormat format = WGPUTextureFormat_Undefined;
     //
     SizeKind sizeKind = SizeKind::Absolute;
-    float scaleX = 1.0f, scaleY = 1.0f;
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
     ResourceHandle relativeTo{};
     WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;   // depthOrArrayLayers = array/cube layers (6 for a cube)
     uint32_t mipLevelCount = 1;                    // > 1 for a mip chain (downsample pyramid, mip generation); per-mip size is implicit
@@ -231,6 +234,8 @@ struct RenderGraph
     template<typename BuilderFn, typename ExecuteFn>
     void add_pass(WGPUStringView name, PassKind kind, BuilderFn&& setup, ExecuteFn&& executeFn)
     {
+        assert(name.length != 0 && "must have name");
+        assert(kind != PassKind::None);
         GraphBuilder builder = begin_pass(name, kind);
         setup(builder);
         store_exec(builder, std::forward<ExecuteFn>(executeFn));

@@ -140,6 +140,8 @@ struct PersistentResourcePool
     std::vector<Entry> entries;   // ponytail: linear scan + memcmp; fine for the handful of temporal resources
     uint64_t evictClock = 0;      // advanced once per frame (end_frame); entries idle kRetain frames are freed
 
+    // TODO: optimization find by hash first and than compare the string to catch hash collisions.
+    //       doing a simple hash compare might be faster
     Entry* find(WGPUStringView name)
     {
         const size_t len = sv_length(name);   // names may arrive as WGPU_STRLEN (see screenTex)
@@ -665,7 +667,8 @@ struct ResourceNode
     WGPUTextureFormat format = WGPUTextureFormat_Undefined;
 
     SizeKind sizeKind = SizeKind::Absolute;
-    float scaleX = 1.0f, scaleY = 1.0f;
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
     ResourceHandle relativeToHandle{};
     WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;
     uint32_t mipLevelCount = 1;   // > 1 = mip chain; created once, per-mip views built at bind/attach time
@@ -680,7 +683,7 @@ struct ResourceNode
     WGPUBuffer       buffer{};                        // imported: the registered buffer
     WGPUExtent3D     resolved = WGPU_EXTENT_3D_INIT;  // imported: registered size (base for future Relative resolution)
     WGPUTextureUsage texUsage{};                      // accumulated in compile() from the access list
-    WGPUBufferUsage  bufUsage{};                      //   "       (WebGPU needs these at create time)
+    WGPUBufferUsage  bufUsage{};                      // accumulated in compile() from the access list
 
     // first/last surviving pass (execution-order index) to touch this, filled in compile() phase 3.
     // kNoPass = no live pass touched it (dead transient) or imported -- imported is left out: the graph
@@ -699,7 +702,7 @@ struct ResourceNode
     bool     hasWriter    = false;
     bool     firstDefines = false;
 
-    ResourceNode* next{}; // ptr to the next resouce node of the render graph
+    ResourceNode* next{}; // ptr to the next resource node of the render graph
 };
 
 struct NodeAdjacency;
@@ -709,13 +712,13 @@ struct NodeAdjacency;
 struct PassNode
 {
     WGPUStringView name{};
-    PassKind    kind{};
+    PassKind kind{};
 
     // type-erased execute callback: stored by add_pass, invoked by the future execute phase
     void* exec_obj{};
     void (*exec_fn)(void*, PassContext&){};
 
-    // ponytail: fixed inline array, no alloc; bump N or add a spill list if a pass needs more
+    // TODO: fixed inline array, no alloc; bump N or add a spill list if a pass needs more
     static constexpr uint32_t kMaxAccess = 16;
     ResourceAccess accesses[kMaxAccess];
     uint32_t accessCount{};
@@ -737,6 +740,7 @@ struct PassNode
     PassNode* next{}; // ptr to the next pass node of the render graph
 };
 
+// walk the `NodeAdjacency` to get all adjacent nodes 
 struct NodeAdjacency
 {
     PassNode* pass{};
@@ -769,8 +773,8 @@ struct PhysicalResource
 struct RenderGraphStorage
 {
     GraphAllocator*         m_allocator{};   // owns the pools; reach them via m_allocator->pool / ->transient
-    ResourceNode*           m_resouces{};
-    PassNode*               m_passes{};
+    ResourceNode*           m_resouces{};    // linked list of resources declared for the graph
+    PassNode*               m_passes{};      // linked list of passes declared for the graph
     WGPUDevice              m_device{};
     uint32_t                next_id = 1; // 0 = invalid handle
     ResourceNode**          byId{};      // id->node (sized next_id); built in compile() phase 3 -> O(1) find_node
@@ -890,13 +894,18 @@ static bool in_pass_accesses_conflict(AccessType a, uint32_t aMip, uint32_t aLay
 }
 #endif
 
+void validate_texture_desc(const TextureDesc& desc)
+{
+    assert(desc.relativeTo.id == 0 || (desc.scaleX != 0 && desc.scaleY != 0) && "When relative to another texture it cannot be a scale of 0");
+}
 
 ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc& desc)
 {
+    validate_texture_desc(desc);
     RenderGraphStorage& s = *storage(this);
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++ };
+    resouce->handle = { s.next_id++, ResourceKind::Texture };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->dimension = desc.dimension;
@@ -921,7 +930,7 @@ ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc&
     RenderGraphStorage& s = *storage(this);
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++ };
+    resouce->handle = { s.next_id++, ResourceKind::Buffer };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->bufferSize = desc.size;
@@ -939,7 +948,7 @@ ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView v
     RenderGraphStorage& s = *storage(this);
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++ };
+    resouce->handle = { s.next_id++, ResourceKind::Texture };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->imported = true;
@@ -957,7 +966,7 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
     RenderGraphStorage& s = *storage(this);
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++ };
+    resouce->handle = { s.next_id++, ResourceKind::Buffer };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->imported = true;
@@ -980,7 +989,7 @@ TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const T
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-        resouce->handle = { s.next_id++ };
+        resouce->handle = { s.next_id++, ResourceKind::Texture };
         resouce->name = s.m_allocator->copy_string(name);
         resouce->kind = ResourceNode::Kind::Texture;
         resouce->persistent = true;
@@ -1015,7 +1024,7 @@ TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-        resouce->handle = { s.next_id++ };
+        resouce->handle = { s.next_id++, ResourceKind::Buffer };
         resouce->name = s.m_allocator->copy_string(name);
         resouce->kind = ResourceNode::Kind::Buffer;
         resouce->persistent = true;
@@ -1038,7 +1047,7 @@ ResourceHandle RenderGraph::create_persistent_buffer(WGPUStringView name, const 
     s.m_allocator->pool.touch(name, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-    resouce->handle = { s.next_id++ };
+    resouce->handle = { s.next_id++, ResourceKind::Buffer };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->persistent = true;
@@ -1059,7 +1068,7 @@ ResourceHandle RenderGraph::create_persistent_image(WGPUStringView name, const T
     s.m_allocator->pool.touch(name, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-    resouce->handle = { s.next_id++ };
+    resouce->handle = { s.next_id++, ResourceKind::Texture };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->persistent = true;
@@ -1157,7 +1166,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
                 if (currentProducer[id] && currentProducer[id] != p)
                     onEdge(p, currentProducer[id], id, HazardKind::RAW);
                 // register as a pending reader of the current version (for a future write's WAR).
-                NodeAdjacency* link = alloc->scratch_make<NodeAdjacency>();   // transient: dead at function return
+                NodeAdjacency* link = alloc->scratch_make<NodeAdjacency>();
                 link->pass = p; link->next = pendingReaders[id]; pendingReaders[id] = link;
             }
         }
@@ -1681,11 +1690,14 @@ void debug_print_lifetimes(RenderGraph* rg)
 // rather than dereferencing null. a valid graph never reaches here.
 static void rg_resolve_miss(const char* fn, ResourceHandle h)
 {
+    // TODO: add bettre error handling
     std::printf("[RenderGraph] error: ctx.%s(): no live resource for handle id %u.\n", fn, h.id);
 }
 
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
+    assert(h.id != 0);
+    assert(h.kind == ResourceKind::Texture && "only textures can create a view");
     ResourceNode* r = find_node(graph, h);
     if (!r) { rg_resolve_miss("view", h); return {}; }   // unknown / default handle: loud, bind nothing
     if (!r->texture) return r->view;     // imported: the caller-registered view (e.g. swapchain)
@@ -1724,14 +1736,20 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
 
 WGPUTexture PassContext::texture(ResourceHandle h) const
 {
+    assert(h.id != 0);
+    assert(h.kind == ResourceKind::Texture);
     ResourceNode* r = find_node(graph, h);
+    assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
     if (!r) { rg_resolve_miss("texture", h); return {}; }
     return r->texture;   // null for an imported texture (sample via ctx.view) -- the body's concern, not a graph bug
 }
 
 WGPUBuffer PassContext::buffer(ResourceHandle h) const
 {
+    assert(h.id != 0);
+    assert(h.kind == ResourceKind::Buffer);
     ResourceNode* r = find_node(graph, h);
+    assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
     if (!r) { rg_resolve_miss("buffer", h); return {}; }
     // realize() skips a buffer with no accumulated usage (no live pass wrote it) -> r->buffer stays null. an
     // imported buffer always carries its registered handle, so a null here means a declared-but-unwritten graph
@@ -1741,11 +1759,24 @@ WGPUBuffer PassContext::buffer(ResourceHandle h) const
     return r->buffer;
 }
 
-WGPUExtent3D PassContext::size(ResourceHandle h) const
+WGPUExtent3D PassContext::texture_size(ResourceHandle h) const
 {
+    assert(h.id != 0);
+    assert(h.kind == ResourceKind::Texture);
     ResourceNode* r = find_node(graph, h);
+    assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
     if (!r) { rg_resolve_miss("size", h); return {}; }
     return r->resolved;   // compile() phase 3 resolved every live resource
+}
+
+uint32_t PassContext::buffer_size(ResourceHandle h) const
+{
+    assert(h.id != 0);
+    assert(h.kind == ResourceKind::Buffer);
+    ResourceNode* r = find_node(graph, h);
+    assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
+    if (!r) { rg_resolve_miss("size", h); return {}; }
+    return r->bufferSize;
 }
 
 // create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
@@ -2066,10 +2097,12 @@ void RenderGraph::release_resources()
 // records one access on the pass currently being built: the one primitive every GraphBuilder
 // helper below wraps. load/store/clear are only meaningful for the two attachment AccessTypes;
 // every other call site leaves them at their (ignored) defaults.
-void GraphBuilder::use(ResourceHandle handle, AccessType type,
-                       WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, float clearDepth,
-                       uint32_t baseMip, uint32_t baseLayer,
-                       WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
+static void use(PassNode* pass, ResourceHandle handle, AccessType type,
+    WGPULoadOp load = WGPULoadOp_Undefined, WGPUStoreOp store = WGPUStoreOp_Undefined,
+    WGPUColor clear = {}, float clearDepth = {},
+    uint32_t baseMip = 0, uint32_t baseLayer = 0,
+    WGPULoadOp stencilLoad = WGPULoadOp_Undefined, WGPUStoreOp stencilStore = WGPUStoreOp_Undefined,
+    uint32_t stencilClear = 0)
 {
     if (!handle.id) return;   // invalid handle (id 0): record nothing -- no dependency, no usage bit, no view lookup later
 #if RG_VALIDATE
@@ -2082,15 +2115,15 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
     // because it has no way to synchronize two writes inside a pass; relax if a shader ever needs it.
     if (handle.id) {
         const bool w = access_is_write(type);
-        for (uint32_t i = 0; i < m_new_pass->accessCount; ++i) {
-            if (m_new_pass->accesses[i].handle.id != handle.id) continue;
+        for (uint32_t i = 0; i < pass->accessCount; ++i) {
+            if (pass->accesses[i].handle.id != handle.id) continue;
             if (in_pass_accesses_conflict(type, baseMip, baseLayer,
-                                          m_new_pass->accesses[i].type,
-                                          m_new_pass->accesses[i].baseMip, m_new_pass->accesses[i].baseLayer)) {
+                pass->accesses[i].type,
+                pass->accesses[i].baseMip, pass->accesses[i].baseLayer)) {
                 std::printf("[RenderGraph] error: pass \"%.*s\" uses resource id %u %s in one pass -- a "
                             "written resource must be its only use in the pass.\n",
-                            (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "",
-                            handle.id, (w && access_is_write(m_new_pass->accesses[i].type))
+                            (int)pass->name.length, pass->name.data ? pass->name.data : "",
+                            handle.id, (w && access_is_write(pass->accesses[i].type))
                                            ? "as more than one write (unsynchronized)"
                                            : "as both written and read");
                 assert(false && "RenderGraph: illegal in-pass resource usage (read+write or double write in one pass)");
@@ -2099,15 +2132,15 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
     }
 #endif
 
-    if (m_new_pass->accessCount < PassNode::kMaxAccess) {
-        m_new_pass->accesses[m_new_pass->accessCount++] =
+    if (pass->accessCount < PassNode::kMaxAccess) {
+        pass->accesses[pass->accessCount++] =
             { handle, type, load, store, clear, clearDepth, stencilLoad, stencilStore, stencilClear, baseMip, baseLayer };
     } else {
         // hard structural cap hit (PassNode::kMaxAccess). dropping the access silently mis-renders (a missing
         // attachment/binding), so be loud right here -- always-on (not RG_VALIDATE), at the offending b.*() call.
         std::printf("[RenderGraph] error: pass \"%.*s\" hit kMaxAccess (%u) -- access on resource id %u dropped; "
                     "raise PassNode::kMaxAccess.\n",
-                    (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "",
+                    (int)pass->name.length, pass->name.data ? pass->name.data : "",
                     (unsigned)PassNode::kMaxAccess, handle.id);
         assert(false && "RenderGraph: pass exceeded kMaxAccess");
     }
@@ -2115,7 +2148,8 @@ void GraphBuilder::use(ResourceHandle handle, AccessType type,
 
 void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
+    assert(handle.kind == ResourceKind::Texture);
+    use(m_new_pass, handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
@@ -2145,33 +2179,34 @@ void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t bas
         assert(false && "RenderGraph: resolve() with no preceding color() in a pass");
     }
 #endif
-    use(handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer, WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
-    use(handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, stencilLoad, stencilStore, stencilClear);
+    use(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, stencilLoad, stencilStore, stencilClear);
 }
 
 void GraphBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     // load/store/clear default Undefined/{}; required when read-only
-    use(handle, AccessType::DepthStencilReadOnly, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::DepthStencilReadOnly, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    assert(handle.kind == ResourceKind::Texture);
+    use(m_new_pass, handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void GraphBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
-    use(handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 // in-place read-modify-write: the API mirror of WGSL `var<storage, read_write>`. records the
@@ -2186,32 +2221,39 @@ void GraphBuilder::storage_read_write(ResourceHandle handle, uint32_t baseMip, u
 
 void GraphBuilder::uniform(ResourceHandle handle)
 {
-    use(handle, AccessType::Uniform);
+    assert(handle.kind == ResourceKind::Buffer);
+    use(m_new_pass, handle, AccessType::Uniform);
 }
 
 void GraphBuilder::copy_src(ResourceHandle handle)
 {
-    use(handle, AccessType::CopySrc);
+    use(m_new_pass, handle, AccessType::CopySrc);
 }
 
 void GraphBuilder::copy_dst(ResourceHandle handle)
 {
-    use(handle, AccessType::CopyDst);
+    use(m_new_pass, handle, AccessType::CopyDst);
 }
 
 void GraphBuilder::vertex_buffer(ResourceHandle handle)
 {
-    use(handle, AccessType::Vertex);
+    assert(handle.id != 0);
+    assert(handle.kind == ResourceKind::Buffer);
+    use(m_new_pass, handle, AccessType::Vertex);
 }
 
 void GraphBuilder::index_buffer(ResourceHandle handle)
 {
-    use(handle, AccessType::Index);
+    assert(handle.id != 0);
+    assert(handle.kind == ResourceKind::Buffer);
+    use(m_new_pass, handle, AccessType::Index);
 }
 
 void GraphBuilder::indirect_buffer(ResourceHandle handle)
 {
-    use(handle, AccessType::Indirect);
+    assert(handle.id != 0);
+    assert(handle.kind == ResourceKind::Buffer);
+    use(m_new_pass, handle, AccessType::Indirect);
 }
 
 // gate this pass on a persistent target -- compile() runs it only while the target needs (re)baking: it is
@@ -2219,8 +2261,9 @@ void GraphBuilder::indirect_buffer(ResourceHandle handle)
 // marker; declare the actual write to `target` separately. hash 0 (default) == bake once.
 void GraphBuilder::initialize(ResourceHandle target, uint64_t hash)
 {
+    assert(m_new_pass->initTarget.id == 0 || m_new_pass->initTarget.id == target.id && "The render graph only supports one initialize per pass!");
     m_new_pass->initTarget = target;
-    m_new_pass->initHash   = hash;
+    m_new_pass->initHash = hash;
 }
 
 // keep this pass even with no in-graph reader and no imported/persistent write: mark it an extra cull root

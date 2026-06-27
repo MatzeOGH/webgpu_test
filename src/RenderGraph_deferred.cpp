@@ -708,7 +708,7 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
             wgpuComputePassEncoderSetPipeline(ctx.compute, ssaoPipe);
             wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
-            WGPUExtent3D as = ctx.size(ao);                       // half-res AO extent -> workgroups cover exactly its grid
+            WGPUExtent3D as = ctx.texture_size(ao);                       // half-res AO extent -> workgroups cover exactly its grid
             wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, (as.width + 7) / 8, (as.height + 7) / 8, 1);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);

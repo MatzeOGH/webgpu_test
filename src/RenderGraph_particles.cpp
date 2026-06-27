@@ -274,6 +274,7 @@ static void particles_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle 
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
             wgpuComputePassEncoderSetPipeline(ctx.compute, simPipe);
             wgpuComputePassEncoderSetBindGroup(ctx.compute, 0, bg, 0, nullptr);
+            assert(ctx.buffer_size(parts.prev) == kParticleBytes);
             wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, groups, 1, 1);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);
