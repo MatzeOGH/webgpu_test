@@ -453,7 +453,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
     });
     rg->add_pass(WEBGPU_STR("pt.accum"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.storage_read_write(acc);   // one call mirrors WGSL var<storage, read_write> samples
         },
@@ -474,7 +474,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
 
     // trace one new sample, fold it into the running mean carried in prev.
     rg->add_pass(WEBGPU_STR("pt.trace"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(a.prev);
             b.color(a.curr, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -497,7 +497,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
     // per-frame log-luminance histogram: reads the traced HDR image, writes 256 u32 bins into a
     // persistent buffer via storage_write (pure-write sink, no dependency on prior contents).
     rg->add_pass(WEBGPU_STR("pt.histogram"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(a.curr);
             b.storage_write(histo);
         },
@@ -519,7 +519,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
     // bilateral denoise: smooth path-tracing noise while preserving edges. transient output
     // tests create_image + compute storage_write on a texture; mixes pass kinds in the chain.
     rg->add_pass(WEBGPU_STR("pt.denoise"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(a.curr);
             b.storage_write(denoised);
             b.uniform(ubo);
@@ -542,7 +542,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
 
     // tonemap the denoised HDR result into the swapchain; reads the histogram for auto-exposure.
     rg->add_pass(WEBGPU_STR("pt.present"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(denoised);
             b.storage_read(histo);
             b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});

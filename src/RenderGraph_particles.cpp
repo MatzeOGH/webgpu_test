@@ -258,7 +258,7 @@ static void particles_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle 
     // sim: integrate prev -> curr. one invocation per particle.
     const uint32_t groups = (kParticleCount + 63u) / 64u;
     rg->add_pass(WEBGPU_STR("particles.sim"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.storage_read(parts.prev);
             b.storage_write(parts.curr);
@@ -282,7 +282,7 @@ static void particles_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle 
 
     // draw: billboard every particle, additive over a near-black clear.
     rg->add_pass(WEBGPU_STR("particles.draw"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.storage_read(parts.curr);
             b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0.01, 0.01, 0.02, 1.0});

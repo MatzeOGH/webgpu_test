@@ -1,5 +1,5 @@
 // ===== Bake (precompute-once, re-bake on change) demo =======================================
-// Demonstrates create_persistent_image + GraphBuilder::initialize(target, hash): a procedural environment
+// Demonstrates create_persistent_image + PassBuilder::initialize(target, hash): a procedural environment
 // is baked into a persistent texture and then sampled every frame. The bake pass runs ONLY when the result
 // is stale -- the first frame (target unrealized), after the pool evicts it, or when the settings `hash`
 // changes (drag the sun, switch quality). A steady setting bakes once; nothing re-bakes per frame.
@@ -152,7 +152,7 @@ static void bake_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle swapc
     // bake: fill the env from the current settings. initialize(envTex, hash) gates it -> it runs only while
     // bake.env is unrealized OR `hash` differs from the hash last baked in, then compile() culls it.
     rg->add_pass(WEBGPU_STR("bake.fill"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(bparams);
             b.color(envTex, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
             b.initialize(envTex, hash);
@@ -174,7 +174,7 @@ static void bake_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle swapc
     // show: sample the baked env to the swapchain, every frame. on frames the bake is culled, bake.env has
     // no in-graph writer -- legal, because a persistent resource is external (its value is from a prior frame).
     rg->add_pass(WEBGPU_STR("bake.show"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(envTex);
             b.color(swapchain, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});

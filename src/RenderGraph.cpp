@@ -635,9 +635,11 @@ struct GraphAllocator
         scratchHighWater = 0;
     }
 
-    void reset_scratch()
+    // reset scratch head to a new position
+    // enables partial resets
+    void reset_scratch(size_t pos = 0)
     {
-        scratchUsed = 0;
+        scratchUsed = pos;
     }
 };
 
@@ -734,7 +736,7 @@ struct PassNode
     // skipInit (drops the pass this frame) once the target's pool entry is populated AND was baked with this
     // same initHash; a fresh/evicted target or a changed hash re-arms it. 0 target = ordinary pass.
     ResourceHandle initTarget{};
-    uint64_t       initHash{};   // settings digest this bake produces (see GraphBuilder::initialize)
+    uint64_t       initHash{};   // settings digest this bake produces (see PassBuilder::initialize)
     bool           skipInit{};
 
     PassNode* next{}; // ptr to the next pass node of the render graph
@@ -1087,19 +1089,19 @@ ResourceHandle RenderGraph::create_persistent_image(WGPUStringView name, const T
 }
 
 
-GraphBuilder RenderGraph::begin_pass(WGPUStringView name, PassKind kind)
+PassBuilder RenderGraph::begin_pass(WGPUStringView name, PassKind kind)
 {
     RenderGraphStorage& s = *storage(this);
     PassNode* pass = s.m_allocator->make<PassNode>();
     pass->name = s.m_allocator->copy_string(name);
     pass->kind = kind;
 
-    GraphBuilder builder;
+    PassBuilder builder;
     builder.m_new_pass = pass;
     return builder;
 }
 
-void RenderGraph::end_pass(GraphBuilder& builder)
+void RenderGraph::end_pass(PassBuilder& builder)
 {
     list_append(&storage(this)->m_passes, builder.m_new_pass);
 }
@@ -1109,7 +1111,7 @@ void* RenderGraph::alloc_exec(size_t size, size_t align)
     return storage(this)->m_allocator->alloc_raw(size, align);
 }
 
-void RenderGraph::set_exec(GraphBuilder& builder, void* obj, void(*fn)(void*, PassContext&))
+void RenderGraph::set_exec(PassBuilder& builder, void* obj, void(*fn)(void*, PassContext&))
 {
     builder.m_new_pass->exec_obj = obj;
     builder.m_new_pass->exec_fn  = fn;
@@ -2094,7 +2096,7 @@ void RenderGraph::release_resources()
     s.m_allocator->transient.end_frame();     // release every claim + evict idle textures AND buffers
 }
 
-// records one access on the pass currently being built: the one primitive every GraphBuilder
+// records one access on the pass currently being built: the one primitive every PassBuilder
 // helper below wraps. load/store/clear are only meaningful for the two attachment AccessTypes;
 // every other call site leaves them at their (ignored) defaults.
 static void use(PassNode* pass, ResourceHandle handle, AccessType type,
@@ -2146,13 +2148,13 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
     }
 }
 
-void GraphBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
 {
     assert(handle.kind == ResourceKind::Texture);
     use(m_new_pass, handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     // single-sample target the preceding color() resolves into; execute() pairs it with the most recent
     // color() by order. load/store/clear are unused (a resolve has no load op of its own).
@@ -2182,29 +2184,29 @@ void GraphBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t bas
     use(m_new_pass, handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer, WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
+void PassBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer, WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
     use(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, stencilLoad, stencilStore, stencilClear);
 }
 
-void GraphBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     // load/store/clear default Undefined/{}; required when read-only
     use(m_new_pass, handle, AccessType::DepthStencilReadOnly, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     assert(handle.kind == ResourceKind::Texture);
     use(m_new_pass, handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     use(m_new_pass, handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void GraphBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     use(m_new_pass, handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
@@ -2213,43 +2215,43 @@ void GraphBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32
 // StorageRead+StorageWrite pair on one handle -- in_pass_accesses_conflict whitelists exactly this
 // pairing, and the sweep's self-guards (no WAR/WAW/RAW edge from a pass to itself) keep it acyclic.
 // one logical binding, two recorded accesses.
-void GraphBuilder::storage_read_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::storage_read_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
     storage_read(handle, baseMip, baseLayer);
     storage_write(handle, baseMip, baseLayer);
 }
 
-void GraphBuilder::uniform(ResourceHandle handle)
+void PassBuilder::uniform(ResourceHandle handle)
 {
     assert(handle.kind == ResourceKind::Buffer);
     use(m_new_pass, handle, AccessType::Uniform);
 }
 
-void GraphBuilder::copy_src(ResourceHandle handle)
+void PassBuilder::copy_src(ResourceHandle handle)
 {
     use(m_new_pass, handle, AccessType::CopySrc);
 }
 
-void GraphBuilder::copy_dst(ResourceHandle handle)
+void PassBuilder::copy_dst(ResourceHandle handle)
 {
     use(m_new_pass, handle, AccessType::CopyDst);
 }
 
-void GraphBuilder::vertex_buffer(ResourceHandle handle)
+void PassBuilder::vertex_buffer(ResourceHandle handle)
 {
     assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Buffer);
     use(m_new_pass, handle, AccessType::Vertex);
 }
 
-void GraphBuilder::index_buffer(ResourceHandle handle)
+void PassBuilder::index_buffer(ResourceHandle handle)
 {
     assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Buffer);
     use(m_new_pass, handle, AccessType::Index);
 }
 
-void GraphBuilder::indirect_buffer(ResourceHandle handle)
+void PassBuilder::indirect_buffer(ResourceHandle handle)
 {
     assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Buffer);
@@ -2259,7 +2261,7 @@ void GraphBuilder::indirect_buffer(ResourceHandle handle)
 // gate this pass on a persistent target -- compile() runs it only while the target needs (re)baking: it is
 // unrealized, or `hash` differs from the hash last baked in. not an access (records no hazard/usage), just a
 // marker; declare the actual write to `target` separately. hash 0 (default) == bake once.
-void GraphBuilder::initialize(ResourceHandle target, uint64_t hash)
+void PassBuilder::initialize(ResourceHandle target, uint64_t hash)
 {
     assert(m_new_pass->initTarget.id == 0 || m_new_pass->initTarget.id == target.id && "The render graph only supports one initialize per pass!");
     m_new_pass->initTarget = target;
@@ -2270,7 +2272,7 @@ void GraphBuilder::initialize(ResourceHandle target, uint64_t hash)
 // so compile() phase 2 never drops it (and keeps everything it depends on). not an access (records no
 // hazard/usage), just a marker. for side-effect-only passes: readback, timestamp/profiling resolve,
 // indirect-arg gen consumed outside the graph.
-void GraphBuilder::force_keep()
+void PassBuilder::force_keep()
 {
     m_new_pass->forceKeep = true;
 }

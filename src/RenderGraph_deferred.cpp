@@ -626,7 +626,7 @@ static GBuffer build_gbuffer(RenderGraph* rg, WGPUDevice dev, ResourceHandle ubo
         screen_tex(rg, "gbuffer.depth",  kDepthFormat, swap),
     };
     rg->add_pass(WEBGPU_STR("gbuffer"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.color(g.albedo, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});         // @location(0)
             b.color(g.normal, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0.5, 0.5, 1.0, 1});   // @location(1)
             b.color(g.rough,  WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});         // @location(2)
@@ -661,7 +661,7 @@ static ResourceHandle build_shadows(RenderGraph* rg, WGPUDevice dev, ResourceHan
     });
     for (uint32_t c = 0; c < kNumCascades; ++c) {
         rg->add_pass(WEBGPU_STR("shadow.cascade"), PassKind::Graphics,
-            [&, c](GraphBuilder& b) {
+            [&, c](PassBuilder& b) {
                 b.depth_stencil(csm, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f, 0, c);   // baseMip 0, layer c
                 b.uniform(ubo);
             },
@@ -690,7 +690,7 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
     WGPUDevice dev = env.device;
     auto ao = screen_tex(rg, "ssao.ao", kAOFormat, swap, 0.5f);   // half-res AO (P3); grid + dispatch derive from ctx.size(ao)
     rg->add_pass(WEBGPU_STR("ssao"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);                 // camera basis for world reconstruction
             b.sampled(gDepth);
             b.sampled(gNormal);
@@ -721,7 +721,7 @@ static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHa
 {
     auto lit = screen_tex(rg, "lighting.color", kColorFormat, swap);
     rg->add_pass(WEBGPU_STR("lighting"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(g.albedo);
             b.sampled(g.normal);
             b.sampled(g.rough);
@@ -763,7 +763,7 @@ static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHa
 static void build_sky(RenderGraph* rg, WGPUDevice dev, ResourceHandle gDepth, ResourceHandle lit)
 {
     rg->add_pass(WEBGPU_STR("sky"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(gDepth);                                                              // which pixels are background
             b.color(lit, WGPULoadOp_Load, WGPUStoreOp_Store);                               // keep lit geometry, add sky
         },
@@ -791,7 +791,7 @@ static ResourceHandle build_compose(RenderGraph* rg, WGPUDevice dev, ResourceHan
 
     auto scene = screen_tex(rg, "compose.scene", kSwapFormat, swap);
     rg->add_pass(WEBGPU_STR("compose"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(lit);
             b.sampled(ao);
             b.color(scene, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -837,7 +837,7 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
 
     // inject: scene UBO + CSM + last frame's volume -> scatter.curr.
     rg->add_pass(WEBGPU_STR("fog.inject"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(csm);
             b.sampled(scatter.prev);
@@ -870,7 +870,7 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
 
     // integrate: scatter.curr -> integrated volume, accumulating in-scatter + transmittance per column.
     rg->add_pass(WEBGPU_STR("fog.integrate"), PassKind::Compute,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(scatter.curr);
             b.storage_write(volInteg);
         },
@@ -892,7 +892,7 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
     // apply: composite the integrated fog over the lit scene -> new scene colour.
     auto out = screen_tex(rg, "fog.scene", kSwapFormat, swap);
     rg->add_pass(WEBGPU_STR("fog.apply"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(scene);
             b.sampled(gDepth);
@@ -936,13 +936,13 @@ static ResourceHandle build_cube(RenderGraph* rg, WGPUDevice dev, ResourceHandle
     };
     for (uint32_t f = 0; f < 6; ++f) {
         rg->add_pass(WEBGPU_STR("cube.face"), PassKind::Graphics,
-            [&, f](GraphBuilder& b) {
+            [&, f](PassBuilder& b) {
                 b.color(cube, WGPULoadOp_Clear, WGPUStoreOp_Store, kFace[f], 0, f);   // baseMip 0, layer f
             },
             [](PassContext&) {});   // clear-only: nothing to record
     }
     rg->add_pass(WEBGPU_STR("cube.sample"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.uniform(ubo);     // camera basis for the ray
             b.sampled(cube);
             b.color(scene, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -988,7 +988,7 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
 
     // extract: bright parts of the scene -> mip 0.
     rg->add_pass(WEBGPU_STR("bloom.extract"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(scene);
             b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, 0);
         },
@@ -1010,7 +1010,7 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
     // downsample: sample mip i, render into mip i+1 (Clear).
     for (uint32_t i = 0; i + 1 < bloomMips; ++i) {
         rg->add_pass(WEBGPU_STR("bloom.down"), PassKind::Graphics,
-            [&, i](GraphBuilder& b) {
+            [&, i](PassBuilder& b) {
                 b.sampled(bloom, i);
                 b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, i + 1);
             },
@@ -1034,7 +1034,7 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
     // level the downsample wrote this frame).
     for (uint32_t i = bloomMips; i-- > 1; ) {
         rg->add_pass(WEBGPU_STR("bloom.up"), PassKind::Graphics,
-            [&, i](GraphBuilder& b) {
+            [&, i](PassBuilder& b) {
                 b.sampled(bloom, i);
                 b.color(bloom, WGPULoadOp_Load, WGPUStoreOp_Store, WGPUColor{}, i - 1);
             },
@@ -1057,7 +1057,7 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
     // composite: scene + accumulated bloom (mip 0) -> result.
     auto result = screen_tex(rg, "bloom.scene", kSwapFormat, swap);
     rg->add_pass(WEBGPU_STR("bloom.composite"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(scene);
             b.sampled(bloom, 0);
             b.color(result, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -1091,7 +1091,7 @@ static ResourceHandle build_taa(RenderGraph* rg, const DemoEnv& env, ResourceHan
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swap,
     }, historyEpoch);
     rg->add_pass(WEBGPU_STR("taa"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(scene);                    // this frame's shaded colour
             b.sampled(hist.prev);               // previous frame (rotated in by the pool)
             b.color(hist.curr, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -1132,7 +1132,7 @@ static ResourceHandle build_alias_test(RenderGraph* rg, const DemoEnv& env, Reso
     // sampler binding), and every scratch is kSwapFormat like presentPipe's target.
     auto blit = [&](const char* name, ResourceHandle src, ResourceHandle dst) {
         rg->add_pass(WGPUStringView{ name, WGPU_STRLEN }, PassKind::Graphics,
-            [&](GraphBuilder& b) {
+            [&](PassBuilder& b) {
                 b.sampled(src);
                 b.color(dst, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
             },
@@ -1171,7 +1171,7 @@ static ResourceHandle build_forcekeep_test(RenderGraph* rg, ResourceHandle scene
     if (!enabled) return scene;
     ResourceHandle scratch = screen_tex(rg, "keep.scratch", kSwapFormat, swap);
     rg->add_pass(WEBGPU_STR("keep.side"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.force_keep();   // remove this line -> the pass vanishes from execution order (culled)
             b.color(scratch, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },
@@ -1214,7 +1214,7 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
 
     auto fill = [&](const char* nm, ResourceHandle dst) {
         rg->add_pass(WGPUStringView{ nm, WGPU_STRLEN }, PassKind::Compute,
-            [&](GraphBuilder& b) { b.storage_write(dst); },
+            [&](PassBuilder& b) { b.storage_write(dst); },
             [dev, dst](PassContext& ctx) {
                 WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(bufFillPipe, 0);
                 WGPUBindGroupEntry e[1] = { { .binding = 0, .buffer = ctx.buffer(dst), .offset = 0, .size = kBytes } };
@@ -1228,7 +1228,7 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
     };
     auto step = [&](const char* nm, ResourceHandle src, ResourceHandle dst, bool keep) {
         rg->add_pass(WGPUStringView{ nm, WGPU_STRLEN }, PassKind::Compute,
-            [&, keep](GraphBuilder& b) { b.storage_read(src); b.storage_write(dst); if (keep) b.force_keep(); },
+            [&, keep](PassBuilder& b) { b.storage_read(src); b.storage_write(dst); if (keep) b.force_keep(); },
             [dev, src, dst](PassContext& ctx) {
                 WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(bufStepPipe, 0);
                 WGPUBindGroupEntry e[2] = {
@@ -1260,7 +1260,7 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
 static void build_present(RenderGraph* rg, WGPUDevice dev, ResourceHandle scene, ResourceHandle swap)
 {
     rg->add_pass(WEBGPU_STR("present"), PassKind::Graphics,
-        [&](GraphBuilder& b) {
+        [&](PassBuilder& b) {
             b.sampled(scene);
             b.color(swap, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },

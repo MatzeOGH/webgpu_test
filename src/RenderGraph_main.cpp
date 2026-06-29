@@ -251,7 +251,7 @@ int main()
         // ImGui overlay: last pass. Load keeps the rendered scene; the write to the imported swapchain
         // makes it a sink, and a WAW edge orders it after the demo's present.
         rg->add_pass(WEBGPU_STR("imgui"), PassKind::Graphics,
-            [&](GraphBuilder& b) { b.color(swapchain, WGPULoadOp_Load, WGPUStoreOp_Store); },
+            [&](PassBuilder& b) { b.color(swapchain, WGPULoadOp_Load, WGPUStoreOp_Store); },
             [](PassContext& ctx) { ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), ctx.render); });
 
         auto t0 = std::chrono::steady_clock::now();

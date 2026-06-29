@@ -8,6 +8,7 @@
 // Major Refactor before v0
 // calling add_{resource} to the rendergraph gives to opportunity to call it after compile by mistake where the graph
 // is in read mode onaly and it is not allowed to add new passes or resources
+// - 
 
 
 #pragma once
@@ -60,7 +61,6 @@ struct ResourceHandle
 };
 
 
-
 // a ping-pong temporal (history) resource: two physical textures or buffers rotate each frame.
 // write `curr`, read `prev`. returned by create_temporal_image / create_temporal_buffer
 struct TemporalResource
@@ -91,7 +91,7 @@ struct PassContext
     uint32_t buffer_size(ResourceHandle h) const;
 };
 
-struct GraphBuilder
+struct PassBuilder
 {
     // color attachment
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1}, uint32_t baseMip = 0, uint32_t baseLayer = 0);
@@ -171,6 +171,11 @@ struct BufferDesc
     uint64_t size{};
 };
 
+struct RenderGraphBuilder
+{
+
+};
+
 struct RenderGraph
 {
 
@@ -216,7 +221,7 @@ struct RenderGraph
     // One pool-backed texture (no ping-pong), survives the per-frame teardown, auto-evicted once no pass
     // declares it. For a precomputed/baked resource written once then sampled every frame -- IBL / env map,
     // BRDF LUT, prefiltered specular. Declare it every frame (to read it), and fill it with a pass marked
-    // GraphBuilder::initialize(handle, hash): that bake runs only when the texture is freshly (re)created
+    // PassBuilder::initialize(handle, hash): that bake runs only when the texture is freshly (re)created
     // (first frame, eviction, or a descriptor/resize change -- the pool clears its `baked` flag) or the
     // settings `hash` changes, not every frame.
     ResourceHandle create_persistent_image(WGPUStringView name, const TextureDesc& desc);
@@ -236,7 +241,7 @@ struct RenderGraph
     {
         assert(name.length != 0 && "must have name");
         assert(kind != PassKind::None);
-        GraphBuilder builder = begin_pass(name, kind);
+        PassBuilder builder = begin_pass(name, kind);
         setup(builder);
         store_exec(builder, std::forward<ExecuteFn>(executeFn));
         end_pass(builder);
@@ -267,7 +272,7 @@ struct RenderGraph
 private:
     // type-erase the execute callback into allocator-owned memory; the trampoline is a
     // captureless lambda (-> plain fn-pointer), so no extra named symbol leaks onto the struct
-    template<class F> void store_exec(GraphBuilder& b, F&& f){
+    template<class F> void store_exec(PassBuilder& b, F&& f){
         using D = std::decay_t<F>;
         static_assert(std::is_trivially_destructible_v<D>,
             "execute callback must be trivially destructible (arena frees without dtor); capture handles/ids by value");
@@ -277,12 +282,12 @@ private:
         set_exec(b, m, [](void* o, PassContext& c){ (*static_cast<D*>(o))(c); });
     }
     void* alloc_exec(size_t size, size_t align);                                       // forwards to GraphAllocator
-    void  set_exec(GraphBuilder& builder, void* obj, void(*fn)(void*, PassContext&));  // writes obj+fn onto PassNode
+    void  set_exec(PassBuilder& builder, void* obj, void(*fn)(void*, PassContext&));  // writes obj+fn onto PassNode
 
     // .cpp shims add_pass uses to alloc/append a PassNode across the header/.cpp boundary
     // (PassNode/GraphAllocator are incomplete here); not part of the public API.
-    GraphBuilder begin_pass(WGPUStringView name, PassKind kind);
-    void end_pass(GraphBuilder& builder);
+    PassBuilder begin_pass(WGPUStringView name, PassKind kind);
+    void end_pass(PassBuilder& builder);
 };
 
 // Creates an instance of the `GraphAllocator` with a given areana size default to to 1MB
