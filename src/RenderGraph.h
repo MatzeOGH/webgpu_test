@@ -32,7 +32,7 @@ namespace RG
 
 enum struct PassKind : uint8_t
 {
-    None = 0,
+    None = 0,   // invalide!
     Graphics,
     Compute,
     Transfer
@@ -77,12 +77,12 @@ struct RenderGraph; // PassContext holds a back-pointer for resource lookup
 // the real thing that replaces the old forward-declared stub.
 struct PassContext
 {
-    WGPUCommandEncoder encoder{};  // always set
-    WGPURenderPassEncoder render{};   // set for Graphics passes
-    WGPUComputePassEncoder compute{};  // set for Compute passes
-    WGPUQueue queue{};
+    WGPUCommandEncoder encoder{};               // always set
+    WGPURenderPassEncoder render{};             // set for Graphics passes
+    WGPUComputePassEncoder compute{};           // set for Compute passes
+    WGPUQueue queue{};                          // needed for copy ops
     RenderGraph* graph{};
-    PassNode* pass{};   // the pass being recorded; lets view(h) build the subresource the access declared
+    PassNode* pass{};                           // the pass being recorded; lets view(h) build the subresource the access declared
 
     WGPUTextureView view(ResourceHandle h) const;   // resolved view
     WGPUTexture texture(ResourceHandle h) const;    // resolved texture (copies need the texture, not a view)
@@ -93,7 +93,7 @@ struct PassContext
 
 struct PassBuilder
 {
-    // color attachment
+    // color attachment. Only legal for render passes
     void color(ResourceHandle handle, WGPULoadOp load = WGPULoadOp_Clear, WGPUStoreOp store = WGPUStoreOp_Store, WGPUColor clear = {0, 0, 0, 1}, uint32_t baseMip = 0, uint32_t baseLayer = 0);
     // depth stencil attachment. for a depth+stencil format pass the stencil load/store/clear too (a
     // depth-only format leaves them Undefined/0); the bound pipeline's depthStencil state drives the actual
@@ -158,7 +158,7 @@ struct TextureDesc
     ResourceHandle relativeTo{};
     WGPUExtent3D absolute = WGPU_EXTENT_3D_INIT;   // depthOrArrayLayers = array/cube layers (6 for a cube)
     uint32_t mipLevelCount = 1;                    // > 1 for a mip chain (downsample pyramid, mip generation); per-mip size is implicit
-    uint32_t sampleCount = 1;                      // > 1 = MSAA (multisampled attachment)
+    uint32_t sampleCount = 1;                      // > 1 = MSAA (multisampled attachment); must be 1 or 4 ( WebGPU 1.0 limit)
     // ponytail: sampleCount > 1 implies a 2D, mipLevelCount-1, non-storage texture and every attachment in
     // a pass must share it; not enforced here -- Dawn validates at texture/render-pass creation.
     // ponytail: hazards stay whole-resource. a mip chain still serializes right (each step RAW-depends on
@@ -171,26 +171,20 @@ struct BufferDesc
     uint64_t size{};
 };
 
-struct RenderGraphBuilder
-{
-
-};
-
+// IMPORTANT: the RenderGraph is a transient object and should never be stored longer than `release_resources()` is called
 struct RenderGraph
 {
 
-    //
+    // a per-frame transient GPU texture the graph owns: realize() backs it
     ResourceHandle create_image(WGPUStringView name, const TextureDesc& desc);
+    // Declares an external buffer the graph can use. i.e. swapchain texture
     ResourceHandle importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size);
-    ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
-    // a per-frame transient GPU buffer the graph owns (the buffer twin of create_image): realize() backs it
-    // from the TransientResourcePool and phase-4 aliasing may pack it onto a shared buffer with a disjoint-
-    // lifetime sibling; freed at end_frame. for graph-authored scratch consumed within the frame (compute
-    // output, indirect args, scan/compaction). host-written UBOs stay imported; cross-frame state uses
-    // create_temporal_buffer / create_persistent_buffer.
+    // a per-frame transient GPU buffer the graph owns: realize() backs it
     ResourceHandle create_buffer(WGPUStringView name, const BufferDesc& desc);
+    // Declares an external buffer the graph can use.
+    ResourceHandle import_buffer(WGPUStringView name, WGPUBuffer buffer);
 
-    // Temporal (history) resource: a ping-pong pair the PersistentResourcePool rotates each frame, so
+    // Temporal (history) texture: a ping-pong pair the PersistentResourcePool rotates each frame, so
     // this frame's `.curr` becomes next frame's `.prev` for free -- no manual ping-pong or caller-owned
     // textures. Write `.curr`, read `.prev`. Survives the per-frame teardown (realize()/release_resources()
     // defer to the pool the allocator owns). Writing `.prev` is an authoring
@@ -292,6 +286,10 @@ private:
 
 // Creates an instance of the `GraphAllocator` with a given areana size default to to 1MB
 GraphAllocator* create_allocator(size_t arenaSize = 1u << 20);
+
+void destroy_allocator(GraphAllocator* allocator);
+
+
 RenderGraph* create_render_graph(GraphAllocator* allocator);
 
 // debug: dump the graph as a Mermaid flowchart to stdout (passes = nodes, resources = edges)

@@ -144,7 +144,7 @@ struct PersistentResourcePool
     //       doing a simple hash compare might be faster
     Entry* find(WGPUStringView name)
     {
-        const size_t len = sv_length(name);   // names may arrive as WGPU_STRLEN (see screenTex)
+        const size_t len = sv_length(name);
         for (Entry& e : entries)
             if (e.name.size() == len &&
                 (len == 0 || std::memcmp(e.name.data(), name.data, len) == 0))
@@ -490,6 +490,7 @@ struct GpuProfiler
 // permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
 // for compile()-local temporaries, reset per-scope via defer (AlpUtils.h) instead of calloc/free.
 // Also owns the two resource pools (below): they share the allocator's lifetime, so when it goes they go.
+// TODO: add a chained allocator to enable growing allocations
 struct GraphAllocator
 {
     // Pointer to the base memory block
@@ -774,12 +775,13 @@ struct PhysicalResource
 // the header a pure method-only interface.
 struct RenderGraphStorage
 {
-    GraphAllocator*         m_allocator{};   // owns the pools; reach them via m_allocator->pool / ->transient
-    ResourceNode*           m_resouces{};    // linked list of resources declared for the graph
-    PassNode*               m_passes{};      // linked list of passes declared for the graph
-    WGPUDevice              m_device{};
-    uint32_t                next_id = 1; // 0 = invalid handle
-    ResourceNode**          byId{};      // id->node (sized next_id); built in compile() phase 3 -> O(1) find_node
+    GraphAllocator*         m_allocator{};  // owns the pools; reach them via m_allocator->pool / ->transient
+    ResourceNode*           m_resouces{};   // linked list of resources declared for the graph
+    PassNode*               m_passes{};     // linked list of passes declared for the graph
+    WGPUDevice              m_device{};     //
+    bool                    m_readOnly{};   // after compile() the graph is in readOnly mode and cannot be modified any more.
+    uint32_t                next_resource_id = 1; // 0 = invalid handle; also doubles as resource count -1
+    ResourceNode**          byId{};      // id->node (sized next_resource_id); built in compile() phase 3 -> O(1) find_node
     // aliasing: physical slots computed by compile() phase 4 (front-arena, this frame). m_slotCount == 0
     // whenever aliasing is off -> realize()/release_resources() fall back to the per-resource path unchanged.
     PhysicalResource*       m_slots{};
@@ -788,6 +790,8 @@ struct RenderGraphStorage
     // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
     WGPUTextureView         viewScratch[PassNode::kMaxAccess]{};
     uint32_t                viewScratchN{};
+
+    // CPU timing infos
     float                   timing_compile_us{};
     float                   timing_realize_us{};
     float                   timing_execute_us{};
@@ -795,9 +799,7 @@ struct RenderGraphStorage
 
 static RenderGraphStorage* storage(RenderGraph* rg)
 {
-    return reinterpret_cast<RenderGraphStorage*>(
-        reinterpret_cast<uint8_t*>(rg)
-        + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
+    return reinterpret_cast<RenderGraphStorage*>(reinterpret_cast<uint8_t*>(rg) + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
 }
 
 // resolve a handle to its node. O(1) through the byId table compile() builds (persisted on storage for
@@ -806,7 +808,7 @@ static RenderGraphStorage* storage(RenderGraph* rg)
 static ResourceNode* find_node(RenderGraph* rg, ResourceHandle h)
 {
     RenderGraphStorage& s = *storage(rg);
-    if (s.byId && h.id && h.id < s.next_id) return s.byId[h.id];   // fast path: compiled graph
+    if (s.byId && h.id && h.id < s.next_resource_id) return s.byId[h.id];   // fast path: compiled graph
     for (ResourceNode* r = s.m_resouces; r; r = r->next)           // pre-compile or id 0: walk
         if (r->handle.id == h.id) return r;
     return nullptr;
@@ -818,6 +820,12 @@ GraphAllocator* create_allocator(size_t arenaSize){
     allocator->base = (uint8_t*)malloc(capacity);
     allocator->capacity = capacity;
     return allocator;
+}
+
+void destroy_allocator(GraphAllocator* allocator)
+{
+    free(allocator->base);
+    delete allocator;
 }
 
 RenderGraph* create_render_graph(GraphAllocator* allocator)
@@ -896,18 +904,30 @@ static bool in_pass_accesses_conflict(AccessType a, uint32_t aMip, uint32_t aLay
 }
 #endif
 
-void validate_texture_desc(const TextureDesc& desc)
+// used to validate the correct creation of textures
+static void validate_texture_desc(const TextureDesc& desc)
 {
-    assert(desc.relativeTo.id == 0 || (desc.scaleX != 0 && desc.scaleY != 0) && "When relative to another texture it cannot be a scale of 0");
+    // relative sizing rule
+    assert(desc.relativeTo.id == 0 ||
+        (desc.scaleX > 0.0f && desc.scaleY > 0.0f) && "When relative to another texture it cannot be a scale of 0");
+
+    // MSAA constraints
+    assert(desc.sampleCount == 1 || desc.sampleCount == 4 && "WebGPU(1.0) only supports MSAA samples of 1 or 4.");
+    assert(desc.dimension != WGPUTextureDimension_3D || desc.sampleCount == 1 && "Texture3D do not support MSAA");
+
+    assert(desc.dimension != WGPUTextureDimension_3D || desc.mipLevelCount == 1 && "Texture3d only support mipLevelCount of 1; This can be implemented when needed.");
+
+
 }
 
 ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc& desc)
 {
     validate_texture_desc(desc);
     RenderGraphStorage& s = *storage(this);
+    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++, ResourceKind::Texture };
+    resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->dimension = desc.dimension;
@@ -930,9 +950,10 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
 ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
+    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++, ResourceKind::Buffer };
+    resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->bufferSize = desc.size;
@@ -948,9 +969,10 @@ ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc&
 ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size)
 {
     RenderGraphStorage& s = *storage(this);
+    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++, ResourceKind::Texture };
+    resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->imported = true;
@@ -966,9 +988,10 @@ ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView v
 ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer)
 {
     RenderGraphStorage& s = *storage(this);
+    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
-    resouce->handle = { s.next_id++, ResourceKind::Buffer };
+    resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->imported = true;
@@ -986,12 +1009,13 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc, uint64_t hash)
 {
     RenderGraphStorage& s = *storage(this);
+    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
     s.m_allocator->pool.touch(name, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-        resouce->handle = { s.next_id++, ResourceKind::Texture };
+        resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
         resouce->name = s.m_allocator->copy_string(name);
         resouce->kind = ResourceNode::Kind::Texture;
         resouce->persistent = true;
@@ -1026,7 +1050,7 @@ TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-        resouce->handle = { s.next_id++, ResourceKind::Buffer };
+        resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
         resouce->name = s.m_allocator->copy_string(name);
         resouce->kind = ResourceNode::Kind::Buffer;
         resouce->persistent = true;
@@ -1049,7 +1073,7 @@ ResourceHandle RenderGraph::create_persistent_buffer(WGPUStringView name, const 
     s.m_allocator->pool.touch(name, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-    resouce->handle = { s.next_id++, ResourceKind::Buffer };
+    resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->persistent = true;
@@ -1070,7 +1094,7 @@ ResourceHandle RenderGraph::create_persistent_image(WGPUStringView name, const T
     s.m_allocator->pool.touch(name, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
-    resouce->handle = { s.next_id++, ResourceKind::Texture };
+    resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
     resouce->name = s.m_allocator->copy_string(name);
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->persistent = true;
@@ -1139,12 +1163,12 @@ enum struct HazardKind : uint8_t { RAW, WAW, WAR };
 // any writer of its resource simply binds to "no producer" (no edge). Detecting that authoring error
 // is left to compile()'s post-cull pass, which sees the final schedule; the sweep stays edge-only.
 template<typename OnEdge>
-static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_id, OnEdge&& onEdge)
+static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_resource_id, OnEdge&& onEdge)
 {
-    // per resource id (1..next_id-1): the pass holding the current version, and the readers of that
+    // per resource id (1..next_resource_id-1): the pass holding the current version, and the readers of that
     // version not yet retired by a newer write.
-    PassNode** currentProducer = alloc->scratch_alloc<PassNode*>(next_id);
-    NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_id);
+    PassNode** currentProducer = alloc->scratch_alloc<PassNode*>(next_resource_id);
+    NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_resource_id);
     defer { alloc->reset_scratch(); };
 
     for (PassNode* p = head; p; p = p->next) {
@@ -1230,6 +1254,7 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
 bool RenderGraph::compile(bool enableAlias)
 {
     RenderGraphStorage& s = *storage(this);
+    assert(s.m_readOnly == false);
 
     // phase 0: resolve initialize() passes. such a pass (re)bakes a persistent target and should run only
     // while that target needs it: skip it this frame iff the pool entry exists, was realized on a prior frame
@@ -1260,7 +1285,7 @@ bool RenderGraph::compile(bool enableAlias)
     // three collapse to add_dependency; its dedup folds multiple hazards between one pass pair into
     // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
     // before any writer get no edge here; the post-cull pass below turns them into errors.
-    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
+    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_resource_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t /*id*/, HazardKind /*kind*/) {
             add_dependency(s.m_allocator, dependent, dep);
         });
@@ -1268,11 +1293,11 @@ bool RenderGraph::compile(bool enableAlias)
     // phase 2: dead-node removal + topo sort, fused into one DFS seeded from sinks.
     {
         // sinks = passes writing an imported resource. accesses store only handle.id, so flatten
-        // the imported flags into an id-indexed table first (same scratch_alloc-over-next_id trick
+        // the imported flags into an id-indexed table first (same scratch_alloc-over-next_resource_id trick
         // as phase 1's currentProducer).
         // external = imported OR persistent (temporal). both are output sinks when written (their value
         // leaves the frame) and exempt from the read-before-write check (value comes from outside the frame).
-        bool* external = s.m_allocator->scratch_alloc<bool>(s.next_id);
+        bool* external = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);
         for (ResourceNode* r = s.m_resouces; r; r = r->next)
             external[r->handle.id] = r->is_external();
 
@@ -1315,10 +1340,10 @@ bool RenderGraph::compile(bool enableAlias)
     //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
     // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
     {
-        bool* hasWriter = s.m_allocator->scratch_alloc<bool>(s.next_id);   // some surviving pass writes id
-        bool* produced  = s.m_allocator->scratch_alloc<bool>(s.next_id);   // ...has written it so far, in order
-        bool* external  = s.m_allocator->scratch_alloc<bool>(s.next_id);   // imported OR temporal: value from outside the frame
-        bool* prevLayer = s.m_allocator->scratch_alloc<bool>(s.next_id);   // temporal layer k>0: read-only this frame
+        bool* hasWriter = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // some surviving pass writes id
+        bool* produced  = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // ...has written it so far, in order
+        bool* external  = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // imported OR temporal: value from outside the frame
+        bool* prevLayer = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // temporal layer k>0: read-only this frame
         defer { s.m_allocator->reset_scratch(); };
         for (ResourceNode* r = s.m_resouces; r; r = r->next) {
             external[r->handle.id]  = r->is_external();
@@ -1367,7 +1392,7 @@ bool RenderGraph::compile(bool enableAlias)
     {
         // id->node table: O(1) handle resolution. front-arena (lives until the next create_render_graph
         // reset) and persisted on storage so find_node / PassContext reuse it through realize + execute.
-        s.byId = s.m_allocator->alloc<ResourceNode*>(s.next_id);
+        s.byId = s.m_allocator->alloc<ResourceNode*>(s.next_resource_id);
         ResourceNode** byId = s.byId;   // local alias for the loop + resolve_size below
         for (ResourceNode* r = s.m_resouces; r; r = r->next) byId[r->handle.id] = r;
 
@@ -1442,7 +1467,7 @@ bool RenderGraph::compile(bool enableAlias)
         // attachment; for a BUFFER a storage_write may write only part, so an aliased successor could read
         // the previous occupant's bytes. the shader owns writing every byte it later reads -- same implicit
         // contract textures carry, sharper for buffers. tighten to CopyDst-only here if that ever bites.
-        ResourceNode** elig = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_id);
+        ResourceNode** elig = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_resource_id);
         defer { s.m_allocator->reset_scratch(); };
         uint32_t nElig = 0;
         for (ResourceNode* r = s.m_resouces; r; r = r->next) {
@@ -1505,6 +1530,7 @@ bool RenderGraph::compile(bool enableAlias)
         }
     }
 
+    s.m_readOnly = true; // signal that the render graph is in read only mode ready for rendering
     return true;
 }
 
@@ -1561,7 +1587,7 @@ void debug_print_mermaid(RenderGraph* rg)
     }
 
     // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
-    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_id,
+    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_resource_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
             ResourceNode* r = find_node(rg, { id });
             WGPUStringView nm = r ? r->name : WGPUStringView{};
@@ -1699,26 +1725,28 @@ static void rg_resolve_miss(const char* fn, ResourceHandle h)
 WGPUTextureView PassContext::view(ResourceHandle h) const
 {
     assert(h.id != 0);
-    assert(h.kind == ResourceKind::Texture && "only textures can create a view");
+    assert(h.kind == ResourceKind::Texture && "ctx.view: only textures can create a view");
+    assert(pass); // cannot be nullptr
     ResourceNode* r = find_node(graph, h);
     if (!r) { rg_resolve_miss("view", h); return {}; }   // unknown / default handle: loud, bind nothing
     if (!r->texture) return r->view;     // imported: the caller-registered view (e.g. swapchain)
 
     // a single-mip 2D texture's full view IS its only subresource, and a 3D volume is sampled whole, so the
-    // view already on the node is the right one -- hand it back (no per-call churn, and a 3D volume must not
+    // view already on the node is the right one; hand it back (no per-call churn, and a 3D volume must not
     // be sliced to one 2D layer). only a mip chain / 2D array needs a per-subresource view.
     uint32_t layers = (r->dimension == WGPUTextureDimension_2D)
                     ? (r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1) : 1;
-    if (!pass || (r->mipLevelCount <= 1 && layers <= 1)) return r->view;
+    if (r->mipLevelCount <= 1 && layers <= 1)
+        return r->view;
 
     // mip chain / array: hand back the (baseMip, baseLayer) 2D slice the body's READ access declared, pooled
     // with the attachment views for release after the pass (exactly like attach_view in execute()).
-    // ponytail: a 3D mip chain would fall through and get a 2D view -- none exist; revisit if one does.
+    // ponytail: a 3D mip chain would fall through and get a 2D view; none exist; revisit if one does.
     const ResourceAccess* rd = nullptr;
     for (uint32_t i = 0; i < pass->accessCount; ++i) {
         const ResourceAccess& a = pass->accesses[i];
         if (a.handle.id == h.id && !access_is_write(a.type)) {
-            assert(!rd && "ctx.view: two reads of one handle in a pass -- ambiguous subresource; use ctx.texture");
+            assert(!rd && "ctx.view: two reads of one handle in a pass; ambiguous subresource; use ctx.texture");
             rd = &a;
         }
     }
@@ -2151,6 +2179,7 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
 void PassBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
 {
     assert(handle.kind == ResourceKind::Texture);
+    assert(m_new_pass->kind == PassKind::Graphics && "color attachment is only legal for graphics passes.");
     use(m_new_pass, handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
 }
 
