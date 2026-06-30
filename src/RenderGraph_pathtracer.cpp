@@ -431,10 +431,10 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
     u.dnSigmaS   = dnSigmaS;
     u.dnSigmaL   = dnSigmaL;
     wgpuQueueWriteBuffer(env.queue, uboBuf, 0, &u, sizeof(u));
-    ResourceHandle ubo = rg->import_buffer(WEBGPU_STR("pt.ubo"), uboBuf);
+    ResourceHandle ubo = rg->import_buffer("pt.ubo"_rid, uboBuf);
 
     // ping-ponged HDR target: write curr, read prev (last frame's accumulated mean).
-    auto a = rg->create_temporal_image(WEBGPU_STR("pt.accum"), {
+    auto a = rg->create_temporal_image("pt.accum"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kAccumFormat,
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
     });
@@ -443,16 +443,16 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
     // create_persistent_buffer. read + write the same buffer in one pass (the StorageRead+StorageWrite RMW
     // pair); own-slot, so one buffer is correct + half the memory of a temporal pair. nothing reads it, so
     // trace/present are untouched -- it survives culling purely by writing a persistent sink.
-    auto acc   = rg->create_persistent_buffer(WEBGPU_STR("pt.samples"),    { .size = kAccumBytes });
-    auto histo = rg->create_persistent_buffer(WEBGPU_STR("pt.histogram"), { .size = kHistoBytes });
+    auto acc   = rg->create_persistent_buffer("pt.samples"_rid,    { .size = kAccumBytes });
+    auto histo = rg->create_persistent_buffer("pt.histogram"_rid, { .size = kHistoBytes });
 
     // transient denoised image: written by pt.denoise, read by pt.present. exercises create_image
     // (first transient texture in this demo) and tests aliasing with the temporal ping-pong pair.
-    auto denoised = rg->create_image(WEBGPU_STR("pt.denoised"), {
+    auto denoised = rg->create_image("pt.denoised"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kAccumFormat,
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swapchain,
     });
-    rg->add_pass(WEBGPU_STR("pt.accum"), PassKind::Compute,
+    rg->add_pass("pt.accum"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.storage_read_write(acc);   // one call mirrors WGSL var<storage, read_write> samples
@@ -473,7 +473,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
         });
 
     // trace one new sample, fold it into the running mean carried in prev.
-    rg->add_pass(WEBGPU_STR("pt.trace"), PassKind::Graphics,
+    rg->add_pass("pt.trace"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(a.prev);
@@ -496,7 +496,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
 
     // per-frame log-luminance histogram: reads the traced HDR image, writes 256 u32 bins into a
     // persistent buffer via storage_write (pure-write sink, no dependency on prior contents).
-    rg->add_pass(WEBGPU_STR("pt.histogram"), PassKind::Compute,
+    rg->add_pass("pt.histogram"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.sampled(a.curr);
             b.storage_write(histo);
@@ -518,7 +518,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
 
     // bilateral denoise: smooth path-tracing noise while preserving edges. transient output
     // tests create_image + compute storage_write on a texture; mixes pass kinds in the chain.
-    rg->add_pass(WEBGPU_STR("pt.denoise"), PassKind::Compute,
+    rg->add_pass("pt.denoise"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.sampled(a.curr);
             b.storage_write(denoised);
@@ -541,7 +541,7 @@ static void pathtracer_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle
         });
 
     // tonemap the denoised HDR result into the swapchain; reads the histogram for auto-exposure.
-    rg->add_pass(WEBGPU_STR("pt.present"), PassKind::Graphics,
+    rg->add_pass("pt.present"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(denoised);
             b.storage_read(histo);

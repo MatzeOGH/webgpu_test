@@ -566,9 +566,9 @@ static int build_gtree(std::vector<GNode>& gtree, const RgDagBox* box, int n,
 	g.prefix = prefix; g.gi = gi; g.gj = gj; g.depth = depth;
 	if (sv_length(prefix)) { int st = grpStore->GetInt(rg_grp_key(prefix), 0); g.collapsed = st == 2 ? true : st == 1 ? false : collapseDefault; }
 	for (int a = gi; a < gj;) {
-		WGPUStringView sub = group_prefix_n(box[a].p->name, depth + 1);
+		WGPUStringView sub = group_prefix_n(box[a].p->id.name, depth + 1);
 		int b = a + 1;
-		while (b < gj && sv_length(sub) && sv_eq(group_prefix_n(box[b].p->name, depth + 1), sub)) ++b;
+		while (b < gj && sv_length(sub) && sv_eq(group_prefix_n(box[b].p->id.name, depth + 1), sub)) ++b;
 		if (sv_length(sub) && b - a >= 2 && !(a == gi && b == gj))
 			g.kids.push_back(build_gtree(gtree, box, n, grpStore, collapseDefault, a, b, depth + 1, sub));
 		a = b;
@@ -838,7 +838,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	struct TNode { bool isRead; int passBox, pin; ResourceNode* res; int col; float w, h; const char* cap; ImU32 tint; int li; };
 	static std::vector<TNode> tnodes; tnodes.clear();
 	auto push_tnode = [&](bool isRead, int passBox, int pin, ResourceNode* res, const char* cap, ImU32 tint) {
-		char b[48]; std::snprintf(b, sizeof b, "%.*s", (int)res->name.length, res->name.data ? res->name.data : "?");
+		char b[48]; std::snprintf(b, sizeof b, "%.*s", (int)res->id.name.length, res->id.name.data ? res->id.name.data : "?");
 		ImVec2 ns = ImGui::CalcTextSize(b), cs = ImGui::CalcTextSize(cap);
 		float w = ((ns.x > cs.x ? ns.x : cs.x) + 16) * zoom, h = (ns.y + cs.y + 10) * zoom;
 		tnodes.push_back({ isRead, passBox, pin, res, isRead ? vReadCol[passBox] : vWriteCol[passBox], w, h, cap, tint, -1 });
@@ -954,9 +954,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		// writer members (cube's 6 face clears) have no in-graph read edge, so each would otherwise split into
 		// its own component and the banding would stack them, shoving the group's consumers far down/over.
 		for (int ga = 0; ga < n;) {
-			WGPUStringView pre = group_prefix(box[ga].p->name);
+			WGPUStringView pre = group_prefix(box[ga].p->id.name);
 			int gb = ga + 1;
-			while (gb < n && sv_length(pre) && sv_eq(group_prefix(box[gb].p->name), pre)) ++gb;
+			while (gb < n && sv_length(pre) && sv_eq(group_prefix(box[gb].p->id.name), pre)) ++gb;
 			if (sv_length(pre) && gb - ga >= 2) for (int k = ga + 1; k < gb; ++k) comp[cfind(ga)] = cfind(k);
 			ga = gb;
 		}
@@ -1069,7 +1069,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	static std::vector<RgEdge> rge; rge.clear();
 	for (int i = 0; i < n; ++i) {
 		RgNode nd{}; nd.kind = RgNode::Kind::Pass; nd.pass = box[i].p;
-		nd.label = box[i].p->name; nd.pos = box[i].tl; nd.w = box[i].w; nd.h = box[i].h; nd.col = box[i].layer;
+		nd.label = box[i].p->id.name; nd.pos = box[i].tl; nd.w = box[i].w; nd.h = box[i].h; nd.col = box[i].layer;
 		rgn.push_back(nd);
 	}
 	for (REdge& e : edge) {
@@ -1176,9 +1176,9 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		for (int i = 0; i < cnt; ++i) pins[i].y += shift;
 	};
 	for (int gi = 0; gi < n;) {
-		WGPUStringView pre = group_prefix(box[gi].p->name);
+		WGPUStringView pre = group_prefix(box[gi].p->id.name);
 		int gj = gi + 1;
-		while (gj < n && sv_length(pre) && sv_eq(group_prefix(box[gj].p->name), pre)) ++gj;
+		while (gj < n && sv_length(pre) && sv_eq(group_prefix(box[gj].p->id.name), pre)) ++gj;
 		if (!(sv_length(pre) && gj - gi >= 2)) { gi = gj; continue; }
 
 		float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
@@ -1312,7 +1312,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		return np;
 	};
 	bool matchBox[kRgDagMax];
-	for (int i = 0; i < n; ++i) matchBox[i] = rg_name_has(rgn[i].pass->name, filter);
+	for (int i = 0; i < n; ++i) matchBox[i] = rg_name_has(rgn[i].pass->id.name, filter);
 
 	// ---- find the single hovered pin (manual rect test: pins are small + overlap the box button).
 	int hovB = -1, hovSlot = -1; bool hovWrite = false; uint32_t hovId = 0, hovMip = 0, hovLayer = 0; AccessType hovType{};
@@ -1521,7 +1521,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			for (int e = 3; e >= 1; --e)
 				dl->AddRect(ImVec2(tl.x - e, tl.y - e), ImVec2(br.x + e, br.y + e), IM_COL32(255, 100, 0, dim ? 80 : 200), 6.0f, 0, 1.0f);
 
-		WGPUStringView nm = rgn[i].pass->name;
+		WGPUStringView nm = rgn[i].pass->id.name;
 		char head[96];
 		std::snprintf(head, sizeof head, "P%d  %.*s", i, (int)nm.length, nm.data ? nm.data : "");
 		dl->PushClipRect(tl, ImVec2(br.x - 4, br.y), true);
@@ -1543,7 +1543,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		for (uint32_t k = 0; k < p->accessCount; ++k) {
 			const ResourceAccess& acc = p->accesses[k];
 			ResourceNode* r = find_node(rg, acc.handle);
-			WGPUStringView rn = r ? r->name : WGPUStringView{};
+			WGPUStringView rn = r ? r->id.name : WGPUStringView{};
 			char lbl[48]; std::snprintf(lbl, sizeof lbl, "%.*s", (int)rn.length, rn.data ? rn.data : "?");
 			ImVec2 ls = ImGui::CalcTextSize(lbl);
 			const ImU32 lc = dim ? IM_COL32(190, 190, 190, 110) : IM_COL32(230, 230, 230, 255);
@@ -1587,7 +1587,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		dl->PopClipRect();
 		for (int s = 0; s < g.nIn; ++s) {
 			ResourceNode* r = find_node(rg, { g.inId[s] });
-			WGPUStringView rn = r ? r->name : WGPUStringView{};
+			WGPUStringView rn = r ? r->id.name : WGPUStringView{};
 			bool buf = r && r->kind == ResourceNode::Kind::Buffer;
 			bool prod = false; for (int j = 0; j < n; ++j) if (rg_pass_writes(box[j].p, g.inId[s])) prod = true;
 			rg_draw_pin(dl, g.inC[s], kPinR, kRGRead, prod, buf);   // hollow = external input (no in-graph producer)
@@ -1601,7 +1601,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		}
 		for (int s = 0; s < g.nOut; ++s) {
 			ResourceNode* r = find_node(rg, { g.outId[s] });
-			WGPUStringView rn = r ? r->name : WGPUStringView{};
+			WGPUStringView rn = r ? r->id.name : WGPUStringView{};
 			bool buf = r && r->kind == ResourceNode::Kind::Buffer;
 			rg_draw_pin(dl, g.outC[s], kPinR, kRGWrite, true, buf);
 			if (hovB >= g.gi && hovB < g.gj && hovWrite && hovId == g.outId[s]) dl->AddCircle(g.outC[s], kPinR + 3.0f, IM_COL32(255, 255, 255, 255), 16, 2.0f);
@@ -1700,7 +1700,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		if (!vLive[vi]) continue;   // node with no surviving link (all readers filtered/deduped) stays hidden
 		RgNode& vn = rgn[vi];
 		ImVec2 a(origin.x + vn.pos.x, origin.y + vn.pos.y), b(a.x + vn.w, a.y + vn.h);
-		char nm[48]; std::snprintf(nm, sizeof nm, "%.*s", (int)vn.res->name.length, vn.res->name.data ? vn.res->name.data : "?");
+		char nm[48]; std::snprintf(nm, sizeof nm, "%.*s", (int)vn.res->id.name.length, vn.res->id.name.data ? vn.res->id.name.data : "?");
 		const char* cap = vn.label.data ? vn.label.data : "";
 		dl->AddRectFilled(a, b, IM_COL32(32, 30, 40, 240), 4.0f);
 		dl->AddRect(a, b, vn.tint, 4.0f, 0, 1.5f);
@@ -1713,7 +1713,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	// ---- tooltip: hovered pin wins; else fall back to the per-pass reads/writes list.
 	if (hovB >= 0) {
 		PassNode* p = rgn[hovB].pass; ResourceNode* r = find_node(rg, { hovId });
-		WGPUStringView rn = r ? r->name : WGPUStringView{};
+		WGPUStringView rn = r ? r->id.name : WGPUStringView{};
 		ImGui::BeginTooltip();
 		ImGui::Text("%.*s", (int)rn.length, rn.data ? rn.data : "?");
 		if (r) {
@@ -1740,7 +1740,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		else {
 			int prod = rg_producer_of(box, n, p, hovId);
 			if (prod >= 0) {
-				WGPUStringView pn = rgn[prod].pass->name;
+				WGPUStringView pn = rgn[prod].pass->id.name;
 				ImGui::Text("produced by P%d %.*s", prod, (int)pn.length, pn.data ? pn.data : "");
 			}
 			else ImGui::TextDisabled(r && r->imported ? "imported (external input)" : "external input (no producer)");
@@ -1748,7 +1748,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		ImGui::EndTooltip();
 	}
 	else if (hovBox >= 0) {
-		PassNode* p = rgn[hovBox].pass; WGPUStringView nm = p->name;
+		PassNode* p = rgn[hovBox].pass; WGPUStringView nm = p->id.name;
 		const char* kn = rg_kind_name(p->kind);
 		ImGui::BeginTooltip();
 		ImGui::Text("%.*s  [%s]", (int)nm.length, nm.data ? nm.data : "", kn);
@@ -1756,7 +1756,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		for (uint32_t k = 0; k < p->accessCount; ++k) {
 			const ResourceAccess& acc = p->accesses[k];
 			ResourceNode* r = find_node(rg, acc.handle);
-			WGPUStringView rn = r ? r->name : WGPUStringView{};
+			WGPUStringView rn = r ? r->id.name : WGPUStringView{};
 			ImGui::Text("[%s] %.*s  (%s)%s", access_is_write(acc.type) ? "W" : "R",
 				(int)rn.length, rn.data ? rn.data : "", rg_access_name(acc.type),
 				r ? (r->imported ? "  [imported]" : r->persistent ? "  [temporal]" : "") : "");
@@ -1765,8 +1765,8 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 	}
 	else if (hovEdge >= 0) {
 		REdge& e = edge[hovEdge]; ResourceNode* r = find_node(rg, { e.id });
-		WGPUStringView rn = r ? r->name : WGPUStringView{};
-		WGPUStringView sn = rgn[e.src].pass->name, dn = rgn[e.dst].pass->name;
+		WGPUStringView rn = r ? r->id.name : WGPUStringView{};
+		WGPUStringView sn = rgn[e.src].pass->id.name, dn = rgn[e.dst].pass->id.name;
 		ImGui::BeginTooltip();
 		ImGui::Text("%.*s", (int)rn.length, rn.data ? rn.data : "?");
 		ImGui::TextDisabled("P%d %.*s  ->  P%d %.*s", e.src, (int)sn.length, sn.data ? sn.data : "",
@@ -1799,12 +1799,12 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		};
 
 		const bool pinSel = lockSlot >= 0;   // a specific pin vs. a whole-pass selection (body click)
-		WGPUStringView pn = p->name;
+		WGPUStringView pn = p->id.name;
 		add(cTitle, "P%d  %.*s  [%s]", lockB, (int)pn.length, pn.data ? pn.data : "", rg_kind_name(p->kind));
 		add(cDim, "");
 		if (pinSel) {
 			add(cHead, "SELECTED PIN");
-			WGPUStringView rn = r ? r->name : WGPUStringView{};
+			WGPUStringView rn = r ? r->id.name : WGPUStringView{};
 			add(r ? rg_resource_color(r->kind) : cDim, "%.*s", (int)rn.length, rn.data ? rn.data : "?");
 			if (r) {
 				if (r->kind == ResourceNode::Kind::Texture) add(cDim, "texture  %u x %u", r->resolved.width, r->resolved.height);
@@ -1822,7 +1822,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 			if (lockWrite) add(cDim, "produced here");
 			else {
 				int prod = rg_producer_of(box, n, p, lockId);
-				if (prod >= 0) { WGPUStringView qn = rgn[prod].pass->name; add(cDim, "produced by P%d %.*s", prod, (int)qn.length, qn.data ? qn.data : ""); }
+				if (prod >= 0) { WGPUStringView qn = rgn[prod].pass->id.name; add(cDim, "produced by P%d %.*s", prod, (int)qn.length, qn.data ? qn.data : ""); }
 				else add(cDim, r && r->imported ? "imported (external input)" : "external input");
 			}
 			add(cDim, "");
@@ -1831,7 +1831,7 @@ static void rg_draw_dag(RenderGraph* rg, RenderGraphStorage& s)
 		for (uint32_t k = 0; k < p->accessCount; ++k) {
 			const ResourceAccess& acc = p->accesses[k];
 			ResourceNode* ar = find_node(rg, acc.handle);
-			WGPUStringView arn = ar ? ar->name : WGPUStringView{};
+			WGPUStringView arn = ar ? ar->id.name : WGPUStringView{};
 			bool sel = acc.handle.id == lockId && access_is_write(acc.type) == lockWrite;
 			add(sel ? cTitle : cDim, "%s [%s] %.*s (%s)%s", sel ? ">" : " ",
 				access_is_write(acc.type) ? "W" : "R", (int)arn.length, arn.data ? arn.data : "",
@@ -1999,7 +1999,7 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 	static char selName[96] = {};
 	auto rowSelected = [&](const Row& rw) -> bool {
 		if (rw.slot >= 0) return rw.slot == selSlot;
-		return selSlot == -1 && rw.r->name.data && std::strcmp(selName, rw.r->name.data) == 0;
+		return selSlot == -1 && rw.r->id.name.data && std::strcmp(selName, rw.r->id.name.data) == 0;
 	};
 
 	// lifetime grid on top, details panel for the selected texture below (only when the tab is tall enough).
@@ -2019,7 +2019,7 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 	for (int c = 0; c < nPass; ++c) {
 		float x = origin.x + kLabelW + c * kColW;
 		dl->AddLine(ImVec2(x, origin.y), ImVec2(x, gridB), IM_COL32(255, 255, 255, 22));
-		WGPUStringView nm = passAt[c]->name;
+		WGPUStringView nm = passAt[c]->id.name;
 		if (nm.data) {
 			dl->PushClipRect(ImVec2(x + 4, origin.y), ImVec2(x + kColW, gridT), true);
 			dl->AddText(ImVec2(x + 6, origin.y + 5), IM_COL32(225, 225, 225, 255), nm.data, nm.data + nm.length);
@@ -2054,7 +2054,7 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 		const bool isBuf = rowKind(row[i]) == ResourceNode::Kind::Buffer;
 		char label[96];
 		if (shared) std::snprintf(label, sizeof label, "%s %d (x%d)", isBuf ? "buffer" : "image", i, nocc);
-		else        std::snprintf(label, sizeof label, "%.*s", (int)sole->name.length, sole->name.data ? sole->name.data : "");
+		else        std::snprintf(label, sizeof label, "%.*s", (int)sole->id.name.length, sole->id.name.data ? sole->id.name.data : "");
 		if (shared)   // gutter swatch only for shared (aliased) textures
 			dl->AddRectFilled(ImVec2(origin.x + 1, y + 4), ImVec2(origin.x + 4, y + kRowH - 4), col);
 		dl->PushClipRect(ImVec2(origin.x + 6, y), ImVec2(origin.x + kLabelW - 4, y + kRowH), true);
@@ -2067,7 +2067,7 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 		if (ImGui::InvisibleButton("row", ImVec2(kLabelW + nPass * kColW, kRowH))) {
 			selSlot = row[i].slot;
 			if (row[i].slot < 0) std::snprintf(selName, sizeof selName, "%.*s",
-				(int)row[i].r->name.length, row[i].r->name.data ? row[i].r->name.data : "");
+				(int)row[i].r->id.name.length, row[i].r->id.name.data ? row[i].r->id.name.data : "");
 		}
 		const bool hov = ImGui::IsItemHovered();
 		ImGui::PopID();
@@ -2124,7 +2124,7 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 			if (pnocc > 1) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hcol), "%s %d  (shared by %d)",
 				isBuf ? "buffer" : "image", selIdx, pnocc);
 			else           ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(hcol), "%.*s",
-				(int)psole->name.length, psole->name.data ? psole->name.data : "");
+				(int)psole->id.name.length, psole->id.name.data ? psole->id.name.data : "");
 			ImGui::SameLine();
 
 			char ub[160]; ub[0] = '\0';
@@ -2162,13 +2162,13 @@ static void rg_draw_lifetimes(RenderGraph* rg, RenderGraphStorage& s)
 				WGPUStringView f = pass_name_at(s.m_passes, o->firstUse);
 				WGPUStringView l = pass_name_at(s.m_passes, o->lastUse);
 				ImGui::BulletText("%.*s   [%.*s .. %.*s]",
-					(int)o->name.length, o->name.data ? o->name.data : "",
+					(int)o->id.name.length, o->id.name.data ? o->id.name.data : "",
 					(int)f.length, f.data ? f.data : "", (int)l.length, l.data ? l.data : "");
 				ImGui::Indent();
 				for (uint32_t c = o->firstUse; c <= o->lastUse; ++c) {
 					int a = rg_pass_access(passAt[c], o->handle.id);
 					if (!a) continue;
-					WGPUStringView pn = passAt[c]->name;
+					WGPUStringView pn = passAt[c]->id.name;
 					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(a == 1 ? kRGRead : kRGWrite),
 						"%s  %.*s", a == 3 ? "rw" : a == 2 ? " w" : " r", (int)pn.length, pn.data ? pn.data : "");
 				}
@@ -2399,7 +2399,7 @@ static void rg_draw_memory(RenderGraphStorage& s)
 			any = true;
 			const bool isBuf = r->kind == ResourceNode::Kind::Buffer;
 			ImGui::TableNextRow();
-			ImGui::TableNextColumn(); ImGui::Text("%.*s", (int)r->name.length, r->name.data ? r->name.data : "");
+			ImGui::TableNextColumn(); ImGui::Text("%.*s", (int)r->id.name.length, r->id.name.data ? r->id.name.data : "");
 			ImGui::TableNextColumn(); ImGui::Text("%s", isBuf ? "buffer" : "texture");
 			ImGui::TableNextColumn();
 			if (isBuf) ImGui::TextDisabled("-");
@@ -2604,8 +2604,8 @@ static void imgui_layer_draw_graph(RenderGraph* rg)
 	s.m_allocator->profiler.sample_history();
 
 	ImGui::Begin("RenderGraph");
-	ImGui::Text(" %.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
-	ImGui::Text(" compile %.0f us  realize %.0f us  execute %.0f us",
+	ImGui::Text(" %1.1f FPS (%1.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+	ImGui::Text(" compile %1.0f us  realize %1.0f us  execute %1.0f us",
 	            s.timing_compile_us, s.timing_realize_us, s.timing_execute_us);
 	// GPU timing (opt-in): total of the last completed per-pass timestamp read-back, breakdown on hover.
 	if (const GpuProfiler& gp = s.m_allocator->profiler; gp.resultCount) {

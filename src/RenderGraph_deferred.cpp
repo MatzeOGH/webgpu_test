@@ -607,25 +607,24 @@ static float fogDensity = 0.08f, fogAnisotropy = 0.6f, fogHeightFalloff = 0.25f,
 // the gbuffer's four outputs, threaded through the chain as one value.
 struct GBuffer { ResourceHandle albedo, normal, rough, depth; };
 
-// a swapchain-sized offscreen texture (WGPU_STRLEN -> copy_string measures the literal).
-static ResourceHandle screen_tex(RenderGraph* rg, const char* name, WGPUTextureFormat fmt, ResourceHandle swap, float scale = 1.0f)
+static ResourceHandle screen_tex(RenderGraph* rg, ResourceId id, WGPUTextureFormat fmt, ResourceHandle swap, float scale = 1.0f)
 {
-    return rg->create_image(WGPUStringView{ name, WGPU_STRLEN }, {
+    return rg->create_image(id, {
         .dimension = WGPUTextureDimension_2D, .format = fmt,
         .sizeKind = SizeKind::Relative, .scaleX = scale, .scaleY = scale, .relativeTo = swap,
-    });
+        });
 }
 
 // gbuffer: raymarch the SDF -> albedo / normal / roughness (MRT) + linear depth.
 static GBuffer build_gbuffer(RenderGraph* rg, WGPUDevice dev, ResourceHandle ubo, ResourceHandle swap)
 {
     GBuffer g{
-        screen_tex(rg, "gbuffer.albedo", kColorFormat, swap),
-        screen_tex(rg, "gbuffer.normal", kColorFormat, swap),
-        screen_tex(rg, "gbuffer.rough",  kColorFormat, swap),
-        screen_tex(rg, "gbuffer.depth",  kDepthFormat, swap),
+        screen_tex(rg, "gbuffer.albedo"_rid, kColorFormat, swap),
+        screen_tex(rg, "gbuffer.normal"_rid, kColorFormat, swap),
+        screen_tex(rg, "gbuffer.rough"_rid,  kColorFormat, swap),
+        screen_tex(rg, "gbuffer.depth"_rid,  kDepthFormat, swap),
     };
-    rg->add_pass(WEBGPU_STR("gbuffer"), PassKind::Graphics,
+    rg->add_pass("gbuffer"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.color(g.albedo, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});         // @location(0)
             b.color(g.normal, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0.5, 0.5, 1.0, 1});   // @location(1)
@@ -655,12 +654,12 @@ static GBuffer build_gbuffer(RenderGraph* rg, WGPUDevice dev, ResourceHandle ubo
 // (WAW) and lighting RAW-depends on all.
 static ResourceHandle build_shadows(RenderGraph* rg, WGPUDevice dev, ResourceHandle ubo)
 {
-    auto csm = rg->create_image(WEBGPU_STR("shadow.csm"), {
+    auto csm = rg->create_image("shadow.csm"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kDepthFormat,
         .sizeKind = SizeKind::Absolute, .absolute = { kShadowSize, kShadowSize, kNumCascades },
     });
     for (uint32_t c = 0; c < kNumCascades; ++c) {
-        rg->add_pass(WEBGPU_STR("shadow.cascade"), PassKind::Graphics,
+        rg->add_pass("shadow.cascade"_rid, PassKind::Graphics,
             [&, c](PassBuilder& b) {
                 b.depth_stencil(csm, WGPULoadOp_Clear, WGPUStoreOp_Store, 1.0f, 0, c);   // baseMip 0, layer c
                 b.uniform(ubo);
@@ -688,8 +687,8 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
                                  ResourceHandle gDepth, ResourceHandle gNormal, ResourceHandle swap)
 {
     WGPUDevice dev = env.device;
-    auto ao = screen_tex(rg, "ssao.ao", kAOFormat, swap, 0.5f);   // half-res AO (P3); grid + dispatch derive from ctx.size(ao)
-    rg->add_pass(WEBGPU_STR("ssao"), PassKind::Compute,
+    auto ao = screen_tex(rg, "ssao.ao"_rid, kAOFormat, swap, 0.5f);   // half-res AO (P3); grid + dispatch derive from ctx.size(ao)
+    rg->add_pass("ssao"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.uniform(ubo);                 // camera basis for world reconstruction
             b.sampled(gDepth);
@@ -719,8 +718,8 @@ static ResourceHandle build_ssao(RenderGraph* rg, const DemoEnv& env, ResourceHa
 // lighting: gbuffer + shadow map + directional light -> lit colour.
 static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHandle ubo, GBuffer g, ResourceHandle csm, ResourceHandle swap)
 {
-    auto lit = screen_tex(rg, "lighting.color", kColorFormat, swap);
-    rg->add_pass(WEBGPU_STR("lighting"), PassKind::Graphics,
+    auto lit = screen_tex(rg, "lighting.color"_rid, kColorFormat, swap);
+    rg->add_pass("lighting"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(g.albedo);
             b.sampled(g.normal);
@@ -762,7 +761,7 @@ static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHa
 // sky: 2nd writer of the lit colour (LoadOp_Load, background pixels only) -> WAW edge after lighting.
 static void build_sky(RenderGraph* rg, WGPUDevice dev, ResourceHandle gDepth, ResourceHandle lit)
 {
-    rg->add_pass(WEBGPU_STR("sky"), PassKind::Graphics,
+    rg->add_pass("sky"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(gDepth);                                                              // which pixels are background
             b.color(lit, WGPULoadOp_Load, WGPUStoreOp_Store);                               // keep lit geometry, add sky
@@ -789,8 +788,8 @@ static ResourceHandle build_compose(RenderGraph* rg, WGPUDevice dev, ResourceHan
 {
     if (!ssaoOn) return lit;
 
-    auto scene = screen_tex(rg, "compose.scene", kSwapFormat, swap);
-    rg->add_pass(WEBGPU_STR("compose"), PassKind::Graphics,
+    auto scene = screen_tex(rg, "compose.scene"_rid, kSwapFormat, swap);
+    rg->add_pass("compose"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(lit);
             b.sampled(ao);
@@ -828,15 +827,15 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
     WGPUDevice dev = env.device;
     const TextureDesc desc3d{
         .dimension = WGPUTextureDimension_3D, .format = kFogFormat,
-        .sizeKind = SizeKind::Absolute, .absolute = { kFroxelX, kFroxelY, kFroxelZ }, .mipLevelCount = 1,
+        .sizeKind = SizeKind::Absolute, .absolute = { kFroxelX, kFroxelY, kFroxelZ }, .mipLevelCount = 1, .sampleCount = 1,
     };
-    auto scatter  = rg->create_temporal_image(WEBGPU_STR("fog.scatter"), desc3d, historyEpoch);
-    auto volInteg = rg->create_image(WEBGPU_STR("fog.integrated"), desc3d);
+    auto scatter  = rg->create_temporal_image("fog.scatter"_rid, desc3d, historyEpoch);
+    auto volInteg = rg->create_image("fog.integrated"_rid, desc3d);
     const uint32_t ix = (kFroxelX + 3) / 4, iy = (kFroxelY + 3) / 4, iz = (kFroxelZ + 3) / 4;   // inject 4x4x4
     const uint32_t cx = (kFroxelX + 7) / 8, cy = (kFroxelY + 7) / 8;                            // integrate 8x8x1
 
     // inject: scene UBO + CSM + last frame's volume -> scatter.curr.
-    rg->add_pass(WEBGPU_STR("fog.inject"), PassKind::Compute,
+    rg->add_pass("fog.inject"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(csm);
@@ -869,7 +868,7 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
         });
 
     // integrate: scatter.curr -> integrated volume, accumulating in-scatter + transmittance per column.
-    rg->add_pass(WEBGPU_STR("fog.integrate"), PassKind::Compute,
+    rg->add_pass("fog.integrate"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.sampled(scatter.curr);
             b.storage_write(volInteg);
@@ -890,8 +889,8 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
         });
 
     // apply: composite the integrated fog over the lit scene -> new scene colour.
-    auto out = screen_tex(rg, "fog.scene", kSwapFormat, swap);
-    rg->add_pass(WEBGPU_STR("fog.apply"), PassKind::Graphics,
+    auto out = screen_tex(rg, "fog.scene"_rid, kSwapFormat, swap);
+    rg->add_pass("fog.apply"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(scene);
@@ -923,8 +922,8 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
 // -> a rotatable scene colour. Stands in for the deferred source when cubeOn.
 static ResourceHandle build_cube(RenderGraph* rg, WGPUDevice dev, ResourceHandle ubo, ResourceHandle swap)
 {
-    auto scene = screen_tex(rg, "cube.scene", kSwapFormat, swap);
-    auto cube = rg->create_image(WEBGPU_STR("cube"), {
+    auto scene = screen_tex(rg, "cube.scene"_rid, kSwapFormat, swap);
+    auto cube = rg->create_image("cube"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kColorFormat,
         .sizeKind = SizeKind::Absolute, .absolute = { 256, 256, 6 }, .mipLevelCount = 1,
     });
@@ -935,13 +934,13 @@ static ResourceHandle build_cube(RenderGraph* rg, WGPUDevice dev, ResourceHandle
         {0.66, 0.16, 0.66, 1}, {0.16, 0.22, 0.80, 1}, {0.72, 0.66, 0.16, 1},
     };
     for (uint32_t f = 0; f < 6; ++f) {
-        rg->add_pass(WEBGPU_STR("cube.face"), PassKind::Graphics,
+        rg->add_pass("cube.face"_rid, PassKind::Graphics,
             [&, f](PassBuilder& b) {
                 b.color(cube, WGPULoadOp_Clear, WGPUStoreOp_Store, kFace[f], 0, f);   // baseMip 0, layer f
             },
             [](PassContext&) {});   // clear-only: nothing to record
     }
-    rg->add_pass(WEBGPU_STR("cube.sample"), PassKind::Graphics,
+    rg->add_pass("cube.sample"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(ubo);     // camera basis for the ray
             b.sampled(cube);
@@ -980,14 +979,14 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
     uint32_t minDim = env.width < env.height ? env.width : env.height;
     uint32_t bloomMips = 1;
     while (bloomMips < 6 && (1u << bloomMips) <= minDim) ++bloomMips;   // smallest mip stays >= 1px, cap 6
-    auto bloom = rg->create_image(WEBGPU_STR("bloom"), {
+    auto bloom = rg->create_image("bloom"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kColorFormat,
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swap,
         .mipLevelCount = bloomMips,
     });
 
     // extract: bright parts of the scene -> mip 0.
-    rg->add_pass(WEBGPU_STR("bloom.extract"), PassKind::Graphics,
+    rg->add_pass("bloom.extract"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(scene);
             b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, 0);
@@ -1009,7 +1008,7 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
 
     // downsample: sample mip i, render into mip i+1 (Clear).
     for (uint32_t i = 0; i + 1 < bloomMips; ++i) {
-        rg->add_pass(WEBGPU_STR("bloom.down"), PassKind::Graphics,
+        rg->add_pass("bloom.down"_rid, PassKind::Graphics,
             [&, i](PassBuilder& b) {
                 b.sampled(bloom, i);
                 b.color(bloom, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1}, i + 1);
@@ -1033,7 +1032,7 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
     // upsample: sample mip i (coarser), additively blend into mip i-1 (LoadOp_Load keeps the finer
     // level the downsample wrote this frame).
     for (uint32_t i = bloomMips; i-- > 1; ) {
-        rg->add_pass(WEBGPU_STR("bloom.up"), PassKind::Graphics,
+        rg->add_pass("bloom.up"_rid, PassKind::Graphics,
             [&, i](PassBuilder& b) {
                 b.sampled(bloom, i);
                 b.color(bloom, WGPULoadOp_Load, WGPUStoreOp_Store, WGPUColor{}, i - 1);
@@ -1055,8 +1054,8 @@ static ResourceHandle build_bloom(RenderGraph* rg, const DemoEnv& env, ResourceH
     }
 
     // composite: scene + accumulated bloom (mip 0) -> result.
-    auto result = screen_tex(rg, "bloom.scene", kSwapFormat, swap);
-    rg->add_pass(WEBGPU_STR("bloom.composite"), PassKind::Graphics,
+    auto result = screen_tex(rg, "bloom.scene"_rid, kSwapFormat, swap);
+    rg->add_pass("bloom.composite"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(scene);
             b.sampled(bloom, 0);
@@ -1086,11 +1085,11 @@ static ResourceHandle build_taa(RenderGraph* rg, const DemoEnv& env, ResourceHan
 {
     if (!enabled) return scene;
     WGPUDevice dev = env.device;
-    auto hist = rg->create_temporal_image(WEBGPU_STR("taa.history"), {
+    auto hist = rg->create_temporal_image("taa.history"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kSwapFormat,
         .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = swap,
     }, historyEpoch);
-    rg->add_pass(WEBGPU_STR("taa"), PassKind::Graphics,
+    rg->add_pass("taa"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(scene);                    // this frame's shaded colour
             b.sampled(hist.prev);               // previous frame (rotated in by the pool)
@@ -1130,8 +1129,8 @@ static ResourceHandle build_alias_test(RenderGraph* rg, const DemoEnv& env, Reso
     // one reusable full-screen blit pass: sample `src`, clear + write `dst`. presentPipe already does
     // exactly this (binding 0 texture -> color target, 3-vertex fullscreen triangle, textureLoad so no
     // sampler binding), and every scratch is kSwapFormat like presentPipe's target.
-    auto blit = [&](const char* name, ResourceHandle src, ResourceHandle dst) {
-        rg->add_pass(WGPUStringView{ name, WGPU_STRLEN }, PassKind::Graphics,
+    auto blit = [&](ResourceId id, ResourceHandle src, ResourceHandle dst) {
+        rg->add_pass(id, PassKind::Graphics,
             [&](PassBuilder& b) {
                 b.sampled(src);
                 b.color(dst, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -1151,13 +1150,13 @@ static ResourceHandle build_alias_test(RenderGraph* rg, const DemoEnv& env, Reso
 
     // distinct names so the lifetime widget lists them individually; the pass names repeat (fine -- like
     // bloom.down / shadow.cascade). 4 scratches -> all alias onto one physical slot.
-    static const char* kScratch[] = { "alias.s0", "alias.s1", "alias.s2", "alias.s3" };
-    ResourceHandle accum = screen_tex(rg, "alias.accum", kSwapFormat, swap);
-    blit("alias.seed", scene, accum);                                  // seed the accumulator from the scene
-    for (const char* nm : kScratch) {
+    static ResourceId kScratch[] = { "alias.s0"_rid, "alias.s1"_rid, "alias.s2"_rid, "alias.s3"_rid };
+    ResourceHandle accum = screen_tex(rg, "alias.accum"_rid, kSwapFormat, swap);
+    blit("alias.seed"_rid, scene, accum);                                  // seed the accumulator from the scene
+    for (auto nm : kScratch) {
         ResourceHandle s = screen_tex(rg, nm, kSwapFormat, swap);
-        blit("alias.tap",  accum, s);   // fill scratch from the current accumulator (reads accum)
-        blit("alias.fold", s, accum);   // fold back -> new accum version, forcing the next tap to wait
+        blit("alias.tap"_rid,  accum, s);   // fill scratch from the current accumulator (reads accum)
+        blit("alias.fold"_rid, s, accum);   // fold back -> new accum version, forcing the next tap to wait
     }
     return accum;
 }
@@ -1169,8 +1168,8 @@ static ResourceHandle build_alias_test(RenderGraph* rg, const DemoEnv& env, Reso
 static ResourceHandle build_forcekeep_test(RenderGraph* rg, ResourceHandle scene, ResourceHandle swap, bool enabled)
 {
     if (!enabled) return scene;
-    ResourceHandle scratch = screen_tex(rg, "keep.scratch", kSwapFormat, swap);
-    rg->add_pass(WEBGPU_STR("keep.side"), PassKind::Graphics,
+    ResourceHandle scratch = screen_tex(rg, "keep.scratch"_rid, kSwapFormat, swap);
+    rg->add_pass("keep.side"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.force_keep();   // remove this line -> the pass vanishes from execution order (culled)
             b.color(scratch, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -1212,8 +1211,8 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
     constexpr uint64_t kBytes  = 1024;                 // 256 u32
     constexpr uint32_t kGroups = (256u + 63u) / 64u;
 
-    auto fill = [&](const char* nm, ResourceHandle dst) {
-        rg->add_pass(WGPUStringView{ nm, WGPU_STRLEN }, PassKind::Compute,
+    auto fill = [&](ResourceId id, ResourceHandle dst) {
+        rg->add_pass(id, PassKind::Compute,
             [&](PassBuilder& b) { b.storage_write(dst); },
             [dev, dst](PassContext& ctx) {
                 WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(bufFillPipe, 0);
@@ -1226,8 +1225,8 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
                 wgpuBindGroupRelease(bg); wgpuBindGroupLayoutRelease(l);
             });
     };
-    auto step = [&](const char* nm, ResourceHandle src, ResourceHandle dst, bool keep) {
-        rg->add_pass(WGPUStringView{ nm, WGPU_STRLEN }, PassKind::Compute,
+    auto step = [&](ResourceId id, ResourceHandle src, ResourceHandle dst, bool keep) {
+        rg->add_pass(id, PassKind::Compute,
             [&, keep](PassBuilder& b) { b.storage_read(src); b.storage_write(dst); if (keep) b.force_keep(); },
             [dev, src, dst](PassContext& ctx) {
                 WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(bufStepPipe, 0);
@@ -1244,22 +1243,22 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
             });
     };
 
-    static const char* kScr[] = { "bufalias.s0", "bufalias.s1", "bufalias.s2", "bufalias.s3" };
-    ResourceHandle accum = rg->create_buffer(WEBGPU_STR("bufalias.accum"), { .size = kBytes });
-    ResourceHandle s0    = rg->create_buffer(WGPUStringView{ kScr[0], WGPU_STRLEN }, { .size = kBytes });
-    fill("bufalias.fill", s0);                 // seed scratch 0 (dst-only define)
-    step("bufalias.fold", s0, accum, false);   // scratch 0 -> accum (accum's first write)
+    static ResourceId kScr[] = { "bufalias.s0"_rid, "bufalias.s1"_rid, "bufalias.s2"_rid, "bufalias.s3"_rid };
+    ResourceHandle accum = rg->create_buffer("bufalias.accum"_rid, { .size = kBytes });
+    ResourceHandle s0    = rg->create_buffer( kScr[0], { .size = kBytes });
+    fill("bufalias.fill"_rid, s0);                 // seed scratch 0 (dst-only define)
+    step("bufalias.fold"_rid, s0, accum, false);   // scratch 0 -> accum (accum's first write)
     for (uint32_t i = 1; i < 4; ++i) {
-        ResourceHandle si = rg->create_buffer(WGPUStringView{ kScr[i], WGPU_STRLEN }, { .size = kBytes });
-        step("bufalias.fill", accum, si, false);     // accum -> scratch i (reads accum -> ordered after prev fold)
-        step("bufalias.fold", si, accum, i == 3);    // scratch i -> accum; tail force_keep()s the whole chain
+        ResourceHandle si = rg->create_buffer(kScr[i], { .size = kBytes });
+        step("bufalias.fill"_rid, accum, si, false);     // accum -> scratch i (reads accum -> ordered after prev fold)
+        step("bufalias.fold"_rid, si, accum, i == 3);    // scratch i -> accum; tail force_keep()s the whole chain
     }
 }
 
 // present: blit the final scene colour to the swapchain (the chain's sink).
 static void build_present(RenderGraph* rg, WGPUDevice dev, ResourceHandle scene, ResourceHandle swap)
 {
-    rg->add_pass(WEBGPU_STR("present"), PassKind::Graphics,
+    rg->add_pass("present"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.sampled(scene);
             b.color(swap, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -1620,7 +1619,7 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     sHavePrev = true;
 
     wgpuQueueWriteBuffer(env.queue, uboBuf, 0, &sb, sizeof(sb));
-    ResourceHandle ubo = rg->import_buffer(WEBGPU_STR("scene.ubo"), uboBuf);
+    ResourceHandle ubo = rg->import_buffer("scene.ubo"_rid, uboBuf);
 
     // ---- scene source: deferred lighting (default) or the cubemap skybox ----
     ResourceHandle scene;

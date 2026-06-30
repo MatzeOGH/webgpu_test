@@ -135,23 +135,23 @@ static void bake_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle swapc
     // bake settings UBO (read by the bake shader). written every frame so it's current whenever a bake runs.
     float params[4] = { sunAngle, (quality == 0 ? 2.0f : 5.0f), 0.0f, 0.0f };
     wgpuQueueWriteBuffer(env.queue, paramBuf, 0, params, sizeof params);
-    ResourceHandle bparams = rg->import_buffer(WEBGPU_STR("bake.params"), paramBuf);
+    ResourceHandle bparams = rg->import_buffer("bake.params"_rid, paramBuf);
 
     // present pan from camera yaw (turns). the env itself is unaffected -- only the lookup pans.
     float ctl[4] = { env.camera.yaw * 0.1591549f, 0.0f, 0.0f, 0.0f };
     wgpuQueueWriteBuffer(env.queue, ctlBuf, 0, ctl, sizeof ctl);
-    ResourceHandle ubo = rg->import_buffer(WEBGPU_STR("bake.ctl"), ctlBuf);
+    ResourceHandle ubo = rg->import_buffer("bake.ctl"_rid, ctlBuf);
 
     // the baked environment: one persistent texture, Absolute-sized so a window resize never recreates it.
     // declared every frame (to read it + keep the pool entry alive), filled only by the initialize() pass.
-    auto envTex = rg->create_persistent_image(WEBGPU_STR("bake.env"), {
+    auto envTex = rg->create_persistent_image("bake.env"_rid, {
         .dimension = WGPUTextureDimension_2D, .format = kEnvFormat,
         .absolute  = { kEnvW, kEnvH, 1 },
     });
 
     // bake: fill the env from the current settings. initialize(envTex, hash) gates it -> it runs only while
     // bake.env is unrealized OR `hash` differs from the hash last baked in, then compile() culls it.
-    rg->add_pass(WEBGPU_STR("bake.fill"), PassKind::Graphics,
+    rg->add_pass("bake.fill"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(bparams);
             b.color(envTex, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
@@ -173,7 +173,7 @@ static void bake_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle swapc
 
     // show: sample the baked env to the swapchain, every frame. on frames the bake is culled, bake.env has
     // no in-graph writer -- legal, because a persistent resource is external (its value is from a prior frame).
-    rg->add_pass(WEBGPU_STR("bake.show"), PassKind::Graphics,
+    rg->add_pass("bake.show"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.sampled(envTex);

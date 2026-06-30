@@ -12,23 +12,9 @@
 #include <chrono>
 #include "AlpUtils.h"
 
-// Graph validation: the post-cull "reads a resource before any pass writes it" check in compile().
-// It is a per-frame development aid; like assert it is compiled OUT in release builds (NDEBUG), so a
-// shipping build assumes author-valid graphs and compile() always returns true. Predefine RG_VALIDATE
-// to 1/0 to force it on/off independently of NDEBUG.
-#ifndef RG_VALIDATE
-#  ifdef NDEBUG
-#    define RG_VALIDATE 0
-#  else
-#    define RG_VALIDATE 1
-#  endif
-#endif
-
-
 namespace RG{
 
-// how a pass touches a resource -> read/write (hazards) and WGPU usage flags.
-// comment column = WebGPU internal usage (usage-scope class) -> hazard -> usage bit.
+// how a pass touches a resource -> read/write (hazards)
 enum struct AccessType : uint8_t
 {
     ColorAttachment,         // attachment      write   tex RenderAttachment
@@ -106,6 +92,7 @@ struct PersistentResourcePool
 
     struct Entry
     {
+        ResourceId           id{};
         std::string          name;               // identity across frames (arena names don't persist)
         uint64_t             frame  = 0;          // rotation counter, bumped once per touch (declaration)
         uint64_t             lastTouched = 0;     // pool evictClock at the last touch; stale entries are freed
@@ -121,7 +108,7 @@ struct PersistentResourcePool
         bool                 created       = false;
         WGPUExtent3D         size          = {};
         WGPUTextureFormat    format        = WGPUTextureFormat_Undefined;
-        WGPUTextureDimension dim           = WGPUTextureDimension_2D;
+        WGPUTextureDimension dim           = WGPUTextureDimension_Undefined;
         uint32_t             mipLevelCount = 1;
         uint32_t             sampleCount   = 1;
         WGPUTextureUsage     usage         = {};  // running union of every layer's usage
@@ -130,25 +117,28 @@ struct PersistentResourcePool
         // buffer arm: mutually exclusive with the texture arm per named entry (create_temporal_image
         // fills the texture fields, create_temporal_buffer fills these), so both can coexist on Entry --
         // only one is ever populated. `created` + destroy() are shared across both arms.
-        // ponytail: both arms on one Entry rather than a union/kind tag -- a few unused bytes per
+        // NOTE(Huerbe): both arms on one Entry rather than a union/kind tag -- a few unused bytes per
         // temporal resource (there are a handful) isn't worth the tagged-variant ceremony.
         WGPUBuffer           buf[kLayers]     = {};
         uint64_t             bufferSize       = 0;
         WGPUBufferUsage      bufUsage         = {};  // running union across layers/frames
         WGPUBufferUsage      bufUsageAtCreate = {};
     };
-    std::vector<Entry> entries;   // ponytail: linear scan + memcmp; fine for the handful of temporal resources
+    std::vector<Entry> entries;   // NOTE(Huerbe): linear scan + memcmp; fine for the handful of temporal resources
     uint64_t evictClock = 0;      // advanced once per frame (end_frame); entries idle kRetain frames are freed
 
     // TODO: optimization find by hash first and than compare the string to catch hash collisions.
     //       doing a simple hash compare might be faster
-    Entry* find(WGPUStringView name)
+    Entry* find(ResourceId id)
     {
-        const size_t len = sv_length(name);
         for (Entry& e : entries)
-            if (e.name.size() == len &&
-                (len == 0 || std::memcmp(e.name.data(), name.data, len) == 0))
+        {
+            ResourceId eId = e.id; // TODO: fix this mess
+            eId.name = { e.name.c_str(), e.name.size() };
+            if (eId == id)
                 return &e;
+
+        }
         return nullptr;
     }
 
@@ -156,17 +146,18 @@ struct PersistentResourcePool
     // the only callers and declare each resource once per frame, so one touch == one frame == one rotation.
     // Declaring the same name twice in a frame (or once as an image and once as a buffer) is an authoring
     // error: it double-rotates the slot mapping, and a cross-kind name clash thrashes the shared `created`
-    // flag. Unenforced -- ponytail: add a kind tag + assert if a real collision ever happens.
-    Entry* touch(WGPUStringView name, uint32_t layers = kLayers, uint64_t hash = 0)
+    // flag. Unenforced -- NOTE(Huerbe): add a kind tag + assert if a real collision ever happens.
+    Entry* touch(ResourceId id, uint32_t layers = kLayers, uint64_t hash = 0)
     {
-        if (Entry* e = find(name)) {
+        if (Entry* e = find(id)) {
             ++e->frame; e->lastTouched = evictClock; e->layers = layers;
             if (hash && e->historyHash != hash) { destroy(e); e->historyHash = hash; }
             return e;
         }
         entries.emplace_back();
         Entry& e = entries.back();
-        e.name.assign(name.data ? name.data : "", sv_length(name));   // WGPU_STRLEN -> measured, not SIZE_MAX
+        e.name.assign(id.name.data ? id.name.data : "", sv_length(id.name));   // TODO: get rid of std::string 
+        e.id = { id.value, {e.name.data(), e.name.size()}};
         e.lastTouched = evictClock;
         e.layers = layers;
         e.historyHash = hash;
@@ -211,7 +202,7 @@ struct PersistentResourcePool
         e->created = true;
     }
 
-    // buffer twin of realize_entry: (re)create the entry's `layers` buffers when missing or size/usage
+    // (re)create the entry's `layers` buffers when missing or size/usage
     // changed (1 for a single in-place buffer, kLayers for a ping-pong). usage is the union realize()
     // accumulated into e->bufUsage (each physical buffer cycles through every layer role across frames),
     // mirroring how realize_entry reads e->usage.
@@ -267,7 +258,7 @@ struct PersistentResourcePool
 // usage), tagged by `isBuffer`; textures and buffers share the inUse-claim, idle eviction, vector and
 // teardown -- only the match + create differ (the two acquire overloads). Sibling to PersistentResourcePool
 // (name-keyed ping-pong for history); this one is descriptor-keyed and evicts objects left idle.
-// ponytail: linear scan over a vector -- fine for the ~dozen transients a frame declares. inUse (not the
+// NOTE(Huerbe): linear scan over a vector -- fine for the ~dozen transients a frame declares. inUse (not the
 // frame stamp) is the claim, so two simultaneously-live same-descriptor resources get two distinct objects.
 struct TransientResourcePool
 {
@@ -403,7 +394,7 @@ struct TransientResourcePool
 // staging buffer and copied into a ring of mappable read-back buffers so a frame never stalls waiting on
 // the GPU. Lives in GraphAllocator (cross-frame survivor) -- the query set + buffers outlive the per-frame
 // arena reset. Only created when profiling is first enabled AND the device has the TimestampQuery feature.
-// ponytail: kMaxPasses/kRing fixed; a pass past kMaxPasses is just left unprofiled, bump if a demo grows.
+// NOTE(Huerbe): kMaxPasses/kRing fixed; a pass past kMaxPasses is just left unprofiled, bump if a demo grows.
 struct GpuProfiler
 {
     static constexpr uint32_t kMaxPasses = 64;   // -> 2*64 timestamps in the set
@@ -442,7 +433,7 @@ struct GpuProfiler
 
     // append one column iff recording AND a fresh read-back arrived since last call. Match each result to a
     // series by name; new names get a new series (older columns stay 0), missing series get 0 this column.
-    // ponytail: series keyed by name; a demo switch just adds new series + zero-fills old ones. Clear resets.
+    // NOTE(Huerbe): series keyed by name; a demo switch just adds new series + zero-fills old ones. Clear resets.
     void sample_history()
     {
         if (!recording || resultId == lastSampledId) return;
@@ -484,6 +475,35 @@ struct GpuProfiler
         for (uint32_t i = 0; i < kRing; ++i) if (!ring[i].pending) return (int)i;
         return -1;
     }
+};
+
+// TODO: new block backed arena allocator
+static constexpr size_t ARENA_DEFAULT_BLOCK_SIZE = 64 * 1024;
+
+struct Arena
+{
+    struct ArenaBlock
+    {
+        ArenaBlock* next;
+        uint8_t base;
+        size_t capacity;
+        size_t used;
+    };
+
+    ArenaBlock* head;
+    ArenaBlock* current;
+    size_t blockSize;
+
+    size_t totalCapacity;
+    size_t peakUsage;
+    size_t blockCount;
+};
+
+static Arena* createArena() {
+    void* block = malloc(ARENA_DEFAULT_BLOCK_SIZE);
+    Arena* arena = ::new (block) Arena;
+    arena->blockCount = 1;
+    return arena;
 };
 
 // arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
@@ -646,11 +666,11 @@ struct GraphAllocator
 
 // internal resouceNode of an image or buffer
 // structured as a intrusive linked list for memory resouce
-// fat stuct style
 struct ResourceNode
 {
     ResourceHandle handle{};
-    WGPUStringView name{};
+    ResourceId id{};
+    //WGPUStringView name{};
     enum struct Kind { Texture, Buffer} kind{};
 
     // the resource is managed from outside te render graph. i.e: swapchain
@@ -714,7 +734,7 @@ struct NodeAdjacency;
 // style as ResourceNode so the builder records accesses without per-access allocation
 struct PassNode
 {
-    WGPUStringView name{};
+    ResourceId id{};
     PassKind kind{};
 
     // type-erased execute callback: stored by add_pass, invoked by the future execute phase
@@ -731,7 +751,7 @@ struct PassNode
 
     bool placed{}; // topo sort: already emitted into execution order
     bool sink{}; // mark a pass as a sink
-    bool forceKeep{}; // force_keep(): extra cull root -- survives even with no reader and no imported/persistent write
+    bool forceKeep{}; // force_keep(): extra cull root. Survives even with no reader and no imported/persistent write
 
     // initialize(): if set, this pass (re)bakes the persistent resource `initTarget`. compile() sets
     // skipInit (drops the pass this frame) once the target's pool entry is populated AND was baked with this
@@ -755,19 +775,26 @@ struct NodeAdjacency
 // (phase 4 buckets by kind). `freeFrom` + the alias bookkeeping are shared across both arms.
 struct PhysicalResource
 {
-    ResourceNode::Kind   kind{};        // Texture (default 0) or Buffer; selects which arm below is live
-    uint32_t             freeFrom{};    // occupant lastUse; reusable iff the next member's firstUse > this (STRICT)
-    // texture arm (kind == Texture)
+    ResourceNode::Kind   kind{};        // Texture or Buffer;
+    uint32_t             freeFrom{};    // occupant lastUse; reusable iff the next member's firstUse > this
+    // Texture
     WGPUTextureDimension dimension{};   // signature: members must match exactly to share this slot
     WGPUTextureFormat    format{};
     WGPUExtent3D         size{};
     WGPUTextureUsage     texUsage{};    // union over members (WebGPU needs every member's bits at create)
     WGPUTexture          texture{};     // filled by realize() via transient.acquire()
     WGPUTextureView      view{};
-    // buffer arm (kind == Buffer)
+    // Buffer
     uint64_t             bufferSize{};  // signature
     WGPUBufferUsage      bufUsage{};    // union over members
     WGPUBuffer           buffer{};      // filled by realize() via transient.acquire() (buffer overload)
+};
+
+enum struct RenderGraphState
+{
+    Recording = 0,
+    Compiled,
+    Finished
 };
 
 // RenderGraph carries no data members; its state lives here, bump-allocated immediately after the
@@ -778,10 +805,9 @@ struct RenderGraphStorage
     GraphAllocator*         m_allocator{};  // owns the pools; reach them via m_allocator->pool / ->transient
     ResourceNode*           m_resouces{};   // linked list of resources declared for the graph
     PassNode*               m_passes{};     // linked list of passes declared for the graph
-    WGPUDevice              m_device{};     //
-    bool                    m_readOnly{};   // after compile() the graph is in readOnly mode and cannot be modified any more.
+    RenderGraphState        m_state{};   // after compile() the graph is in readOnly mode and cannot be modified any more.
     uint32_t                next_resource_id = 1; // 0 = invalid handle; also doubles as resource count -1
-    ResourceNode**          byId{};      // id->node (sized next_resource_id); built in compile() phase 3 -> O(1) find_node
+    ResourceNode**          byId{};      // id->node (sized next_resource_id); built in compile() phase 3 -> find_node
     // aliasing: physical slots computed by compile() phase 4 (front-arena, this frame). m_slotCount == 0
     // whenever aliasing is off -> realize()/release_resources() fall back to the per-resource path unchanged.
     PhysicalResource*       m_slots{};
@@ -790,11 +816,13 @@ struct RenderGraphStorage
     // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
     WGPUTextureView         viewScratch[PassNode::kMaxAccess]{};
     uint32_t                viewScratchN{};
+    bool                    m_isValid{}; // if `m_isValid` is `false` execute becomes a noop. The client needs to check for error messages
+    ErrorMessage*           m_errors{}; // linked list of error messages
 
     // CPU timing infos
-    float                   timing_compile_us{};
-    float                   timing_realize_us{};
-    float                   timing_execute_us{};
+    float timing_compile_us{};
+    float timing_realize_us{};
+    float timing_execute_us{};
 };
 
 static RenderGraphStorage* storage(RenderGraph* rg)
@@ -802,9 +830,13 @@ static RenderGraphStorage* storage(RenderGraph* rg)
     return reinterpret_cast<RenderGraphStorage*>(reinterpret_cast<uint8_t*>(rg) + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
 }
 
-// resolve a handle to its node. O(1) through the byId table compile() builds (persisted on storage for
-// the frame); before that table exists (declaration time) or for the invalid id 0, fall back to a linear
-// walk. an unknown handle resolves to null.
+// TODO: append error message onto errors
+static void pushError()
+{
+
+}
+
+// resolve a handle to its node.
 static ResourceNode* find_node(RenderGraph* rg, ResourceHandle h)
 {
     RenderGraphStorage& s = *storage(rg);
@@ -882,7 +914,7 @@ static bool access_defines(const ResourceAccess& a)
     return a.type == AccessType::StorageWrite || a.type == AccessType::CopyDst;
 }
 
-#if RG_VALIDATE
+
 // do two accesses to the SAME resource in ONE pass (one usage scope) conflict? read+read never does.
 // disjoint subresources never do either: WebGPU usage scopes are per-(mip,layer), so sampling mip i while
 // rendering into mip j!=i is legal (a mip-chain downsample/upsample pass). the lone same-subresource read+write
@@ -891,7 +923,7 @@ static bool access_defines(const ResourceAccess& a)
 // the sweep's WAR self-guard depend on it). Any other same-subresource pairing involving a write is
 // illegal: a read-only binding aliasing a write (e.g. Sampled+StorageWrite, the named case), or two writes
 // the graph can't order within an atomic pass ("multiple unsynchronized writes").
-// ponytail: each access is one (mip,layer) point, so a wide sampled range overlapping a written mip slips
+// NOTE(Huerbe): each access is one (mip,layer) point, so a wide sampled range overlapping a written mip slips
 // past here -- WebGPU validation is the backstop.
 static bool in_pass_accesses_conflict(AccessType a, uint32_t aMip, uint32_t aLayer,
                                       AccessType b, uint32_t bMip, uint32_t bLayer)
@@ -902,7 +934,6 @@ static bool in_pass_accesses_conflict(AccessType a, uint32_t aMip, uint32_t aLay
         (a == AccessType::StorageWrite && b == AccessType::StorageRead)) return false;
     return true;
 }
-#endif
 
 // used to validate the correct creation of textures
 static void validate_texture_desc(const TextureDesc& desc)
@@ -920,15 +951,15 @@ static void validate_texture_desc(const TextureDesc& desc)
 
 }
 
-ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc& desc)
+ResourceHandle RenderGraph::create_image(ResourceId id, const TextureDesc& desc)
 {
     validate_texture_desc(desc);
     RenderGraphStorage& s = *storage(this);
-    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
-    resouce->name = s.m_allocator->copy_string(name);
+    resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->dimension = desc.dimension;
     resouce->format = desc.format;
@@ -947,14 +978,14 @@ ResourceHandle RenderGraph::create_image(WGPUStringView name, const TextureDesc&
 
 // transient (graph-owned, per-frame) GPU buffer: the buffer twin of create_image. realize() backs it from
 // the TransientResourcePool buffer arm (or a phase-4 alias slot); release_resources() drops the borrowed ref.
-ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc& desc)
+ResourceHandle RenderGraph::create_buffer(ResourceId id, const BufferDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
-    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
-    resouce->name = s.m_allocator->copy_string(name);
+    resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->bufferSize = desc.size;
 
@@ -966,14 +997,14 @@ ResourceHandle RenderGraph::create_buffer(WGPUStringView name, const BufferDesc&
 
 // imported resources are managed outside the graph (swapchain, etc). they carry no desc;
 // the graph only needs the `imported` flag so passes that write them count as sinks (compile()).
-ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView view, WGPUExtent3D size)
+ResourceHandle RenderGraph::importe_image(ResourceId id, WGPUTextureView view, WGPUExtent3D size)
 {
     RenderGraphStorage& s = *storage(this);
-    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
-    resouce->name = s.m_allocator->copy_string(name);
+    resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->imported = true;
     resouce->view = view;
@@ -985,14 +1016,14 @@ ResourceHandle RenderGraph::importe_image(WGPUStringView name, WGPUTextureView v
 }
 
 
-ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer)
+ResourceHandle RenderGraph::import_buffer(ResourceId id, WGPUBuffer buffer)
 {
     RenderGraphStorage& s = *storage(this);
-    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
-    resouce->name = s.m_allocator->copy_string(name);
+    resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->imported = true;
     resouce->buffer = buffer;
@@ -1006,17 +1037,17 @@ ResourceHandle RenderGraph::import_buffer(WGPUStringView name, WGPUBuffer buffer
 // temporal/history resource: two rotating physical textures owned by the PersistentResourcePool. allocates
 // two ResourceNodes (curr = layer 0, prev = layer 1); the pool backs them and swaps which physical texture
 // each maps to every frame (see realize()), so this frame's curr is next frame's prev.
-TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const TextureDesc& desc, uint64_t hash)
+TemporalResource RenderGraph::create_temporal_image(ResourceId id, const TextureDesc& desc, uint64_t hash)
 {
     RenderGraphStorage& s = *storage(this);
-    assert(s.m_readOnly == false && "Render graph is in read only mode after compile()");
-    s.m_allocator->pool.touch(name, PersistentResourcePool::kLayers, hash);
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+    s.m_allocator->pool.touch(id, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
         resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
-        resouce->name = s.m_allocator->copy_string(name);
+        resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
         resouce->kind = ResourceNode::Kind::Texture;
         resouce->persistent = true;
         resouce->temporalIndex = i;
@@ -1029,7 +1060,7 @@ TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const T
         resouce->absolute = desc.absolute;
         resouce->mipLevelCount = desc.mipLevelCount ? desc.mipLevelCount : 1;
         resouce->sampleCount = desc.sampleCount ? desc.sampleCount : 1;
-        // ponytail: a multisampled history layer is creatable but prev can only be an attachment/resolve
+        // NOTE(Huerbe): a multisampled history layer is creatable but prev can only be an attachment/resolve
         // target -- sampling an MSAA texture is illegal (Dawn rejects it) and reading prev is the whole
         // point of history. left to Dawn rather than forbidden here.
         list_append(&s.m_resouces, resouce);
@@ -1042,16 +1073,17 @@ TemporalResource RenderGraph::create_temporal_image(WGPUStringView name, const T
 // temporal/history BUFFER: the GPU-buffer twin of create_temporal_image. two rotating physical buffers
 // owned by the PersistentResourcePool; allocates two ResourceNodes (curr = layer 0, prev = layer 1) and
 // the pool swaps which physical buffer each maps to every frame, so this frame's curr is next frame's prev.
-TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const BufferDesc& desc, uint64_t hash)
+TemporalResource RenderGraph::create_temporal_buffer(ResourceId id, const BufferDesc& desc, uint64_t hash)
 {
     RenderGraphStorage& s = *storage(this);
-    s.m_allocator->pool.touch(name, PersistentResourcePool::kLayers, hash);
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+    s.m_allocator->pool.touch(id, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
     for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i) {
         ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
         resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
-        resouce->name = s.m_allocator->copy_string(name);
+        resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
         resouce->kind = ResourceNode::Kind::Buffer;
         resouce->persistent = true;
         resouce->temporalIndex = i;
@@ -1067,14 +1099,15 @@ TemporalResource RenderGraph::create_temporal_buffer(WGPUStringView name, const 
 // teardown and is auto-evicted when no longer declared. the in-place own-slot / atomic-accumulator twin of
 // create_temporal_buffer -- read+write it in one pass (var<storage, read_write>) and the graph models that
 // as the StorageRead+StorageWrite RMW pair (no self-ordering). one ResourceNode, one physical buffer.
-ResourceHandle RenderGraph::create_persistent_buffer(WGPUStringView name, const BufferDesc& desc)
+ResourceHandle RenderGraph::create_persistent_buffer(ResourceId id, const BufferDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
-    s.m_allocator->pool.touch(name, 1);   // single layer: slot() always resolves to 0, no rotation
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+    s.m_allocator->pool.touch(id, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
     resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
-    resouce->name = s.m_allocator->copy_string(name);
+    resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
     resouce->kind = ResourceNode::Kind::Buffer;
     resouce->persistent = true;
     resouce->temporalIndex = 0;       // the only layer
@@ -1088,14 +1121,15 @@ ResourceHandle RenderGraph::create_persistent_buffer(WGPUStringView name, const 
 // texture (no ping-pong), survives the per-frame teardown, auto-evicted when no longer declared. for a
 // precomputed/baked resource written once and sampled every frame (IBL/env map, BRDF LUT). pair it with an
 // initialize() pass to fill it on the first frame / after eviction / when its settings hash changes. one ResourceNode, one texture.
-ResourceHandle RenderGraph::create_persistent_image(WGPUStringView name, const TextureDesc& desc)
+ResourceHandle RenderGraph::create_persistent_image(ResourceId id, const TextureDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
-    s.m_allocator->pool.touch(name, 1);   // single layer: slot() always resolves to 0, no rotation
+    assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+    s.m_allocator->pool.touch(id, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
     resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
-    resouce->name = s.m_allocator->copy_string(name);
+    resouce->id = { id.value, s.m_allocator->copy_string(id.name) };
     resouce->kind = ResourceNode::Kind::Texture;
     resouce->persistent = true;
     resouce->temporalIndex = 0;       // the only layer
@@ -1113,11 +1147,11 @@ ResourceHandle RenderGraph::create_persistent_image(WGPUStringView name, const T
 }
 
 
-PassBuilder RenderGraph::begin_pass(WGPUStringView name, PassKind kind)
+PassBuilder RenderGraph::begin_pass(ResourceId id, PassKind kind)
 {
     RenderGraphStorage& s = *storage(this);
     PassNode* pass = s.m_allocator->make<PassNode>();
-    pass->name = s.m_allocator->copy_string(name);
+    pass->id = { id.value, s.m_allocator->copy_string(id.name) };
     pass->kind = kind;
 
     PassBuilder builder;
@@ -1240,6 +1274,7 @@ static bool is_sink(PassNode* p, const bool* external)
 // assumes an acyclic relativeTo graph (same author-acyclic assumption as topo_visit).
 static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
 {
+    assert(byId);
     if (r->resolved.width) return r->resolved;                       // imported, or already walked
     if (r->sizeKind == SizeKind::Absolute) return r->resolved = r->absolute;
     ResourceNode* base = byId[r->relativeToHandle.id];
@@ -1251,10 +1286,11 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
     return r->resolved = { (uint32_t)(b.width * r->scaleX + 0.5f), (uint32_t)(b.height * r->scaleY + 0.5f), layers };
 }
 
-bool RenderGraph::compile(bool enableAlias)
+void RenderGraph::compile(bool enableAlias)
 {
+    auto t0 = std::chrono::steady_clock::now();
     RenderGraphStorage& s = *storage(this);
-    assert(s.m_readOnly == false);
+    assert(s.m_state == RenderGraphState::Recording);
 
     // phase 0: resolve initialize() passes. such a pass (re)bakes a persistent target and should run only
     // while that target needs it: skip it this frame iff the pool entry exists, was realized on a prior frame
@@ -1271,7 +1307,7 @@ bool RenderGraph::compile(bool enableAlias)
             if (r->handle.id == p->initTarget.id) {
                 assert(r->persistent && "initialize() target must be persistent or temporal "
                                         "(create_persistent_image/_buffer or create_temporal_image/_buffer)");
-                PersistentResourcePool::Entry* e = s.m_allocator->pool.find(r->name);
+                PersistentResourcePool::Entry* e = s.m_allocator->pool.find(r->id);
                 // skip only when the target is realized AND holds content baked with this exact hash.
                 // `baked` (cleared by destroy()) re-arms after any (re)create, so a recreated-blank texture
                 // is re-baked even for hash 0 -- closes the resize/descriptor-change stale-bake hole.
@@ -1286,7 +1322,7 @@ bool RenderGraph::compile(bool enableAlias)
     // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
     // before any writer get no edge here; the post-cull pass below turns them into errors.
     sweep_resource_versions(s.m_allocator, s.m_passes, s.next_resource_id,
-        [&](PassNode* dependent, PassNode* dep, uint32_t /*id*/, HazardKind /*kind*/) {
+        [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
             add_dependency(s.m_allocator, dependent, dep);
         });
 
@@ -1323,14 +1359,13 @@ bool RenderGraph::compile(bool enableAlias)
         if (count) order[count - 1]->next = nullptr;
         s.m_passes = count ? order[0] : nullptr;
 
-        // ponytail: transient array as DFS scratch; can't sort a one-field intrusive list in
+        // NOTE(Huerbe): transient array as DFS scratch; can't sort a one-field intrusive list in
         // place (a dep emitted before the driver reaches it clobbers its `next`, dropping
         // disconnected nodes). recursive DFS, no cycle detection: graph is author-acyclic; add an
         // `onstack` flag (+2 lines) only if a cyclic graph ever needs catching.
     }
 
-#if RG_VALIDATE
-    // post-cull validation (development aid; compiled out when RG_VALIDATE==0, e.g. release/NDEBUG,
+    // post-cull validation (development aid; e.g. release/NDEBUG,
     // exactly like assert, so a shipping build pays none of this per-frame walk). Over the FINAL schedule
     // (m_passes is now culled + in execution order), a read of a TRANSIENT resource that no earlier pass
     // has produced is an authoring error: the reader would sample uninitialized contents (its writer was
@@ -1364,10 +1399,10 @@ bool RenderGraph::compile(bool enableAlias)
                     // create_temporal_image/_buffer) is the only legal write target.
                     if (prevLayer[id]) {
                         ResourceNode* w = find_node(this, p->accesses[i].handle);
-                        WGPUStringView wn = w ? w->name : WGPUStringView{};
+                        WGPUStringView wn = w ? w->id.name : WGPUStringView{};
                         std::printf("[RenderGraph] error: pass \"%.*s\" writes temporal resource \"%.*s\" "
                                     "layer %u -- only layer 0 (the .curr handle) is writable.\n",
-                                    (int)p->name.length, p->name.data ? p->name.data : "",
+                                    (int)p->id.name.length, p->id.name.data ? p->id.name.data : "",
                                     (int)wn.length, wn.data ? wn.data : "", w ? w->temporalIndex : 0u);
                         hadError = true;
                     }
@@ -1375,17 +1410,17 @@ bool RenderGraph::compile(bool enableAlias)
                 }
                 if (id == 0 || external[id] || produced[id] || !hasWriter[id]) continue;
                 ResourceNode* r = find_node(this, p->accesses[i].handle);
-                WGPUStringView rn = r ? r->name : WGPUStringView{};
+                WGPUStringView rn = r ? r->id.name : WGPUStringView{};
                 std::printf("[RenderGraph] error: pass \"%.*s\" reads resource \"%.*s\" before any pass "
                             "writes it -- declare a writer of \"%.*s\" first.\n",
-                            (int)p->name.length, p->name.data ? p->name.data : "",
+                            (int)p->id.name.length, p->id.name.data ? p->id.name.data : "",
                             (int)rn.length, rn.data ? rn.data : "",
                             (int)rn.length, rn.data ? rn.data : "");
                 hadError = true;
             }
-        if (hadError) return false;
+        if (hadError) return;
     }
-#endif
+
 
     // phase 3: frame-independent CPU analysis -> accumulate WGPU usage + resolve concrete sizes.
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
@@ -1447,7 +1482,7 @@ bool RenderGraph::compile(bool enableAlias)
         for (ResourceNode* r = s.m_resouces; r; r = r->next)
             if (r->kind == ResourceNode::Kind::Texture) resolve_size(r, byId);
 
-        // ponytail: usage==0 here == untouched by a live pass -> future realize() skips it = free
+        // NOTE(Huerbe): usage==0 here == untouched by a live pass -> future realize() skips it = free
         // dead-resource culling. no separate resource liveness list needed.
     }
 
@@ -1463,7 +1498,7 @@ bool RenderGraph::compile(bool enableAlias)
         // host-uploaded contents). textures must be single mip + sample so a slot's default view fits every
         // member; buffers carry no such constraint. imported/persistent + dead (kNoPass) excluded. collect
         // into scratch, then sort by firstUse for the left-edge sweep.
-        // ponytail: firstDefines treats a StorageWrite as a full define. true for a cleared/fully-written
+        // NOTE(Huerbe): firstDefines treats a StorageWrite as a full define. true for a cleared/fully-written
         // attachment; for a BUFFER a storage_write may write only part, so an aliased successor could read
         // the previous occupant's bytes. the shader owns writing every byte it later reads -- same implicit
         // contract textures carry, sharper for buffers. tighten to CopyDst-only here if that ever bites.
@@ -1481,7 +1516,7 @@ bool RenderGraph::compile(bool enableAlias)
             elig[nElig++] = r;
         }
 
-        // insertion sort by firstUse asc (nElig is a handful -> the O(n^2) is free; ponytail).
+        // insertion sort by firstUse asc (nElig is a handful -> the O(n^2) is free; NOTE(Huerbe)).
         for (uint32_t i = 1; i < nElig; ++i) {
             ResourceNode* key = elig[i];
             uint32_t j = i;
@@ -1520,18 +1555,22 @@ bool RenderGraph::compile(bool enableAlias)
             else       ph.texUsage |= r->texUsage;
             ph.freeFrom  = r->lastUse;
             r->aliasSlot = slot;
-#if RG_VALIDATE
+
             assert(ph.kind == r->kind && (isBuf
                    ? ph.bufferSize == r->bufferSize
                    : (ph.dimension == r->dimension && ph.format == r->format
                       && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height))
                    && "alias slot signature mismatch");
-#endif
         }
     }
 
-    s.m_readOnly = true; // signal that the render graph is in read only mode ready for rendering
-    return true;
+    s.m_state = RenderGraphState::Compiled; // signal that the render graph is in read only mode ready for rendering
+
+    auto t1 = std::chrono::steady_clock::now();
+    s.timing_compile_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
+
+    // TODO: trap when error
+    s.m_isValid = true;
 }
 
 // debug-only: position of `target` in the pass list = its Mermaid node id. O(n) per call.
@@ -1547,7 +1586,7 @@ static uint32_t pass_index(PassNode* head, PassNode* target)
 static WGPUStringView pass_name_at(PassNode* head, uint32_t idx)
 {
     for (PassNode* p = head; p; p = p->next) {
-        if (idx == 0) return p->name;
+        if (idx == 0) return p->id.name;
         --idx;
     }
     return WGPUStringView{};
@@ -1568,16 +1607,16 @@ void debug_print_mermaid(RenderGraph* rg)
     // node decl: stable id Pi -> pass name, indexed by list position.
     uint32_t idx = 0;
     for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
-        std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->name.length, p->name.data ? p->name.data : "");
+        std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->id.name.length, p->id.name.data ? p->id.name.data : "");
 
     // bracket each contiguous run of same-prefix passes (shadow.cascade, bloom.*) in a subgraph -- the
     // mermaid analogue of the DAG's group frames and the encoder debug groups. node ids resolve wherever
     // declared, so nodes -> subgraphs -> edges renders correctly.
     uint32_t gi = 0;
     for (PassNode* a = s.m_passes; a; ) {
-        WGPUStringView pre = group_prefix(a->name);
+        WGPUStringView pre = group_prefix(a->id.name);
         PassNode* b = a->next; uint32_t gj = gi + 1;
-        while (b && sv_length(pre) && sv_eq(group_prefix(b->name), pre)) { b = b->next; ++gj; }
+        while (b && sv_length(pre) && sv_eq(group_prefix(b->id.name), pre)) { b = b->next; ++gj; }
         if (sv_length(pre) && gj - gi >= 2) {
             std::printf("  subgraph \"%.*s\"\n", (int)sv_length(pre), pre.data);
             for (uint32_t k = gi; k < gj; ++k) std::printf("    P%u\n", k);
@@ -1590,7 +1629,7 @@ void debug_print_mermaid(RenderGraph* rg)
     sweep_resource_versions(s.m_allocator, s.m_passes, s.next_resource_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
             ResourceNode* r = find_node(rg, { id });
-            WGPUStringView nm = r ? r->name : WGPUStringView{};
+            WGPUStringView nm = r ? r->id.name : WGPUStringView{};
             const char* tag = kind == HazardKind::WAW ? " (WAW)" : kind == HazardKind::WAR ? " (WAR)" : "";
             std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
                         pass_index(s.m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
@@ -1598,7 +1637,7 @@ void debug_print_mermaid(RenderGraph* rg)
         });
 
     std::fflush(stdout);
-    // ponytail: pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a
+    // NOTE(Huerbe): pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a
     // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.
 }
 
@@ -1640,18 +1679,18 @@ void debug_print_lifetimes(RenderGraph* rg)
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->is_external()) continue;   // imported + pool-backed: no per-frame lifetime span
         if (r->firstUse == ResourceNode::kNoPass) {
-            std::printf("  %.*s -- unused (dead)\n", (int)r->name.length, r->name.data ? r->name.data : "");
+            std::printf("  %.*s  unused (dead)\n", (int)r->id.name.length, r->id.name.data ? r->id.name.data : "");
             continue;
         }
         WGPUStringView f = pass_name_at(s.m_passes, r->firstUse);
         if (r->firstUse == r->lastUse)
-            std::printf("  %.*s -- alive in %.*s\n",
-                        (int)r->name.length, r->name.data ? r->name.data : "",
+            std::printf("  %.*s  alive in %.*s\n",
+                        (int)r->id.name.length, r->id.name.data ? r->id.name.data : "",
                         (int)f.length, f.data ? f.data : "");
         else {
             WGPUStringView l = pass_name_at(s.m_passes, r->lastUse);
-            std::printf("  %.*s -- alive %.*s..%.*s\n",
-                        (int)r->name.length, r->name.data ? r->name.data : "",
+            std::printf("  %.*s  alive %.*s..%.*s\n",
+                        (int)r->id.name.length, r->id.name.data ? r->id.name.data : "",
                         (int)f.length, f.data ? f.data : "",
                         (int)l.length, l.data ? l.data : "");
         }
@@ -1670,7 +1709,7 @@ void debug_print_lifetimes(RenderGraph* rg)
     uint32_t idx = 0;
     for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
         std::printf("    %.*s :%u, %u\n",
-                    (int)p->name.length, p->name.data ? p->name.data : "", idx * 1000, (idx + 1) * 1000);
+                    (int)p->id.name.length, p->id.name.data ? p->id.name.data : "", idx * 1000, (idx + 1) * 1000);
 
     std::printf("  section transient\n");
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
@@ -1678,7 +1717,7 @@ void debug_print_lifetimes(RenderGraph* rg)
         WGPUStringView f = pass_name_at(s.m_passes, r->firstUse);
         WGPUStringView l = pass_name_at(s.m_passes, r->lastUse);
         std::printf("    %.*s (%.*s..%.*s) :%u, %u\n",
-                    (int)r->name.length, r->name.data ? r->name.data : "",
+                    (int)r->id.name.length, r->id.name.data ? r->id.name.data : "",
                     (int)f.length, f.data ? f.data : "",
                     (int)l.length, l.data ? l.data : "",
                     r->firstUse * 1000, (r->lastUse + 1) * 1000);
@@ -1698,7 +1737,7 @@ void debug_print_lifetimes(RenderGraph* rg)
             for (ResourceNode* r = s.m_resouces; r; r = r->next)
                 if (r->aliasSlot == i) {
                     ++logical; logicalBytes += slotBytes;   // a member shares the slot's signature -> same bytes
-                    std::printf(" %.*s", (int)r->name.length, r->name.data ? r->name.data : "");
+                    std::printf(" %.*s", (int)r->id.name.length, r->id.name.data ? r->id.name.data : "");
                 }
             std::printf("\n");
         }
@@ -1709,17 +1748,8 @@ void debug_print_lifetimes(RenderGraph* rg)
     }
 
     std::fflush(stdout);
-    // ponytail: %S labels the axis 00..59, so it wraps past 60 passes; fine for the handful here. bump
+    // NOTE(Huerbe): %S labels the axis 00..59, so it wraps past 60 passes; fine for the handful here. bump
     // the axisFormat if a graph ever exceeds that. names assumed colon/pipe-free -> no escaping.
-}
-
-// a ctx resolver got a handle no live node matches (id 0, an uncompiled handle, or one from another graph).
-// always-on (release too): announce it, then the resolver hands back an empty object so the body binds nothing
-// rather than dereferencing null. a valid graph never reaches here.
-static void rg_resolve_miss(const char* fn, ResourceHandle h)
-{
-    // TODO: add bettre error handling
-    std::printf("[RenderGraph] error: ctx.%s(): no live resource for handle id %u.\n", fn, h.id);
 }
 
 WGPUTextureView PassContext::view(ResourceHandle h) const
@@ -1728,7 +1758,8 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
     assert(h.kind == ResourceKind::Texture && "ctx.view: only textures can create a view");
     assert(pass); // cannot be nullptr
     ResourceNode* r = find_node(graph, h);
-    if (!r) { rg_resolve_miss("view", h); return {}; }   // unknown / default handle: loud, bind nothing
+    assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
+    if (!r) { return {}; }   // unknown / default handle: loud, bind nothing
     if (!r->texture) return r->view;     // imported: the caller-registered view (e.g. swapchain)
 
     // a single-mip 2D texture's full view IS its only subresource, and a 3D volume is sampled whole, so the
@@ -1741,7 +1772,7 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
 
     // mip chain / array: hand back the (baseMip, baseLayer) 2D slice the body's READ access declared, pooled
     // with the attachment views for release after the pass (exactly like attach_view in execute()).
-    // ponytail: a 3D mip chain would fall through and get a 2D view; none exist; revisit if one does.
+    // NOTE(Huerbe): a 3D mip chain would fall through and get a 2D view; none exist; revisit if one does.
     const ResourceAccess* rd = nullptr;
     for (uint32_t i = 0; i < pass->accessCount; ++i) {
         const ResourceAccess& a = pass->accesses[i];
@@ -1770,7 +1801,7 @@ WGPUTexture PassContext::texture(ResourceHandle h) const
     assert(h.kind == ResourceKind::Texture);
     ResourceNode* r = find_node(graph, h);
     assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
-    if (!r) { rg_resolve_miss("texture", h); return {}; }
+    if (!r) { return {}; }
     return r->texture;   // null for an imported texture (sample via ctx.view) -- the body's concern, not a graph bug
 }
 
@@ -1780,7 +1811,7 @@ WGPUBuffer PassContext::buffer(ResourceHandle h) const
     assert(h.kind == ResourceKind::Buffer);
     ResourceNode* r = find_node(graph, h);
     assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
-    if (!r) { rg_resolve_miss("buffer", h); return {}; }
+    if (!r) { return {}; }
     // realize() skips a buffer with no accumulated usage (no live pass wrote it) -> r->buffer stays null. an
     // imported buffer always carries its registered handle, so a null here means a declared-but-unwritten graph
     // buffer (e.g. a temporal whose .curr no pass writes); binding it is a Dawn error -- assert at the resolve
@@ -1795,7 +1826,7 @@ WGPUExtent3D PassContext::texture_size(ResourceHandle h) const
     assert(h.kind == ResourceKind::Texture);
     ResourceNode* r = find_node(graph, h);
     assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
-    if (!r) { rg_resolve_miss("size", h); return {}; }
+    if (!r) { return {}; }
     return r->resolved;   // compile() phase 3 resolved every live resource
 }
 
@@ -1805,35 +1836,41 @@ uint32_t PassContext::buffer_size(ResourceHandle h) const
     assert(h.kind == ResourceKind::Buffer);
     ResourceNode* r = find_node(graph, h);
     assert(r != nullptr && "failed to find node! Handle is 0 or from another graph");
-    if (!r) { rg_resolve_miss("size", h); return {}; }
+    if (!r) { return {}; }
     return r->bufferSize;
 }
+
+void release_resources(RenderGraph* rg);
 
 // create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
 // imported resources are caller-owned and skipped; a resource with no accumulated usage was
 // untouched by a live pass -> skipped too (the free dead-resource cull compile() phase 3 set up).
-void RenderGraph::realize(WGPUDevice device)
+static void realize_graph(RenderGraph* rg, WGPUDevice device)
 {
-    RenderGraphStorage& s = *storage(this);
-    s.m_device = device;
+    auto t0 = std::chrono::steady_clock::now();
+    RenderGraphStorage& s = *storage(rg);
+    assert(s.m_state == RenderGraphState::Compiled);
 
     // temporal/persistent resources: back each layer with a rotating pool texture instead of a per-frame
     // one. first union the usage over all layers (each physical texture cycles through every layer role
     // across frames), then (re)create on demand, then point each layer node at its rotated slot. size +
     // usage came from compile(); the pool owns lifetime, so release_resources() leaves these alone.
-    PersistentResourcePool& pool         = s.m_allocator->pool;
-    TransientResourcePool&  transient    = s.m_allocator->transient;   // textures + buffers, tagged by kind
+    PersistentResourcePool& pool = s.m_allocator->pool;
+    TransientResourcePool& transient = s.m_allocator->transient;
 
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (!r->persistent) continue;
-        PersistentResourcePool::Entry* e = pool.find(r->name);
+        PersistentResourcePool::Entry* e = pool.find(r->id);
         if (!e) continue;
-        if (r->kind == ResourceNode::Kind::Texture) e->usage    |= r->texUsage;
-        else                                        e->bufUsage |= r->bufUsage;
+        if (r->kind == ResourceNode::Kind::Texture) 
+            e->usage    |= r->texUsage;
+        else                                       
+            e->bufUsage |= r->bufUsage;
     }
+
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (!r->persistent) continue;
-        PersistentResourcePool::Entry* e = pool.find(r->name);
+        PersistentResourcePool::Entry* e = pool.find(r->id);
         if (!e) continue;
         uint32_t sl = pool.slot(*e, r->temporalIndex);
         if (r->kind == ResourceNode::Kind::Texture) {
@@ -1858,7 +1895,7 @@ void RenderGraph::realize(WGPUDevice device)
         if (ph.kind == ResourceNode::Kind::Texture)
             transient.acquire(device, ph.size, ph.format, ph.dimension, 1, 1, ph.texUsage, ph.texture, ph.view);
         else
-            transient.acquire(device, ph.bufferSize, ph.bufUsage, ph.buffer);   // buffer acquire overload
+            transient.acquire(device, ph.bufferSize, ph.bufUsage, ph.buffer);
     }
     for (ResourceNode* r = s.m_resouces; r; r = r->next)
         if (r->aliasSlot != ResourceNode::kNoSlot) {
@@ -1878,18 +1915,31 @@ void RenderGraph::realize(WGPUDevice device)
         // graph-owned per-frame BUFFERS not on an alias slot: the buffer twin of the loop above.
         if (r->is_external() || r->kind != ResourceNode::Kind::Buffer || !r->bufUsage
             || r->aliasSlot != ResourceNode::kNoSlot) continue;
-        transient.acquire(device, r->bufferSize, r->bufUsage, r->buffer);   // buffer acquire overload
+        transient.acquire(device, r->bufferSize, r->bufUsage, r->buffer);
     }
+
+    auto t1 = std::chrono::steady_clock::now();
+    s.timing_realize_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
 }
 
 // record the compiled passes (already in execution order) into a caller-owned encoder: open the
 // right pass kind, wire the attachments declared in setup, invoke the stored body against a live
 // PassContext. caller owns submit + present.
-// ponytail: mirrors RenderPassBuilder/ComputePassBuilder in Renderer.cpp; reimplemented inline
+// NOTE(Huerbe): mirrors RenderPassBuilder/ComputePassBuilder in Renderer.cpp; reimplemented inline
 // rather than shared because those live in Renderer.cpp (not a header) and this TU is standalone.
-void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enableProfiling)
+void RenderGraph::execute(WGPUDevice device, WGPUCommandEncoder encoder, WGPUQueue queue, bool enableProfiling)
 {
     RenderGraphStorage& s = *storage(this);
+    if (s.m_isValid == false)
+            return; // iff errors noop
+
+    // Realize GPU resources first
+    realize_graph(this, device);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+
+    assert(s.m_state == RenderGraphState::Compiled);
 
     // opt-in GPU timing: lazily build the query set/buffers, then grab a free read-back ring slot. If every
     // slot is still awaiting its map callback, skip profiling this frame rather than stall. `pi` is a dense
@@ -1898,7 +1948,8 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
     bool profiling = enableProfiling;
     int  slotIdx = -1;
     if (profiling) {
-        prof.init(s.m_device);
+        prof.init(device);
+        // disable profiling when no free slot is found
         slotIdx = prof.free_slot();
         if (slotIdx < 0) profiling = false;
     }
@@ -1911,7 +1962,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
     WGPUStringView openGroup{};
     for (PassNode* p = s.m_passes; p; p = p->next) {
         assert(p->kind != PassKind::None && "a pass of type none is not allowed; its a trap for bad data");
-        WGPUStringView grp = group_prefix(p->name);
+        WGPUStringView grp = group_prefix(p->id.name);
         if (!sv_eq(grp, openGroup)) {
             if (sv_length(openGroup)) wgpuCommandEncoderPopDebugGroup(encoder);
             if (sv_length(grp))       wgpuCommandEncoderPushDebugGroup(encoder, grp);
@@ -1925,7 +1976,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
         // one either. skipped (already-baked) init passes were culled -> not in this loop.
         if (p->initTarget.id && p->exec_fn)
             if (ResourceNode* t = find_node(this, p->initTarget))
-                if (PersistentResourcePool::Entry* e = s.m_allocator->pool.find(t->name)) {
+                if (PersistentResourcePool::Entry* e = s.m_allocator->pool.find(t->id)) {
                     e->initHash = p->initHash;
                     e->baked    = true;
                 }
@@ -1941,10 +1992,10 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
         // the set. begin/end ride the pass descriptor (render/compute) or bracket the encoder body (transfer).
         const bool timeThis = profiling && p->exec_fn && pi < GpuProfiler::kMaxPasses;
         WGPUPassTimestampWrites tw{ .querySet = prof.querySet, .beginningOfPassWriteIndex = 2 * pi, .endOfPassWriteIndex = 2 * pi + 1 };
-        if (timeThis) slot->names[pi] = p->name;
+        if (timeThis) slot->names[pi] = p->id.name;
 
         if (p->kind == PassKind::Compute && p->exec_fn) {
-            WGPUComputePassDescriptor cd{ .label = p->name, .timestampWrites = timeThis ? &tw : nullptr };
+            WGPUComputePassDescriptor cd{ .label = p->id.name, .timestampWrites = timeThis ? &tw : nullptr };
             ctx.compute = wgpuCommandEncoderBeginComputePass(encoder, &cd);
             p->exec_fn(p->exec_obj, ctx);
             wgpuComputePassEncoderEnd(ctx.compute);
@@ -1962,7 +2013,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
             // array (its default full view spans many subresources -> illegal here), so build the single
             // (baseMip, baseLayer) slice the access named and release it after the pass. imported textures
             // (r->texture null, e.g. swapchain) keep their caller-owned registered view.
-            // ponytail: rebuilt per pass per frame; cache on the node keyed by subresource if it ever shows
+            // NOTE(Huerbe): rebuilt per pass per frame; cache on the node keyed by subresource if it ever shows
             // up in a profile.
             // built views land in the shared per-pass scratch (s.viewScratch, drained after the body) so the
             // body's own ctx.view() reads pool with these attachments. one view per access -> the per-pass
@@ -2012,13 +2063,6 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
                         .depthStoreOp      = a.storeOp,
                         .depthClearValue   = a.clearDepth,
                         .depthReadOnly     = a.type == AccessType::DepthStencilReadOnly,
-                        // stencil aspect: non-default only when the caller passed stencil ops (depth+stencil
-                        // format). depth-only formats keep these Undefined/0, matching the old behavior.
-                        // ponytail: depth + stencil share one read-only flag (DepthStencilReadOnly = both).
-                        // depth-write + stencil-gate (portals/mirrors/masked regions) needs no flag -- use a
-                        // writable depth_stencil() and set the pipeline's stencil ops to Keep. the shared flag
-                        // only blocks sampling the stencil aspect as a texture in the same pass you depth-write
-                        // (would need depthReadOnly=false + stencilReadOnly=true); add a per-aspect flag then.
                         .stencilLoadOp     = a.stencilLoadOp,
                         .stencilStoreOp    = a.stencilStoreOp,
                         .stencilClearValue = a.stencilClear,
@@ -2029,7 +2073,7 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
             }
 
             WGPURenderPassDescriptor rd{
-                .label                  = p->name,
+                .label                  = p->id.name,
                 .colorAttachmentCount   = nc,
                 .colorAttachments       = color,
                 .depthStencilAttachment = hasDepth ? &depth : nullptr,
@@ -2064,6 +2108,11 @@ void RenderGraph::execute(WGPUCommandEncoder encoder, WGPUQueue queue, bool enab
         slot->count = pi;
         prof.pendingSlot = slotIdx;
     }
+
+    s.m_state = RenderGraphState::Finished;
+    release_resources(this);
+    auto t1 = std::chrono::steady_clock::now();
+    s.timing_execute_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
 }
 
 // kick the async read-back of the slot execute() just filled. Call AFTER the frame's queue submit -- the
@@ -2103,11 +2152,18 @@ void RenderGraph::collect_gpu_timings()
     wgpuBufferMapAsync(slot->buf, WGPUMapMode_Read, 0, slot->count * 2 * sizeof(uint64_t), cb);
 }
 
+ErrorMessage* RenderGraph::getErrors()
+{
+    // TODO: implement ErrorMessages
+    return storage(this)->m_errors;
+}
+
 // release graph-created GPU handles (imported ones are caller-owned -> left alone). pairs with
 // realize(); call once the frame's commands have been submitted.
-void RenderGraph::release_resources()
+static void release_resources(RenderGraph* rg)
 {
-    RenderGraphStorage& s = *storage(this);
+    RenderGraphStorage& s = *storage(rg);
+    assert(s.m_state == RenderGraphState::Finished);
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (r->is_external()) continue;   // pool owns temporal/persistent, caller owns imported -> not ours
         // graph-owned per-frame transient (texture or buffer) -> pool-owned; drop our borrowed refs, don't
@@ -2134,14 +2190,14 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
     WGPULoadOp stencilLoad = WGPULoadOp_Undefined, WGPUStoreOp stencilStore = WGPUStoreOp_Undefined,
     uint32_t stencilClear = 0)
 {
-    if (!handle.id) return;   // invalid handle (id 0): record nothing -- no dependency, no usage bit, no view lookup later
-#if RG_VALIDATE
+    assert(handle.id != 0);
+
     // immediate (declaration-time) usage check: fires at the exact b.sampled()/b.storage_write() call
     // site, not deferred to compile(). A pass is one WebGPU usage scope; a resource may not be aliased
     // read+write (e.g. sampled + storage_write, the named case) or written more than once (the graph
     // can't order two writes inside an atomic pass). read+read and the StorageRead+StorageWrite RMW pair
     // are fine; see in_pass_accesses_conflict.
-    // ponytail: WebGPU itself permits multiple writable-storage uses in one scope; the graph is stricter
+    // NOTE(Huerbe): WebGPU itself permits multiple writable-storage uses in one scope; the graph is stricter
     // because it has no way to synchronize two writes inside a pass; relax if a shader ever needs it.
     if (handle.id) {
         const bool w = access_is_write(type);
@@ -2152,7 +2208,7 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
                 pass->accesses[i].baseMip, pass->accesses[i].baseLayer)) {
                 std::printf("[RenderGraph] error: pass \"%.*s\" uses resource id %u %s in one pass -- a "
                             "written resource must be its only use in the pass.\n",
-                            (int)pass->name.length, pass->name.data ? pass->name.data : "",
+                            (int)pass->id.name.length, pass->id.name.data ? pass->id.name.data : "",
                             handle.id, (w && access_is_write(pass->accesses[i].type))
                                            ? "as more than one write (unsynchronized)"
                                            : "as both written and read");
@@ -2160,17 +2216,17 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
             }
         }
     }
-#endif
+
 
     if (pass->accessCount < PassNode::kMaxAccess) {
         pass->accesses[pass->accessCount++] =
             { handle, type, load, store, clear, clearDepth, stencilLoad, stencilStore, stencilClear, baseMip, baseLayer };
     } else {
         // hard structural cap hit (PassNode::kMaxAccess). dropping the access silently mis-renders (a missing
-        // attachment/binding), so be loud right here -- always-on (not RG_VALIDATE), at the offending b.*() call.
+        // attachment/binding), so be loud right here, at the offending b.*() call.
         std::printf("[RenderGraph] error: pass \"%.*s\" hit kMaxAccess (%u) -- access on resource id %u dropped; "
                     "raise PassNode::kMaxAccess.\n",
-                    (int)pass->name.length, pass->name.data ? pass->name.data : "",
+                    (int)pass->id.name.length, pass->id.name.data ? pass->id.name.data : "",
                     (unsigned)PassNode::kMaxAccess, handle.id);
         assert(false && "RenderGraph: pass exceeded kMaxAccess");
     }
@@ -2178,6 +2234,7 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
 
 void PassBuilder::color(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, WGPUColor clear, uint32_t baseMip, uint32_t baseLayer)
 {
+    assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Texture);
     assert(m_new_pass->kind == PassKind::Graphics && "color attachment is only legal for graphics passes.");
     use(m_new_pass, handle, AccessType::ColorAttachment, load, store, clear, {}, baseMip, baseLayer);
@@ -2187,7 +2244,6 @@ void PassBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t base
 {
     // single-sample target the preceding color() resolves into; execute() pairs it with the most recent
     // color() by order. load/store/clear are unused (a resolve has no load op of its own).
-#if RG_VALIDATE
     // pairing is positional, so a resolve() before any color(), or a second resolve() on a color that
     // already has one, is silently dropped in execute() -- the access never reaches Dawn, so Dawn can't
     // catch it. assert at the bad call instead. scan back to whichever came last: a color (this resolve
@@ -2201,68 +2257,77 @@ void PassBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t base
     if (doubleResolve) {
         std::printf("[RenderGraph] error: pass \"%.*s\" calls resolve() twice for one color() -- one "
                     "resolve target per color attachment.\n",
-                    (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "");
+                    (int)m_new_pass->id.name.length, m_new_pass->id.name.data ? m_new_pass->id.name.data : "");
         assert(false && "RenderGraph: resolve() called twice for one color() in a pass");
     } else if (!pairedColor) {
         std::printf("[RenderGraph] error: pass \"%.*s\" calls resolve() with no preceding color() -- a "
                     "resolve target pairs with the color() declared just before it.\n",
-                    (int)m_new_pass->name.length, m_new_pass->name.data ? m_new_pass->name.data : "");
+                    (int)m_new_pass->id.name.length, m_new_pass->id.name.data ? m_new_pass->id.name.data : "");
         assert(false && "RenderGraph: resolve() with no preceding color() in a pass");
     }
-#endif
+
     use(m_new_pass, handle, AccessType::ResolveAttachment, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void PassBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer, WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
+    assert(handle.id != 0);
     use(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, stencilLoad, stencilStore, stencilClear);
 }
 
 void PassBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
+    assert(handle.id != 0);
     // load/store/clear default Undefined/{}; required when read-only
     use(m_new_pass, handle, AccessType::DepthStencilReadOnly, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void PassBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
+    assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Texture);
     use(m_new_pass, handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void PassBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
+    assert(handle.id != 0);
     use(m_new_pass, handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 void PassBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
+    assert(handle.id != 0);
     use(m_new_pass, handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
 // in-place read-modify-write: the API mirror of WGSL `var<storage, read_write>`. records the
-// StorageRead+StorageWrite pair on one handle -- in_pass_accesses_conflict whitelists exactly this
+// StorageRead+StorageWrite pair on one handle; in_pass_accesses_conflict whitelists exactly this
 // pairing, and the sweep's self-guards (no WAR/WAW/RAW edge from a pass to itself) keep it acyclic.
 // one logical binding, two recorded accesses.
 void PassBuilder::storage_read_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
 {
+    assert(handle.id != 0);
     storage_read(handle, baseMip, baseLayer);
     storage_write(handle, baseMip, baseLayer);
 }
 
 void PassBuilder::uniform(ResourceHandle handle)
 {
+    assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Buffer);
     use(m_new_pass, handle, AccessType::Uniform);
 }
 
 void PassBuilder::copy_src(ResourceHandle handle)
 {
+    assert(handle.id != 0);
     use(m_new_pass, handle, AccessType::CopySrc);
 }
 
 void PassBuilder::copy_dst(ResourceHandle handle)
 {
+    assert(handle.id != 0);
     use(m_new_pass, handle, AccessType::CopyDst);
 }
 
@@ -2287,12 +2352,12 @@ void PassBuilder::indirect_buffer(ResourceHandle handle)
     use(m_new_pass, handle, AccessType::Indirect);
 }
 
-// gate this pass on a persistent target -- compile() runs it only while the target needs (re)baking: it is
+// gate this pass on a persistent target. compile() runs it only while the target needs (re)baking: it is
 // unrealized, or `hash` differs from the hash last baked in. not an access (records no hazard/usage), just a
 // marker; declare the actual write to `target` separately. hash 0 (default) == bake once.
 void PassBuilder::initialize(ResourceHandle target, uint64_t hash)
 {
-    assert(m_new_pass->initTarget.id == 0 || m_new_pass->initTarget.id == target.id && "The render graph only supports one initialize per pass!");
+    assert(m_new_pass->initTarget.id == 0 || m_new_pass->initTarget.id == target.id && "The render graph only supports one initialize per pass! This can be extended");
     m_new_pass->initTarget = target;
     m_new_pass->initHash = hash;
 }

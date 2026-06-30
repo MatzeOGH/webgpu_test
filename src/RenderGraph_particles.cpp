@@ -250,14 +250,14 @@ static void particles_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle 
     u.params[0] = env.dt; u.params[1] = env.time; u.params[2] = turbAmp; u.params[3] = turbFreq;
     u.counts[0] = reset ? 1u : 0u; u.counts[1] = kParticleCount;
     wgpuQueueWriteBuffer(env.queue, uboBuf, 0, &u, sizeof(u));
-    ResourceHandle ubo = rg->import_buffer(WEBGPU_STR("part.ubo"), uboBuf);
+    ResourceHandle ubo = rg->import_buffer("part.ubo"_rid, uboBuf);
 
     // the cross-frame particle state: write curr, read prev. the pool rotates the two physical buffers.
-    auto parts = rg->create_temporal_buffer(WEBGPU_STR("particles"), { .size = kParticleBytes });
+    auto parts = rg->create_temporal_buffer("particles"_rid, { .size = kParticleBytes });
 
     // sim: integrate prev -> curr. one invocation per particle.
     const uint32_t groups = (kParticleCount + 63u) / 64u;
-    rg->add_pass(WEBGPU_STR("particles.sim"), PassKind::Compute,
+    rg->add_pass("particles.sim"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.storage_read(parts.prev);
@@ -281,7 +281,7 @@ static void particles_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle 
         });
 
     // draw: billboard every particle, additive over a near-black clear.
-    rg->add_pass(WEBGPU_STR("particles.draw"), PassKind::Graphics,
+    rg->add_pass("particles.draw"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(ubo);
             b.storage_read(parts.curr);

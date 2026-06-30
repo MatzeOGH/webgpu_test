@@ -215,6 +215,7 @@ int main()
         for (int i = 0; i < kDemoCount; ++i) {
             if (i) ImGui::SameLine();
             if (ImGui::RadioButton(demos[i].name, active == i)) active = i;   // F1..Fn also switch
+
         }
         ImGui::Separator();
         static bool enableAlias = true;   // phase-4 transient aliasing; folded into the reshape sig below
@@ -242,7 +243,7 @@ int main()
 
         // ---- declare the whole graph for THIS frame (immediate mode) ----
         RenderGraph* rg = create_render_graph(allocator);   // resets the arena (pools persist in the allocator)
-        auto swapchain = rg->importe_image(WEBGPU_STR("swapchain"), view, { cfg.width, cfg.height, 1 });
+        auto swapchain = rg->importe_image("swapchain"_rid, view, { cfg.width, cfg.height, 1 });
 
         ++frame;   // counts frames that reach build (surface-stale skips above don't); demos detect re-entry from gaps
         DemoEnv env{ dev, q, kSwapFormat, cfg.width, cfg.height, (float)now, dt, frame, camera };
@@ -250,27 +251,12 @@ int main()
 
         // ImGui overlay: last pass. Load keeps the rendered scene; the write to the imported swapchain
         // makes it a sink, and a WAW edge orders it after the demo's present.
-        rg->add_pass(WEBGPU_STR("imgui"), PassKind::Graphics,
+        rg->add_pass("imgui"_rid, PassKind::Graphics,
             [&](PassBuilder& b) { b.color(swapchain, WGPULoadOp_Load, WGPUStoreOp_Store); },
             [](PassContext& ctx) { ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), ctx.render); });
 
-        auto t0 = std::chrono::steady_clock::now();
-        if (!rg->compile(enableAlias)) {
-            // ordering error (compile() already printed it). skip this frame's GPU work.
-            wgpuTextureViewRelease(view);
-            wgpuTextureRelease(st.texture);
-            instance.ProcessEvents();
-            imgui_layer_end_frame();
-            continue;
-        }
-        auto t1 = std::chrono::steady_clock::now();
-        rg->realize(dev);     // creates this frame's transient textures
-        auto t2 = std::chrono::steady_clock::now();
-        {
-            auto& s = *storage(rg);
-            s.timing_compile_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
-            s.timing_realize_us = std::chrono::duration<float, std::micro>(t2 - t1).count();
-        }
+  
+        rg->compile(enableAlias);
 
         imgui_layer_draw_graph(rg);   // build the DAG window now the graph is compiled + realized
         imgui_layer_end_frame();      // ImGui::Render(); the "imgui" pass consumes the draw data at execute
@@ -278,12 +264,12 @@ int main()
         // reprint the execution order whenever the graph reshapes (demo switch, toggle, resize-driven mip
         // count). a pass-name signature diff catches it for ANY demo, no per-demo cooperation.
         std::string sig;
-        for (PassNode* p = storage(rg)->m_passes; p; p = p->next) { sig.append(p->name.data, p->name.length); sig.push_back('|'); }
+        for (PassNode* p = storage(rg)->m_passes; p; p = p->next) { sig.append(p->id.name.data, p->id.name.length); sig.push_back('|'); }
         sig += enableAlias ? "A1" : "A0";   // fold the aliasing toggle in so flipping it reprints the pool stats
         if (sig != lastSig) {
             lastSig = sig;
             std::printf("execution order:");
-            for (PassNode* p = storage(rg)->m_passes; p; p = p->next) std::printf(" %.*s", (int)p->name.length, p->name.data);
+            for (PassNode* p = storage(rg)->m_passes; p; p = p->next) std::printf(" %.*s", (int)p->id.name.length, p->id.name.data);
             size_t tpTex = 0, tpBuf = 0;   // one pool, tagged by kind
             for (const auto& e : allocator->transient.entries) (e.isBuffer ? tpBuf : tpTex)++;
             std::printf("\ntransient pool: %zu textures, %zu buffers (%u created this frame)\n",
@@ -297,16 +283,12 @@ int main()
         }
 
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(dev, nullptr);
-        auto te0 = std::chrono::steady_clock::now();
-        rg->execute(enc, q, enableProfiling && gpuTimingAvailable);
-        auto te1 = std::chrono::steady_clock::now();
-        storage(rg)->timing_execute_us = std::chrono::duration<float, std::micro>(te1 - te0).count();
+
+        rg->execute(dev, enc, q, enableProfiling && gpuTimingAvailable);
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
         wgpuQueueSubmit(q, 1, &cmd);
         rg->collect_gpu_timings();   // kick the async timestamp read-back now the copy is submitted
         wgpuSurfacePresent(surf);
-
-        rg->release_resources();   // destroy this frame's graph textures (imported swapchain left alone)
 
         wgpuTextureViewRelease(view);
         wgpuTextureRelease(st.texture);
