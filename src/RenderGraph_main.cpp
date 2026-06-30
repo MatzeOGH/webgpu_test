@@ -82,6 +82,7 @@ wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
 #include "RenderGraph_pathtracer.cpp"
 #include "RenderGraph_particles.cpp"
 #include "RenderGraph_bake.cpp"
+#include "RenderGraph_msaa.cpp"
 
 // the registry. one row per demo; RG_DEMO_LIST(X) builds the table from the naming convention, so the
 // hooks never need a hand-written Demo literal. add a demo above, then add its row here.
@@ -89,7 +90,8 @@ wgpu::Device acquire_device(wgpu::Instance instance, wgpu::Surface surface)
     X("Deferred",    deferred)   \
     X("Path Tracer", pathtracer) \
     X("Particles",   particles)  \
-    X("Bake",        bake)
+    X("Bake",        bake)        \
+    X("MSAA",        msaa)
 
 int main()
 {
@@ -147,7 +149,7 @@ int main()
     static const Demo demos[] = { RG_DEMO_LIST(X) };
     #undef X
     constexpr int kDemoCount = (int)(sizeof(demos) / sizeof(demos[0]));
-    int active = 0;   // default demo (set to 1 to launch the path tracer for non-interactive checks)
+    int active = 4;   // default demo (set to 1 to launch the path tracer for non-interactive checks)
 
     // free-fly camera, shared by every demo. main drives pos/yaw/pitch from SDL; demos read the basis.
     Camera camera;
