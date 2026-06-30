@@ -2199,21 +2199,19 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
     // are fine; see in_pass_accesses_conflict.
     // NOTE(Huerbe): WebGPU itself permits multiple writable-storage uses in one scope; the graph is stricter
     // because it has no way to synchronize two writes inside a pass; relax if a shader ever needs it.
-    if (handle.id) {
-        const bool w = access_is_write(type);
-        for (uint32_t i = 0; i < pass->accessCount; ++i) {
-            if (pass->accesses[i].handle.id != handle.id) continue;
-            if (in_pass_accesses_conflict(type, baseMip, baseLayer,
-                pass->accesses[i].type,
-                pass->accesses[i].baseMip, pass->accesses[i].baseLayer)) {
-                std::printf("[RenderGraph] error: pass \"%.*s\" uses resource id %u %s in one pass -- a "
-                            "written resource must be its only use in the pass.\n",
-                            (int)pass->id.name.length, pass->id.name.data ? pass->id.name.data : "",
-                            handle.id, (w && access_is_write(pass->accesses[i].type))
-                                           ? "as more than one write (unsynchronized)"
-                                           : "as both written and read");
-                assert(false && "RenderGraph: illegal in-pass resource usage (read+write or double write in one pass)");
-            }
+    const bool w = access_is_write(type);
+    for (uint32_t i = 0; i < pass->accessCount; ++i) {
+        if (pass->accesses[i].handle.id != handle.id) continue;
+        if (in_pass_accesses_conflict(type, baseMip, baseLayer,
+            pass->accesses[i].type,
+            pass->accesses[i].baseMip, pass->accesses[i].baseLayer)) {
+            std::printf("[RenderGraph] error: pass \"%.*s\" uses resource id %u %s in one pass -- a "
+                        "written resource must be its only use in the pass.\n",
+                        (int)pass->id.name.length, pass->id.name.data ? pass->id.name.data : "",
+                        handle.id, (w && access_is_write(pass->accesses[i].type))
+                                        ? "as more than one write (unsynchronized)"
+                                        : "as both written and read");
+            assert(false && "RenderGraph: illegal in-pass resource usage (read+write or double write in one pass)");
         }
     }
 
