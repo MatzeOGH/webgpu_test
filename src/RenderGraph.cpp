@@ -477,59 +477,34 @@ struct GpuProfiler
     }
 };
 
-// TODO: new block backed arena allocator
+// Block-backed bump arena. Grows by mallocing a fresh ArenaBlock and chaining it on when the current block
+// fills -- no fixed ceiling. reset() rewinds every block but KEEPS them (no per-frame malloc/free churn);
+// free_all() releases the chain at teardown. A single alloc_raw never splits across a block boundary, so
+// callers can index a multi-element allocation (byId, the compile() scratch tables) as a contiguous array.
 static constexpr size_t ARENA_DEFAULT_BLOCK_SIZE = 64 * 1024;
 
 struct Arena
 {
+    // header + its payload share one malloc. `payload` is the usable region, rounded up to
+    // alignof(max_align_t) (the most any single allocation can ask for). this+1 is NOT that-aligned (the
+    // header is 12 bytes on wasm32 / 24 on x64), so the aligned start is computed once and stored.
     struct ArenaBlock
     {
-        ArenaBlock* next;
-        uint8_t base;
-        size_t capacity;
-        size_t used;
+        ArenaBlock* next;      // chain link
+        uint8_t*    payload;   // aligned payload start, inside this same malloc
+        size_t      capacity;  // usable payload bytes
+        size_t      used;      // bump cursor into payload
     };
 
-    ArenaBlock* head;
-    ArenaBlock* current;
-    size_t blockSize;
+    ArenaBlock* head{};     // first block; reset() rewinds to it, free_all() walks from it
+    ArenaBlock* current{};  // block we bump from now (null until the first alloc)
+    size_t blockSize = ARENA_DEFAULT_BLOCK_SIZE;   // default payload size for new blocks
 
-    size_t totalCapacity;
-    size_t peakUsage;
-    size_t blockCount;
-};
-
-static Arena* createArena() {
-    void* block = malloc(ARENA_DEFAULT_BLOCK_SIZE);
-    Arena* arena = ::new (block) Arena;
-    arena->blockCount = 1;
-    return arena;
-};
-
-// arena allocator: bumps from both ends of one buffer. `used` grows up from base[0] for
-// permanent per-frame nodes (reset once per frame); `scratchUsed` grows down from base[capacity]
-// for compile()-local temporaries, reset per-scope via defer (AlpUtils.h) instead of calloc/free.
-// Also owns the two resource pools (below): they share the allocator's lifetime, so when it goes they go.
-// TODO: add a chained allocator to enable growing allocations
-struct GraphAllocator
-{
-    // Pointer to the base memory block
-    uint8_t* base{};
-    // Offset to the next free byte
-    size_t used{};
-    // Total capacity in bytes
-    size_t capacity{};
-    // Offset from the top of the buffer to the next free scratch byte (grows downward).
-    size_t scratchUsed{};
-    // High-water mark of scratchUsed within the frame. scratch is rewound to 0 per scope, so by the
-    // time the debug UI reads the arena the live value is back to 0 -- this keeps the peak for it.
-    size_t scratchHighWater{};
-
-    // resource pools folded in. reset() below only rewinds the bump cursors -- it leaves these be,
-    // because they cache GPU objects across frames on purpose (history ping-pong + transient reuse).
-    PersistentResourcePool pool;        // name-keyed temporal/history textures + buffers
-    TransientResourcePool  transient;   // descriptor-keyed per-frame texture + buffer cache (tagged by kind)
-    GpuProfiler            profiler;     // opt-in per-pass GPU timestamps; created lazily on first profiled frame
+    // debug-UI stats: peakUsage is the per-frame high-water (reset() zeros it); live_used() is the current
+    // occupancy. totalCapacity/blockCount persist across reset().
+    size_t totalCapacity{};
+    size_t peakUsage{};
+    size_t blockCount{};
 
     // alignment must be a power of two
     static constexpr size_t align_up(size_t value, size_t alignment)
@@ -537,131 +512,175 @@ struct GraphAllocator
         return (value + alignment - 1) & ~(alignment - 1);
     }
 
-    // Raw aligned allocation for type-erased payloads.
+    // malloc one block whose payload holds >= minPayload bytes (at least blockSize). header, alignment
+    // slack and payload come from a single malloc. null on heap exhaustion.
+    ArenaBlock* new_block(size_t minPayload)
+    {
+        const size_t maxAlign    = alignof(std::max_align_t);
+        const size_t payloadBytes = minPayload < blockSize ? blockSize : minPayload;
+        const size_t raw          = sizeof(ArenaBlock) + maxAlign + payloadBytes;  // +maxAlign covers the round-up
+        ArenaBlock* b = static_cast<ArenaBlock*>(std::malloc(raw));
+        if (!b) return nullptr;
+        uint8_t* start = reinterpret_cast<uint8_t*>(b) + sizeof(ArenaBlock);
+        b->payload  = reinterpret_cast<uint8_t*>(align_up(reinterpret_cast<size_t>(start), maxAlign));
+        b->capacity = payloadBytes;
+        b->used     = 0;
+        b->next     = nullptr;
+        totalCapacity += payloadBytes;
+        ++blockCount;
+        return b;
+    }
+
+    // eagerly create the head block (create_allocator). a later malloc-failure just leaves head null and the
+    // lazy path in alloc_raw retries.
+    void reserve() { if (!current) head = current = new_block(blockSize); }
+
+    // sum of live bytes (head..current inclusive). blocks chained past current are retained-but-empty.
+    size_t live_used() const
+    {
+        size_t total = 0;
+        for (ArenaBlock* b = head; b; b = b->next) { total += b->used; if (b == current) break; }
+        return total;
+    }
+
+    // Raw aligned allocation; grows the chain on demand. The whole request lands in ONE block.
     void* alloc_raw(size_t size, size_t align)
     {
-        const size_t offset = align_up(used, align);
-
-        if (offset + size > capacity - scratchUsed)
+        if (!current)                                  // lazy first block
         {
-            // always-on (release too): assert is stripped under NDEBUG, so without this an OOM returns null and
-            // the caller (begin_pass, make<T>, store_exec, ...) deref-crashes silently. announce it loudly.
-            std::printf("[RenderGraph] error: arena OOM -- need %zu bytes, %zu/%zu used, %zu scratch. "
-                        "raise arenaSize in create_allocator.\n", size, used, capacity, scratchUsed);
-            assert(false && "GraphAllocator OOM");
-            return nullptr;
+            head = current = new_block(size + align);
+            if (!current) return oom(size);
         }
 
-        void* p = base + offset;
-        used = offset + size;
+        size_t off = align_up(current->used, align);
+        if (off + size > current->capacity)            // current is full
+        {
+            if (current->next && size + align <= current->next->capacity)
+            {
+                current = current->next;               // reuse a retained block
+                current->used = 0;
+            }
+            else
+            {
+                ArenaBlock* b = new_block(size + align);
+                if (!b) return oom(size);
+                b->next = current->next;               // keep any blocks already chained past current
+                current->next = b;
+                current = b;
+            }
+            off = align_up(current->used, align);      // current->used == 0 here
+        }
+
+        void* p = current->payload + off;
+        current->used = off + size;
+        const size_t live = live_used();
+        if (live > peakUsage) peakUsage = live;        // record peak before any rewind reads it
         return p;
     }
 
-    // Raw aligned allocation from the TOP of the buffer, growing scratchUsed down. Short-lived,
-    // compile()-local scratch. Pair every call site with `defer { <allocator>->reset_scratch(); };`
-    // right after the scratch allocations in that scope.
-    void* scratch_alloc_raw(size_t size, size_t align)
+    void* oom(size_t size)
     {
-        if (size > capacity - scratchUsed)
-        {
-            std::printf("[RenderGraph] error: scratch OOM -- need %zu bytes, scratch %zu/%zu.\n",
-                        size, scratchUsed, capacity);
-            assert(false && "GraphAllocator scratch OOM");
-            return nullptr;
-        }
-
-        size_t rawTop = (capacity - scratchUsed - size) & ~(align - 1);   // round start down to align
-        size_t newScratchUsed = capacity - rawTop;
-
-        if (newScratchUsed > capacity - used)   // would cross into the live front/permanent region
-        {
-            std::printf("[RenderGraph] error: scratch OOM -- need %zu bytes, would cross the front region "
-                        "(%zu used).\n", size, used);
-            assert(false && "GraphAllocator scratch OOM");
-            return nullptr;
-        }
-
-        scratchUsed = newScratchUsed;
-        if (scratchUsed > scratchHighWater) scratchHighWater = scratchUsed;
-        return base + rawTop;
+        // always-on (release too): assert is stripped under NDEBUG / -sASSERTIONS=0, so without this an OOM
+        // returns null and the caller deref-crashes silently. announce it loudly.
+        std::printf("[RenderGraph] error: arena alloc failed -- malloc of %zu bytes failed (heap exhausted).\n", size);
+        assert(false && "Arena malloc failed");
+        return nullptr;
     }
 
-    // shared by make<T>/scratch_make<T>: placement-new construct T in raw storage.
-    template<typename T, typename... Args>
-    static T* construct(void* m, Args&&... args)
-    {
-        return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr;
-    }
-
-    // shared by alloc<T>/scratch_alloc<T>: zero `count` T's worth of raw storage and reinterpret.
-    template<typename T>
-    static T* zero(void* m, size_t count)
-    {
-        if (m) std::memset(m, 0, sizeof(T) * count);
-        return static_cast<T*>(m);
-    }
-
-    // Allocate + construct
-    template<typename T, typename... Args>
-    T* make(Args&&... args)
-    {
-        return construct<T>(alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
-    }
-
-    // Allocate + construct in scratch.
-    template<typename T, typename... Args>
-    T* scratch_make(Args&&... args)
-    {
-        return construct<T>(scratch_alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...);
-    }
-
-    // Allocate zeroed POD storage
-    template<typename T>
-    T* alloc(size_t count = 1)
-    {
-        return zero<T>(alloc_raw(sizeof(T) * count, alignof(T)), count);
-    }
-
-    // Allocate zeroed POD scratch storage (calloc replacement).
-    template<typename T>
-    T* scratch_alloc(size_t count = 1)
-    {
-        return zero<T>(scratch_alloc_raw(sizeof(T) * count, alignof(T)), count);
-    }
-
-    // Copy a string view into allocator-owned storage.
-    // Result is always null-terminated.
-    WGPUStringView copy_string(WGPUStringView s)
-    {
-        const size_t len = (s.length == WGPU_STRLEN)
-                ? (s.data ? std::strlen(s.data) : 0)
-                : s.length;
-
-        char* buf = alloc<char>(len + 1);
-        if (!buf)
-            return {};
-
-        if (len)
-            std::memcpy(buf, s.data, len);
-
-        buf[len] = '\0';
-
-        return WGPUStringView{ buf, len };
-    }
-
+    // rewind cursors, KEEP blocks (reused next frame). does not touch pools/profiler.
     void reset()
     {
-        used = 0;
-        scratchUsed = 0;
-        scratchHighWater = 0;
+        for (ArenaBlock* b = head; b; b = b->next) b->used = 0;
+        current   = head;
+        peakUsage = 0;                                 // per-frame peak
     }
 
-    // reset scratch head to a new position
-    // enables partial resets
-    void reset_scratch(size_t pos = 0)
+    // free the whole chain (destructor / destroy_allocator).
+    void free_all()
     {
-        scratchUsed = pos;
+        for (ArenaBlock* b = head; b; ) { ArenaBlock* n = b->next; std::free(b); b = n; }
+        head = current = nullptr;
+        totalCapacity = peakUsage = blockCount = 0;
     }
+
+    // scoped scratch discipline (see ScopedScratch): mark a stack position, rewind back to it. blocks
+    // appended past the mark are kept (used=0) for reuse, never freed. peakUsage is left intact so the
+    // per-frame high-water survives the rewind that empties scratch before the debug UI reads it.
+    struct Mark { ArenaBlock* block; size_t used; };
+    Mark mark() const { return Mark{ current, current ? current->used : 0 }; }
+    void rewind(Mark m)
+    {
+        for (ArenaBlock* b = (m.block ? m.block->next : head); b; b = b->next) b->used = 0;
+        if (m.block) { m.block->used = m.used; current = m.block; }
+        else         { current = head; }
+    }
+
+    // shared by make<T>/alloc<T>
+    template<typename T, typename... Args>
+    static T* construct(void* m, Args&&... args) { return m ? ::new (m) T(std::forward<Args>(args)...) : nullptr; }
+    template<typename T>
+    static T* zero(void* m, size_t count) { if (m) std::memset(m, 0, sizeof(T) * count); return static_cast<T*>(m); }
+
+    // Allocate + construct one T.
+    template<typename T, typename... Args>
+    T* make(Args&&... args) { return construct<T>(alloc_raw(sizeof(T), alignof(T)), std::forward<Args>(args)...); }
+
+    // Allocate zeroed POD storage (calloc replacement). contiguous within one block.
+    template<typename T>
+    T* alloc(size_t count = 1) { return zero<T>(alloc_raw(sizeof(T) * count, alignof(T)), count); }
+
+    // Copy a string view into arena-owned storage. Result is always null-terminated.
+    WGPUStringView copy_string(WGPUStringView s)
+    {
+        const size_t len = (s.length == WGPU_STRLEN) ? (s.data ? std::strlen(s.data) : 0) : s.length;
+        char* buf = alloc<char>(len + 1);
+        if (!buf) return {};
+        if (len) std::memcpy(buf, s.data, len);
+        buf[len] = '\0';
+        return WGPUStringView{ buf, len };
+    }
+};
+
+// per-frame allocator built on two growable arenas: `front` for permanent per-frame nodes (the RenderGraph
+// + storage, every ResourceNode/PassNode, type-erased execute closures, copied strings; rewound once per
+// frame by reset()) and `scratch` for compile()-local temporaries (rewound per scope via ScopedScratch).
+// Also owns the two resource pools + profiler: they share the allocator's lifetime and cache GPU objects
+// across frames on purpose, so reset() leaves them be.
+struct GraphAllocator
+{
+    Arena front;     // permanent per-frame nodes (was base/used)
+    Arena scratch;   // compile()-local temporaries (was scratchUsed); driven by ScopedScratch
+
+    PersistentResourcePool pool;        // name-keyed temporal/history textures + buffers
+    TransientResourcePool  transient;   // descriptor-keyed per-frame texture + buffer cache (tagged by kind)
+    GpuProfiler            profiler;     // opt-in per-pass GPU timestamps; created lazily on first profiled frame
+
+    // kept so storage() (a free function) can compute the RenderGraphStorage offset.
+    static constexpr size_t align_up(size_t value, size_t alignment) { return Arena::align_up(value, alignment); }
+
+    // front-arena allocation -- the surface the rest of the .cpp uses. scratch goes through ScopedScratch.
+    void* alloc_raw(size_t size, size_t align) { return front.alloc_raw(size, align); }
+    template<typename T, typename... Args> T* make(Args&&... args) { return front.make<T>(std::forward<Args>(args)...); }
+    template<typename T> T* alloc(size_t count = 1) { return front.alloc<T>(count); }
+    WGPUStringView copy_string(WGPUStringView s) { return front.copy_string(s); }
+
+    void reset() { front.reset(); scratch.reset(); }
+};
+
+// RAII scratch scope: captures the scratch arena's mark on construction, rewinds to it on destruction.
+// Replaces the old `scratch_alloc<T>(...)` + `defer { reset_scratch(); }` pairs; nests cleanly (stack
+// discipline), so a scope inside another scope frees only its own slice.
+struct ScopedScratch
+{
+    Arena*      arena;
+    Arena::Mark mark;
+    explicit ScopedScratch(Arena& a) : arena(&a), mark(a.mark()) {}
+    ~ScopedScratch() { arena->rewind(mark); }
+    ScopedScratch(const ScopedScratch&) = delete;
+    ScopedScratch& operator=(const ScopedScratch&) = delete;
+
+    template<typename T> T* alloc(size_t count = 1) { return arena->alloc<T>(count); }
+    template<typename T, typename... Args> T* make(Args&&... args) { return arena->make<T>(std::forward<Args>(args)...); }
 };
 
 // internal resouceNode of an image or buffer
@@ -848,23 +867,29 @@ static ResourceNode* find_node(RenderGraph* rg, ResourceHandle h)
 
 GraphAllocator* create_allocator(size_t arenaSize){
     GraphAllocator* allocator = new GraphAllocator;
-    size_t capacity = arenaSize;
-    allocator->base = (uint8_t*)malloc(capacity);
-    allocator->capacity = capacity;
+    allocator->front.blockSize   = arenaSize;                 // first/default front block; the chain grows past it
+    allocator->scratch.blockSize = ARENA_DEFAULT_BLOCK_SIZE;  // compile()-local scratch
+    allocator->front.reserve();                               // eagerly create the front head block
     return allocator;
 }
 
 void destroy_allocator(GraphAllocator* allocator)
 {
-    free(allocator->base);
-    delete allocator;
+    allocator->front.free_all();
+    allocator->scratch.free_all();
+    delete allocator;   // runs the pool/transient/profiler destructors (they release GPU handles)
 }
 
 RenderGraph* create_render_graph(GraphAllocator* allocator)
 {
     allocator->reset();
-    RenderGraph* rg = allocator->make<RenderGraph>();
-    RenderGraphStorage* st = allocator->make<RenderGraphStorage>();
+    // RenderGraph + its storage must be adjacent: storage() recovers the latter by a fixed offset from the
+    // former. Allocate them as ONE object so the offset is guaranteed by struct layout, not by where the
+    // two allocations happen to land in the block chain.
+    struct RGPair { RenderGraph rg; RenderGraphStorage st; };
+    RGPair* pair = allocator->make<RGPair>();
+    RenderGraph* rg = &pair->rg;
+    RenderGraphStorage* st = &pair->st;
     assert(st == storage(rg) && "storage must sit immediately after the RenderGraph");
     st->m_allocator = allocator;
     return rg;
@@ -1201,9 +1226,9 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
 {
     // per resource id (1..next_resource_id-1): the pass holding the current version, and the readers of that
     // version not yet retired by a newer write.
-    PassNode** currentProducer = alloc->scratch_alloc<PassNode*>(next_resource_id);
-    NodeAdjacency** pendingReaders  = alloc->scratch_alloc<NodeAdjacency*>(next_resource_id);
-    defer { alloc->reset_scratch(); };
+    ScopedScratch ss(alloc->scratch);
+    PassNode** currentProducer = ss.alloc<PassNode*>(next_resource_id);
+    NodeAdjacency** pendingReaders  = ss.alloc<NodeAdjacency*>(next_resource_id);
 
     for (PassNode* p = head; p; p = p->next) {
         if (p->skipInit) continue;   // initialize() pass already satisfied -> treat as absent (no versions/edges)
@@ -1226,7 +1251,7 @@ static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint3
                 if (currentProducer[id] && currentProducer[id] != p)
                     onEdge(p, currentProducer[id], id, HazardKind::RAW);
                 // register as a pending reader of the current version (for a future write's WAR).
-                NodeAdjacency* link = alloc->scratch_make<NodeAdjacency>();
+                NodeAdjacency* link = ss.make<NodeAdjacency>();
                 link->pass = p; link->next = pendingReaders[id]; pendingReaders[id] = link;
             }
         }
@@ -1333,18 +1358,17 @@ void RenderGraph::compile(bool enableAlias)
         // as phase 1's currentProducer).
         // external = imported OR persistent (temporal). both are output sinks when written (their value
         // leaves the frame) and exempt from the read-before-write check (value comes from outside the frame).
-        bool* external = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);
+        ScopedScratch ss(s.m_allocator->scratch);
+        bool* external = ss.alloc<bool>(s.next_resource_id);
         for (ResourceNode* r = s.m_resouces; r; r = r->next)
             external[r->handle.id] = r->is_external();
 
         // topo into a transient array, then relink the intrusive list into execution order. The
-        // result lives in m_passes itself; the array is just DFS scratch, reclaimed by the
-        // deferred reset_scratch() below.
+        // result lives in m_passes itself; the array is just DFS scratch, reclaimed when ss goes out of scope.
         uint32_t N = 0;
         for (PassNode* p = s.m_passes; p; p = p->next) ++N;
 
-        PassNode** order = s.m_allocator->scratch_alloc<PassNode*>(N);
-        defer { s.m_allocator->reset_scratch(); };
+        PassNode** order = ss.alloc<PassNode*>(N);
         uint32_t count = 0;
         for (PassNode* p = s.m_passes; p; p = p->next)
             if (!p->skipInit && (is_sink(p, external) || p->forceKeep))   // satisfied initialize() pass is not a root; force_keep() keeps a reader-less side-effect pass alive
@@ -1375,11 +1399,11 @@ void RenderGraph::compile(bool enableAlias)
     //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
     // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
     {
-        bool* hasWriter = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // some surviving pass writes id
-        bool* produced  = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // ...has written it so far, in order
-        bool* external  = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // imported OR temporal: value from outside the frame
-        bool* prevLayer = s.m_allocator->scratch_alloc<bool>(s.next_resource_id);   // temporal layer k>0: read-only this frame
-        defer { s.m_allocator->reset_scratch(); };
+        ScopedScratch ss(s.m_allocator->scratch);
+        bool* hasWriter = ss.alloc<bool>(s.next_resource_id);   // some surviving pass writes id
+        bool* produced  = ss.alloc<bool>(s.next_resource_id);   // ...has written it so far, in order
+        bool* external  = ss.alloc<bool>(s.next_resource_id);   // imported OR temporal: value from outside the frame
+        bool* prevLayer = ss.alloc<bool>(s.next_resource_id);   // temporal layer k>0: read-only this frame
         for (ResourceNode* r = s.m_resouces; r; r = r->next) {
             external[r->handle.id]  = r->is_external();
             prevLayer[r->handle.id] = r->persistent && r->temporalIndex != 0;
@@ -1502,8 +1526,8 @@ void RenderGraph::compile(bool enableAlias)
         // attachment; for a BUFFER a storage_write may write only part, so an aliased successor could read
         // the previous occupant's bytes. the shader owns writing every byte it later reads -- same implicit
         // contract textures carry, sharper for buffers. tighten to CopyDst-only here if that ever bites.
-        ResourceNode** elig = s.m_allocator->scratch_alloc<ResourceNode*>(s.next_resource_id);
-        defer { s.m_allocator->reset_scratch(); };
+        ScopedScratch ss(s.m_allocator->scratch);
+        ResourceNode** elig = ss.alloc<ResourceNode*>(s.next_resource_id);
         uint32_t nElig = 0;
         for (ResourceNode* r = s.m_resouces; r; r = r->next) {
             if (r->is_external() || r->firstUse == ResourceNode::kNoPass || !r->hasWriter || !r->firstDefines)

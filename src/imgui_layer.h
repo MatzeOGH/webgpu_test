@@ -2426,22 +2426,22 @@ static void rg_draw_memory(RenderGraphStorage& s)
 	ImGui::EndChild();
 }
 
-// The per-frame bump arena (GraphAllocator) as a dual-ended usage bar. One fixed buffer backs the
-// RenderGraph object, every resource/pass node, the type-erased execute closures and the strings
-// copied in: `used` grows up from the base (cool, drawn from the left) and is what the frame holds.
-// compile()'s scratch grows down from the top (warm, drawn from the right); it's rewound to 0 before
-// we draw, so the bar uses its tracked per-frame peak. The ends can't overlap -- used + scratch peak
-// is the worst-case occupancy that decides whether 1 MB is enough (in the hover).
-static void rg_draw_arena(GraphAllocator& a)
+// One usage bar for a single growable, block-chained arena: `value` bytes (live for `front`, per-frame
+// peak for `scratch` -- scratch is rewound to empty by draw time) filled against the arena's CURRENT
+// capacity, which itself grows as blocks are chained on. The block count is shown in the overlay: > 1 means
+// the arena outgrew its first block this run. label doubles as the InvisibleButton id, so keep them unique.
+static void rg_draw_arena_bar(const char* label, const char* valueLabel, size_t value, const Arena& arena, ImU32 color)
 {
-	const double kib         = 1024.0;
-	const double cap         = a.capacity ? (double)a.capacity : 1.0;
-	const float  usedFrac    = (float)((double)a.used / cap);
-	const float  scratchFrac = (float)((double)(a.scratchHighWater) / cap);
+	const double kib  = 1024.0;
+	const double cap  = arena.totalCapacity ? (double)arena.totalCapacity : 1.0;
+	float        frac = (float)((double)value / cap);
+	if (frac > 1.0f) frac = 1.0f;
+	if (frac < 0.0f) frac = 0.0f;
 
+	constexpr float kLabelW = 56.0f;   // fixed gutter so both bars' left edges line up under each other
 	ImGui::AlignTextToFramePadding();
-	ImGui::TextUnformatted("arena");
-	ImGui::SameLine();
+	ImGui::TextUnformatted(label);
+	ImGui::SameLine(kLabelW);
 
 	const ImVec2 p0 = ImGui::GetCursorScreenPos();
 	float        w  = ImGui::GetContentRegionAvail().x;
@@ -2449,34 +2449,39 @@ static void rg_draw_arena(GraphAllocator& a)
 	const float  h  = ImGui::GetFrameHeight();
 	const ImVec2 p1(p0.x + w, p0.y + h);
 
-	ImGui::InvisibleButton("arena_bar", ImVec2(w, h));
+	ImGui::InvisibleButton(label, ImVec2(w, h));
 	const bool  hov = ImGui::IsItemHovered();
 	ImDrawList* dl  = ImGui::GetWindowDrawList();
 
 	dl->AddRectFilled(p0, p1, IM_COL32(28, 28, 28, 255), 3.0f);                       // track
-	dl->AddRectFilled(p0, ImVec2(p0.x + w * usedFrac, p1.y), kRGRead, 0.0f);          // used, from the left
-	if (scratchFrac > 0.0f)                                                            // scratch peak, from the right
-		dl->AddRectFilled(ImVec2(p1.x - w * scratchFrac, p0.y), p1, kRGWrite, 0.0f);
+	if (frac > 0.0f)
+		dl->AddRectFilled(p0, ImVec2(p0.x + w * frac, p1.y), color, 0.0f);            // fill
 	dl->AddRect(p0, p1, hov ? IM_COL32(255, 255, 255, 255) : IM_COL32(20, 20, 20, 180), 3.0f);
 
-	char ov[64];
-	std::snprintf(ov, sizeof ov, "%.1f / %.0f KB  (%.2f%%)", a.used / kib, a.capacity / kib, usedFrac * 100.0);
+	char ov[80];
+	std::snprintf(ov, sizeof ov, "%.1f / %.0f KB  x%llu blk", value / kib, cap / kib,
+		(unsigned long long)arena.blockCount);
 	const ImVec2 ts = ImGui::CalcTextSize(ov);
 	dl->AddText(ImVec2(p0.x + (w - ts.x) * 0.5f, p0.y + (h - ts.y) * 0.5f), IM_COL32(235, 235, 235, 255), ov);
 
 	if (hov) {
 		ImGui::BeginTooltip();
-		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGRead),  "front used   %llu B  (%.2f KB)",
-			(unsigned long long)a.used, a.used / kib);
-		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kRGWrite), "scratch peak %llu B  (%.2f KB)",
-			(unsigned long long)a.scratchHighWater, a.scratchHighWater / kib);
-		ImGui::Text("free         %llu B  (%.2f KB)",
-			(unsigned long long)(a.capacity - a.used), (a.capacity - a.used) / kib);
-		ImGui::Separator();
-		ImGui::Text("capacity     %.0f KB", a.capacity / kib);
-		ImGui::Text("worst case   %.2f%%  (used + scratch peak)", (usedFrac + scratchFrac) * 100.0);
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(color), "%s", label);
+		ImGui::Text("%-9s%llu B  (%.2f KB)", valueLabel, (unsigned long long)value, value / kib);
+		ImGui::Text("capacity %.2f KB  (grows)", cap / kib);
+		ImGui::Text("blocks   %llu  x %.0f KB", (unsigned long long)arena.blockCount, arena.blockSize / kib);
 		ImGui::EndTooltip();
 	}
+}
+
+// The per-frame GraphAllocator as two stacked usage bars -- it is two independent, growable, block-chained
+// arenas (not one buffer): `front` holds the frame's permanent objects (RenderGraph + storage, every
+// resource/pass node, the type-erased execute closures, copied strings); `scratch` holds compile()'s
+// temporaries, rewound per scope, so we show its per-frame high-water rather than the (empty) live value.
+static void rg_draw_arena(GraphAllocator& a)
+{
+	rg_draw_arena_bar("front",   "used", a.front.live_used(), a.front,   kRGRead);
+	rg_draw_arena_bar("scratch", "peak", a.scratch.peakUsage, a.scratch, kRGWrite);
 }
 
 // distinct line colors for the timing series, cycled by series index. kept opaque/bright so thin polylines
