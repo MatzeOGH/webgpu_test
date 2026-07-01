@@ -124,7 +124,8 @@ struct AppState {
     Camera camera;
     bool   dragging = false;
 
-    double      prevTime = 0.0;
+    double      startTime = 0.0;               // getTime() at first frame; env.time is relative to this so the
+    double      prevTime  = 0.0;                // cast to float below doesn't lose precision to a large clock epoch
     uint64_t    frame    = 0;
     std::string lastSig;                       // pass-name signature; reprint execution order on reshape
 
@@ -236,7 +237,7 @@ static void init_after_device(AppState& app)
     DemoEnv initEnv{ app.dev, app.q, kSwapFormat, app.cfg.width, app.cfg.height, 0.0f, 0.0f, 0, app.camera };
     for (const Demo& d : g_demos) d.init(initEnv);
 
-    app.prevTime = getTime();
+    app.startTime = app.prevTime = getTime();
 }
 
 // One frame: pump input, update the camera, declare + compile + execute + present the graph. Identical on
@@ -321,7 +322,7 @@ static void frame(AppState& app)
     auto swapchain = rg->importe_image("swapchain"_rid, view, { app.cfg.width, app.cfg.height, 1 });
 
     ++app.frame;   // counts frames that reach build (surface-stale skips don't); demos detect re-entry from gaps
-    DemoEnv env{ app.dev, app.q, kSwapFormat, app.cfg.width, app.cfg.height, (float)now, dt, app.frame, app.camera };
+    DemoEnv env{ app.dev, app.q, kSwapFormat, app.cfg.width, app.cfg.height, (float)(now - app.startTime), dt, app.frame, app.camera };
     g_demos[app.active].build(env, rg, swapchain);
 
     // ImGui overlay: last pass. Load keeps the rendered scene; the write to the imported swapchain

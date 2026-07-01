@@ -57,7 +57,7 @@ inline constexpr uint64_t fnv1a(const char* s) {
 }
 
 // `ResourceId` used for passes, textures and buffers
-// Careful! the string internals are not owned 
+// Careful! the string internals are not owned
 struct ResourceId
 {
     uint64_t value{};
@@ -65,7 +65,7 @@ struct ResourceId
 };
 
 // `ResourceId` literal
-constexpr ResourceId operator"" _rid(const char* s, size_t l)
+constexpr ResourceId operator""_rid(const char* s, size_t l)
 {
     return ResourceId(fnv1a(s), WGPUStringView{ .data = s, .length = l });
 }
@@ -73,8 +73,8 @@ constexpr ResourceId operator"" _rid(const char* s, size_t l)
 constexpr bool operator==(ResourceId a, ResourceId b)
 {
     return a.value == b.value &&
-        a.name.length == b.name.length && 
-        // slow 
+        a.name.length == b.name.length &&
+        // slow
         std::string_view(a.name.data, a.name.length) ==
         std::string_view(b.name.data, b.name.length);
 }
@@ -113,7 +113,7 @@ struct PassContext
     RenderGraph* graph{};
     PassNode* pass{};
 
-    // Returns a texture view for the given resource. 
+    // Returns a texture view for the given resource.
     WGPUTextureView view(ResourceHandle h) const;
     WGPUTexture texture(ResourceHandle h) const;
     WGPUBuffer buffer(ResourceHandle h) const;
@@ -272,7 +272,7 @@ GraphAllocator* create_allocator(size_t arenaSize = 1u << 20);
 void destroy_allocator(GraphAllocator* allocator);
 
 // Create render graph that is ready for recording.
-// Don't ever store the in instance of the `RenderGraph` 
+// Don't ever store the in instance of the `RenderGraph`
 // Calling this invalidates the old `RenderGraph`
 RenderGraph* create_render_graph(GraphAllocator* allocator);
 
