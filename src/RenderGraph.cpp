@@ -679,6 +679,10 @@ struct ScopedScratch
     ScopedScratch(const ScopedScratch&) = delete;
     ScopedScratch& operator=(const ScopedScratch&) = delete;
 
+    // Reclaim everything allocated since construction, keeping the scope open. For loops that need a fresh
+    // scratch slice each iteration without accumulating: call reset() at the top of the body and re-alloc.
+    void reset() { arena->rewind(mark); }
+
     template<typename T> T* alloc(size_t count = 1) { return arena->alloc<T>(count); }
     template<typename T, typename... Args> T* make(Args&&... args) { return arena->make<T>(std::forward<Args>(args)...); }
 };
@@ -1222,11 +1226,12 @@ enum struct HazardKind : uint8_t { RAW, WAW, WAR };
 // any writer of its resource simply binds to "no producer" (no edge). Detecting that authoring error
 // is left to compile()'s post-cull pass, which sees the final schedule; the sweep stays edge-only.
 template<typename OnEdge>
-static void sweep_resource_versions(GraphAllocator* alloc, PassNode* head, uint32_t next_resource_id, OnEdge&& onEdge)
+static void sweep_resource_versions(Arena& scratch, PassNode* head, uint32_t next_resource_id, OnEdge&& onEdge)
 {
     // per resource id (1..next_resource_id-1): the pass holding the current version, and the readers of that
-    // version not yet retired by a newer write.
-    ScopedScratch ss(alloc->scratch);
+    // version not yet retired by a newer write. scratch only -- the permanent DAG edges are built by the
+    // onEdge callback (compile() phase 1 routes them through add_dependency onto the front arena).
+    ScopedScratch ss(scratch);
     PassNode** currentProducer = ss.alloc<PassNode*>(next_resource_id);
     NodeAdjacency** pendingReaders  = ss.alloc<NodeAdjacency*>(next_resource_id);
 
@@ -1346,7 +1351,7 @@ void RenderGraph::compile(bool enableAlias)
     // three collapse to add_dependency; its dedup folds multiple hazards between one pass pair into
     // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
     // before any writer get no edge here; the post-cull pass below turns them into errors.
-    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_resource_id,
+    sweep_resource_versions(s.m_allocator->scratch, s.m_passes, s.next_resource_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
             add_dependency(s.m_allocator, dependent, dep);
         });
@@ -1650,7 +1655,7 @@ void debug_print_mermaid(RenderGraph* rg)
     }
 
     // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
-    sweep_resource_versions(s.m_allocator, s.m_passes, s.next_resource_id,
+    sweep_resource_versions(s.m_allocator->scratch, s.m_passes, s.next_resource_id,
         [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
             ResourceNode* r = find_node(rg, { id });
             WGPUStringView nm = r ? r->id.name : WGPUStringView{};
@@ -1864,7 +1869,7 @@ uint32_t PassContext::buffer_size(ResourceHandle h) const
     return r->bufferSize;
 }
 
-void release_resources(RenderGraph* rg);
+static void release_resources(RenderGraph* rg);   // internal helper; definition below is static too
 
 // create the GPU resources compile() worked out (size in `resolved`, usage in tex/bufUsage).
 // imported resources are caller-owned and skipped; a resource with no accumulated usage was

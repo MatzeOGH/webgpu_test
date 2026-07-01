@@ -215,10 +215,13 @@ static void msaa_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle swapc
 
     if (animate) animTime += env.dt;
 
-    ImVec2 m = ImGui::GetMousePos();
+    // GetMousePos is in logical points; the loupe shader works in framebuffer pixels (in.pos.xy), so scale
+    // by the DPI framebuffer scale -- otherwise under DPI scaling the loupe sits up-left of the cursor.
+    ImVec2 m  = ImGui::GetMousePos();
+    ImVec2 fb = ImGui::GetIO().DisplayFramebufferScale;
     MsaaUBO u{};
     u.resolution[0] = (float)env.width;  u.resolution[1] = (float)env.height;
-    u.mouse[0]      = m.x;               u.mouse[1]      = m.y;
+    u.mouse[0]      = m.x * fb.x;        u.mouse[1]      = m.y * fb.y;
     u.time          = animTime;
     u.aspect        = (float)env.width / (float)env.height;
     u.zoom          = zoom;

@@ -18,6 +18,19 @@ set(SHARED_SOURCES
     src/ClusteredMesh.cpp
 )
 
+# Dear ImGui (vendored): core + SDL3 platform + WebGPU(Dawn) renderer backends, each its own TU -- the
+# same set build_rg.bat compiles. The Dawn backend needs IMGUI_IMPL_WEBGPU_BACKEND_DAWN. Shared by the
+# native `rg` target and the Emscripten `rg` web target below.
+set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/src/extern/imgui)
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_wgpu.cpp
+)
+
 # ---------------------------------------------------------------------------
 # Emscripten (WebAssembly / WebGPU via emdawnwebgpu port)
 # ---------------------------------------------------------------------------
@@ -29,6 +42,21 @@ if(EMSCRIPTEN)
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_MakeAvailable(emdawnwebgpu)
+
+    # SDL3 for the RenderGraph web target (rg). There is NO bundled -sUSE_SDL=3 emscripten port -- SDL3
+    # must be built from source (its CMake compiles the emscripten backend into libSDL3.a). Fetch the
+    # source release (not the -devel-VC.zip the WIN32 branch uses) and build a static lib only.
+    set(SDL3_VER "3.4.4")
+    set(SDL_SHARED   OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC   ON  CACHE BOOL "" FORCE)
+    set(SDL_TEST     OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        sdl3
+        URL      https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VER}/SDL3-${SDL3_VER}.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(sdl3)
 
     set(APP_MAIN src/main_web.cpp)
 
@@ -117,23 +145,53 @@ if(EMSCRIPTEN)
         )
     endif()
 
+    # ---------------------------------------------------------------------------
+    # RenderGraph web target (rg) -> build-web/rendergraph/index.html
+    # Single compiled TU: RenderGraph.cpp #includes RenderGraph_main.cpp which #includes the 5 demo
+    # .cpp files (do NOT list them as sources -- that would double-compile them). SDL3 + ImGui keep the
+    # native driver's UX; only surface/device/loop differ, gated by #ifdef __EMSCRIPTEN__ in the driver.
+    # -sUSE_SDL=0 keeps emscripten's legacy SDL headers from shadowing our from-source <SDL3/...>.
+    # ---------------------------------------------------------------------------
+    add_executable(rg src/RenderGraph.cpp ${IMGUI_SOURCES})
+    target_compile_definitions(rg PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+    target_include_directories(rg PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
+    target_compile_options(rg PRIVATE "--use-port=${DAWN_PORT}" "-sUSE_SDL=0" "-Oz")
+    target_link_libraries(rg PRIVATE SDL3::SDL3-static)
+    target_link_options(rg PRIVATE
+        "--use-port=${DAWN_PORT}"
+        "-sUSE_SDL=0"
+        "-sASYNCIFY=0"
+        "-sALLOW_MEMORY_GROWTH=1"
+        "--shell-file=${CMAKE_SOURCE_DIR}/src/shell_rg.html"
+        "-Oz"
+    )
+    # emit straight to a rendergraph/ subdir named index.html so Pages serves it at /rendergraph.
+    set_target_properties(rg PROPERTIES
+        SUFFIX ".html"
+        OUTPUT_NAME "index"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/rendergraph")
+
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(rg PRIVATE "-flto")
+        target_link_options(rg PRIVATE
+            "--closure=1"
+            "-flto"
+            "-sWASM=2"
+            "-sENVIRONMENT=web"
+            "-sMALLOC=emmalloc"
+            "-sASSERTIONS=0"
+            "-sSAFE_HEAP=0"
+            "-sSTACK_OVERFLOW_CHECK=0"
+            "-sDEMANGLE_SUPPORT=0"
+            "-sGL_ASSERTIONS=0"
+        )
+    endif()
+
 elseif(WIN32)
     target_link_libraries(app PRIVATE dawn::webgpu_dawn SDL3::SDL3)
 
     add_executable(nanite_builder src/mainNaniteBuilder.cpp src/ClusteredMesh.cpp)
     target_link_libraries(nanite_builder PRIVATE dawn::webgpu_dawn)
-
-    # Dear ImGui (vendored): core + SDL3 platform + WebGPU(Dawn) renderer backends, each its own
-    # TU -- the same set build_rg.bat compiles. The Dawn backend needs IMGUI_IMPL_WEBGPU_BACKEND_DAWN.
-    set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/src/extern/imgui)
-    set(IMGUI_SOURCES
-        ${IMGUI_DIR}/imgui.cpp
-        ${IMGUI_DIR}/imgui_draw.cpp
-        ${IMGUI_DIR}/imgui_tables.cpp
-        ${IMGUI_DIR}/imgui_widgets.cpp
-        ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
-        ${IMGUI_DIR}/backends/imgui_impl_wgpu.cpp
-    )
 
     # RenderGraph standalone smoke test. RenderGraph_main.cpp is #included at the bottom of
     # RenderGraph.cpp, so that single TU is the whole driver; the ImGui TUs link alongside it

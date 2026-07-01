@@ -2,7 +2,7 @@ name: Build and Deploy to GitHub Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "render-graph"]
   workflow_dispatch:
 
 permissions:
@@ -41,8 +41,22 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 
+      # Only the RenderGraph web target (rg) -> build-web/rendergraph/index.html.
+      # The clustered renderer (app) is intentionally not built or deployed.
       - name: Build
-        run: cmake --build build-web --parallel
+        run: cmake --build build-web --target rg --parallel
+
+      # Site root redirects to /rendergraph/ (that's where the RenderGraph app lives).
+      - name: Root redirect to /rendergraph
+        run: |
+          cat > build-web/index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>RenderGraph</title>
+          <meta http-equiv="refresh" content="0; url=./rendergraph/">
+          <link rel="canonical" href="./rendergraph/">
+          <p>Redirecting to <a href="./rendergraph/">/rendergraph/</a>…</p>
+          EOF
 
       - name: Add .nojekyll
         run: touch build-web/.nojekyll
