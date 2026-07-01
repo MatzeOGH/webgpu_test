@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdarg>
 #include <chrono>
 #include "AlpUtils.h"
 
@@ -53,6 +54,15 @@ struct ResourceAccess
     // for a read, the level/layer the body samples (drives only the in-pass conflict check). 0 = mip 0/layer 0.
     uint32_t baseMip{};
     uint32_t baseLayer{};
+
+    // view shape for a sampled/storage read (from PassBuilder::ViewRange); ctx.view() resolves the exact
+    // view from these. attachments leave them at the single-subresource defaults (execute() ignores them:
+    // a render target is always one mip/one layer/one aspect). mipCount/layerCount 0 = "all remaining".
+    uint32_t                 mipCount{1};
+    uint32_t                 layerCount{1};
+    WGPUTextureViewDimension viewDim{WGPUTextureViewDimension_Undefined};   // Undefined = infer
+    WGPUTextureAspect        viewAspect{WGPUTextureAspect_All};
+    WGPUTextureFormat        viewFormat{WGPUTextureFormat_Undefined};       // Undefined = node format
 };
 
 // length of a (possibly WGPU_STRLEN-sentinel) string view, measured like copy_string.
@@ -79,6 +89,38 @@ static WGPUStringView group_prefix(WGPUStringView name)
     return WGPUStringView{};
 }
 
+// Small per-physical-texture cache of subresource views (mip / layer / cube / aspect slices). The default
+// full view already lives on the pool Entry and is reused across frames; this reuses the *sub*views too, so
+// a mip-chain / cube read builds each view once per pooled texture instead of once per pass per frame.
+// Keyed by the descriptor fields we set; released with its texture in the pool's destroy(), so a
+// recreated/evicted texture never hands back a stale view. Looked up by texture handle (find_subcache), so
+// the vector-realloc of the pools' Entry arrays never dangles a cached pointer.
+struct SubviewCache
+{
+    static constexpr uint32_t kMax = 16;   // distinct subviews of one physical texture (a mip chain is ~12)
+    struct Slot { WGPUTextureViewDescriptor d; WGPUTextureView view; };
+    Slot     e[kMax]{};
+    uint32_t n{};
+
+    static bool same(const WGPUTextureViewDescriptor& a, const WGPUTextureViewDescriptor& b) {
+        return a.format == b.format && a.dimension == b.dimension && a.aspect == b.aspect
+            && a.baseMipLevel == b.baseMipLevel && a.mipLevelCount == b.mipLevelCount
+            && a.baseArrayLayer == b.baseArrayLayer && a.arrayLayerCount == b.arrayLayerCount;
+    }
+    WGPUTextureView get_or_create(WGPUTexture tex, const WGPUTextureViewDescriptor& d) {
+        for (uint32_t i = 0; i < n; ++i) if (same(e[i].d, d)) return e[i].view;
+        assert(n < kMax && "SubviewCache full -- one texture needs more distinct subviews than kMax; bump it");
+        if (n >= kMax) release_all();   // unreachable at kMax=16; recover rather than overrun the array
+        WGPUTextureView v = wgpuTextureCreateView(tex, &d);
+        e[n++] = { d, v };
+        return v;
+    }
+    void release_all() {
+        for (uint32_t i = 0; i < n; ++i) if (e[i].view) wgpuTextureViewRelease(e[i].view);
+        n = 0;
+    }
+};
+
 // Owns GPU resources that must outlive the per-frame graph teardown -- temporal/history textures AND
 // buffers (accumulation, history feedback, GPU-authored particle state). One Entry per logical temporal
 // resource, keyed by name content (the
@@ -103,6 +145,7 @@ struct PersistentResourcePool
 
         WGPUTexture          tex[kLayers]  = {};
         WGPUTextureView      view[kLayers] = {};
+        SubviewCache         sub[kLayers]  = {};   // subresource views per physical texture; freed in destroy()
 
         // what the live textures were created with; a mismatch forces a recreate (resize/format/usage).
         bool                 created       = false;
@@ -226,6 +269,7 @@ struct PersistentResourcePool
     void destroy(Entry* e)
     {
         for (uint32_t i = 0; i < kLayers; ++i) {
+            e->sub[i].release_all();   // subresource views before their texture
             if (e->view[i]) { wgpuTextureViewRelease(e->view[i]); e->view[i] = nullptr; }
             if (e->tex[i])  { wgpuTextureRelease(e->tex[i]);      e->tex[i]  = nullptr; }
             if (e->buf[i])  { wgpuBufferRelease(e->buf[i]);       e->buf[i]  = nullptr; }
@@ -276,6 +320,7 @@ struct TransientResourcePool
         WGPUTextureUsage     usage  = {};
         WGPUTexture          tex    = {};
         WGPUTextureView      view   = {};
+        SubviewCache         sub    = {};   // subresource views of this texture; freed in destroy()
         // buffer arm (isBuffer == true)
         uint64_t             bufferSize = 0;
         WGPUBufferUsage      bufUsage   = {};
@@ -382,6 +427,7 @@ struct TransientResourcePool
 
     void destroy(Entry* e)
     {
+        e->sub.release_all();   // subresource views before their texture
         if (e->view) { wgpuTextureViewRelease(e->view); e->view = nullptr; }
         if (e->tex)  { wgpuTextureRelease(e->tex);      e->tex  = nullptr; }
         if (e->buf)  { wgpuBufferRelease(e->buf);       e->buf  = nullptr; }
@@ -726,8 +772,13 @@ struct ResourceNode
     // realized / registered GPU handles
     WGPUTexture      texture{};                       // created: the texture object backing `view`
     WGPUTextureView  view{};                         // imported: the registered swapchain view
+    // subresource-view cache of the pooled physical texture backing this node (persistent/temporal/plain
+    // transient). set in realize() via find_subcache; null for imported (caller owns the view). ctx.view()
+    // routes non-full views through it so they persist across frames instead of per-pass churn.
+    SubviewCache*    subviews{};
     WGPUBuffer       buffer{};                        // imported: the registered buffer
     WGPUExtent3D     resolved = WGPU_EXTENT_3D_INIT;  // imported: registered size (base for future Relative resolution)
+    bool             resolving{};                     // resolve_size(): on the relativeTo recursion stack -> re-entry is a cycle
     WGPUTextureUsage texUsage{};                      // accumulated in compile() from the access list
     WGPUBufferUsage  bufUsage{};                      // accumulated in compile() from the access list
 
@@ -773,6 +824,7 @@ struct PassNode
     NodeAdjacency* adjacency{};
 
     bool placed{}; // topo sort: already emitted into execution order
+    bool onStack{}; // topo sort: on the current DFS recursion stack -> a re-entry is a back-edge (cycle)
     bool sink{}; // mark a pass as a sink
     bool forceKeep{}; // force_keep(): extra cull root. Survives even with no reader and no imported/persistent write
 
@@ -815,9 +867,10 @@ struct PhysicalResource
 
 enum struct RenderGraphState
 {
-    Recording = 0,
-    Compiled,
-    Finished
+    Recording = 0,   // declaring passes/resources (mutable)
+    Compiled,        // compile() succeeded: read-only, ready to realize/execute
+    Failed,          // compile() hit an authoring error (see getErrors()): realize/execute no-op
+    Finished         // execute() ran; graph is spent for this frame
 };
 
 // RenderGraph carries no data members; its state lives here, bump-allocated immediately after the
@@ -839,8 +892,7 @@ struct RenderGraphStorage
     // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
     WGPUTextureView*         viewScratch{};
     uint32_t                viewScratchN{};
-    bool                    m_isValid{}; // if `m_isValid` is `false` execute becomes a noop. The client needs to check for error messages
-    ErrorMessage*           m_errors{}; // linked list of error messages
+    ErrorMessage*           m_errors{}; // linked list of error messages; non-null => m_state is Failed
 
     // CPU timing infos
     float timing_compile_us{};
@@ -853,10 +905,38 @@ static RenderGraphStorage* storage(RenderGraph* rg)
     return reinterpret_cast<RenderGraphStorage*>(reinterpret_cast<uint8_t*>(rg) + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
 }
 
-// TODO: append error message onto errors
-static void pushError()
+// appends newNode to the end of the intrusive list whose head is *head.
+// works for any node with a `next` pointer (ResourceNode, PassNode, ErrorMessage)
+template<typename T>
+static void list_append(T** head, T* newNode)
 {
+    if (*head == nullptr) {
+        *head = newNode;
+        return;
+    }
 
+    T* current = *head;
+    while (current->next) {
+        current = current->next;
+    }
+
+    current->next = newNode;
+}
+
+// arena-copy a formatted message, append it (tail = detection order), and poison the graph.
+// once poisoned, realize + execute become no-ops; the caller drains getErrors() to learn why.
+static void push_error(RenderGraphStorage& s, const char* fmt, ...)
+{
+    char buf[512];
+    va_list ap; va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    std::printf("[RenderGraph] error: %s\n", buf);   // keep the old console breadcrumb too
+    if (ErrorMessage* e = s.m_allocator->make<ErrorMessage>()) {
+        e->message = s.m_allocator->copy_string(WGPUStringView{ buf, std::strlen(buf) });
+        list_append(&s.m_errors, e);
+    }
+    s.m_state = RenderGraphState::Failed;   // only ever called from compile(); poisons the graph
 }
 
 // resolve a handle to its node.
@@ -869,9 +949,9 @@ static ResourceNode* find_node(RenderGraph* rg, ResourceHandle h)
     return nullptr;
 }
 
-GraphAllocator* create_allocator(size_t arenaSize){
+GraphAllocator* create_allocator(){
     GraphAllocator* allocator = new GraphAllocator;
-    allocator->front.blockSize   = arenaSize;                 // first/default front block; the chain grows past it
+    allocator->front.blockSize   = ARENA_DEFAULT_BLOCK_SIZE;                 // first/default front block; the chain grows past it
     allocator->scratch.blockSize = ARENA_DEFAULT_BLOCK_SIZE;  // compile()-local scratch
     allocator->front.reserve();                               // eagerly create the front head block
     return allocator;
@@ -897,25 +977,6 @@ RenderGraph* create_render_graph(GraphAllocator* allocator)
     assert(st == storage(rg) && "storage must sit immediately after the RenderGraph");
     st->m_allocator = allocator;
     return rg;
-}
-
-
-// appends newNode to the end of the intrusive list whose head is *head.
-// works for any node with a `next` pointer (ResourceNode, PassNode)
-template<typename T>
-static void list_append(T** head, T* newNode)
-{
-    if (*head == nullptr) {
-        *head = newNode;
-        return;
-    }
-
-    T* current = *head;
-    while (current->next) {
-        current = current->next;
-    }
-
-    current->next = newNode;
 }
 
 
@@ -1268,15 +1329,24 @@ static void add_dependency(GraphAllocator* alloc, PassNode* p, PassNode* dep)
 
 enum struct HazardKind : uint8_t { RAW, WAW, WAR };
 
-// One declaration-order sweep with implicit SSA resource versioning, shared by compile() phase 1
-// (turns each edge into add_dependency) and debug_print_mermaid() (prints it) so the dump can never
-// drift from the real graph. Each write to a resource starts a new "version" (the writing pass IS the
+// One declaration-order sweep with implicit SSA resource versioning, driving compile() phase 1
+// (each discovered edge becomes an add_dependency). Each write to a resource starts a new "version" (the writing pass IS the
 // version identity); each read binds to the current one. Calls onEdge(dependent, dep, id, kind) per
 // discovered hazard: RAW (read -> producer), WAW (write -> prev writer), WAR (write -> readers of
 // the version being clobbered); `dependent` is always later in the walk than `dep`. A read seen before
 // any writer of its resource simply binds to "no producer" (no edge). Detecting that authoring error
 // is left to compile()'s post-cull pass, which sees the final schedule; the sweep stays edge-only.
 template<typename OnEdge>
+// NOTE(Huerbe): versioning is per resource id -- one currentProducer/pendingReaders slot per resource, so a
+// write to ANY subresource supersedes the whole thing and disjoint mip/layer touches get a false RAW/WAW/WAR
+// edge (over-serializes, never wrong). To go subresource-precise, replace these one-slot arrays with a
+// per-resource interval map (subrange -> producer / pending readers): a write retires only overlapping
+// readers/producers, disjoint subregions keep independent live producers. Each access already carries the
+// (baseMip,mipCount,baseLayer,layerCount,aspect) range (ViewRange work), so onEdge/add_dependency/topo/
+// execute and the public API are untouched -- only the keying here changes. The later->earlier edge
+// invariant (acyclic by construction) still holds; the only new risk is interval-overlap correctness (test
+// against the bloom chain, which genuinely depends mip-to-mip and must stay serialized). Fold the in-pass
+// point->interval fix (in_pass_accesses_conflict) in at the same time.
 static void sweep_resource_versions(Arena& scratch, PassNode* head, uint32_t next_resource_id, OnEdge&& onEdge)
 {
     // per resource id (1..next_resource_id-1): the pass holding the current version, and the readers of that
@@ -1325,15 +1395,18 @@ static void sweep_resource_versions(Arena& scratch, PassNode* head, uint32_t nex
 // Why this and not Kahn's algorithm? Kahn is iterative BFS over in-degrees, seeded from sources,
 // and visits the whole graph. We seed this DFS from sinks instead (see compile() phase 2), so
 // recursion only reaches passes a sink transitively depends on -> dead-node removal falls out for
-// free, with no in-degree counters or worklist. The trade-off: Kahn detects cycles for free (it
-// emits < N nodes), this does not; we assume an author-acyclic graph and would need an `onstack`
-// flag to catch back-edges (also noted in phase 2).
-static void topo_visit(PassNode* p, PassNode** order, uint32_t& count)
+// free, with no in-degree counters or worklist. The trade-off vs Kahn (which detects cycles for
+// free by emitting < N nodes): we track `onStack` ourselves -- re-entering a pass already on the
+// current recursion stack is a back-edge, i.e. a cycle. Sets `hadCycle` instead of throwing; the
+// graph is acyclic by construction (phase 1 emits only backward edges), so this is a backstop.
+static void topo_visit(PassNode* p, PassNode** order, uint32_t& count, bool& hadCycle)
 {
+    if (p->onStack) { hadCycle = true; return; }   // back-edge: pass depends (transitively) on itself
     if (p->placed) return;
-    p->placed = true;
+    p->placed = p->onStack = true;
     for (NodeAdjacency* a = p->adjacency; a; a = a->next)
-        topo_visit(a->pass, order, count);
+        topo_visit(a->pass, order, count, hadCycle);
+    p->onStack = false;
     order[count++] = p;          // all deps already placed
 }
 
@@ -1358,8 +1431,13 @@ static WGPUExtent3D resolve_size(ResourceNode* r, ResourceNode** byId)
     assert(byId);
     if (r->resolved.width) return r->resolved;                       // imported, or already walked
     if (r->sizeKind == SizeKind::Absolute) return r->resolved = r->absolute;
+    // memoization happens only after the recursion below, so a relativeTo cycle would recurse forever;
+    // guard it here (author-acyclic assumption, same as topo_visit). break the cycle with a zero base.
+    if (r->resolving) { assert(false && "cyclic relativeTo chain"); return WGPUExtent3D{}; }
+    r->resolving = true;
     ResourceNode* base = byId[r->relativeToHandle.id];
     WGPUExtent3D b = base ? resolve_size(base, byId) : WGPUExtent3D{};
+    r->resolving = false;
     // scale only width/height; layer count (cube/array) is the node's own, not the base's.
     uint32_t layers = r->absolute.depthOrArrayLayers ? r->absolute.depthOrArrayLayers : 1;
     // round, don't truncate: at scale 0.5 an odd base dim (1281 -> 640.5) must land on 641, not 640 --
@@ -1373,31 +1451,34 @@ void RenderGraph::compile(bool enableAlias)
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording);
 
-    // phase 0: resolve initialize() passes. such a pass (re)bakes a persistent target and should run only
-    // while that target needs it: skip it this frame iff the pool entry exists, was realized on a prior frame
-    // (`created`), AND was baked with the same settings hash (`initHash`). a fresh/evicted target or a changed
-    // hash leaves skipInit false -> the pass runs. when it runs, execute() records the new hash into the entry.
-    // the baked result lives in the pool, so on skipped frames readers bind to it with no in-graph writer
-    // (legal: persistent is external). skipped passes are then dropped: phase 1's sweep and phase 2's sink
-    // seeding both ignore skipInit, so the pass produces no version (no reader depends on it) and is not a
-    // root -> unreachable -> culled.
+    // phase 0 — skip up-to-date bake passes. An initialize() pass rebakes a persistent target; skip it
+    // this frame only when the pool entry is realized (`created`), still holds baked content (`baked`,
+    // cleared on any recreate so a resized/blank target re-bakes), and was baked with this settings hash.
+    // A skipped pass produces no version and is not a cull root, so phases 1-2 drop it; readers still bind
+    // to the pooled result (persistent is external, no in-graph writer needed). execute() re-stamps the
+    // hash when the pass runs.
     for (PassNode* p = s.m_passes; p; p = p->next) {
         p->skipInit = false;
         if (!p->initTarget.id) continue;
-        for (ResourceNode* r = s.m_resouces; r; r = r->next)        // byId isn't built until phase 3 -> linear
+        for (ResourceNode* r = s.m_resouces; r; r = r->next)
             if (r->handle.id == p->initTarget.id) {
-                assert(r->persistent && "initialize() target must be persistent or temporal "
-                                        "(create_persistent_image/_buffer or create_temporal_image/_buffer)");
-                PersistentResourcePool::Entry* e = s.m_allocator->pool.find(r->id);
-                // skip only when the target is realized AND holds content baked with this exact hash.
-                // `baked` (cleared by destroy()) re-arms after any (re)create, so a recreated-blank texture
-                // is re-baked even for hash 0 -- closes the resize/descriptor-change stale-bake hole.
-                p->skipInit = (e && e->created && e->baked && e->initHash == p->initHash);
-                break;
+                if (!r->persistent)
+                {
+                    push_error(s, "initialize() target must be persistent or temporal (create_persistent_image/_buffer or create_temporal_image/_buffer)");
+                }
+                else
+                {
+                    PersistentResourcePool::Entry* e = s.m_allocator->pool.find(r->id);
+                    // skip only when the target is realized AND holds content baked with this exact hash.
+                    // `baked` (cleared by destroy()) re-arms after any (re)create, so a recreated-blank texture
+                    // is re-baked even for hash 0 -- closes the resize/descriptor-change stale-bake hole.
+                    p->skipInit = (e && e->created && e->baked && e->initHash == p->initHash);
+                    break;
+                }
             }
     }
 
-    // phase 1: build adjacency (pass dependency DAG, "depends-on" direction). The versioning sweep
+    // phase 1 — build the dependency DAG ("depends-on" direction). The versioning sweep
     // (see sweep_resource_versions) discovers every RAW/WAW/WAR hazard in declaration order; here all
     // three collapse to add_dependency; its dedup folds multiple hazards between one pass pair into
     // the single ordering edge phase 2 needs, so the resource id and hazard kind are ignored. Reads
@@ -1407,7 +1488,7 @@ void RenderGraph::compile(bool enableAlias)
             add_dependency(s.m_allocator, dependent, dep);
         });
 
-    // phase 2: dead-node removal + topo sort, fused into one DFS seeded from sinks.
+    // phase 2 — cull dead passes + topo sort, fused into one DFS seeded from sinks.
     {
         // sinks = passes writing an imported resource. accesses store only handle.id, so flatten
         // the imported flags into an id-indexed table first (same scratch_alloc-over-next_resource_id trick
@@ -1426,12 +1507,21 @@ void RenderGraph::compile(bool enableAlias)
 
         PassNode** order = ss.alloc<PassNode*>(N);
         uint32_t count = 0;
+        bool hadCycle = false;
         for (PassNode* p = s.m_passes; p; p = p->next)
             if (!p->skipInit && (is_sink(p, external) || p->forceKeep))   // satisfied initialize() pass is not a root; force_keep() keeps a reader-less side-effect pass alive
             {
                 p->sink = true;
-                topo_visit(p, order, count);          // only reaches passes that feed a sink
+                topo_visit(p, order, count, hadCycle);   // only reaches passes that feed a sink
             }
+
+        // acyclic by construction (phase 1 emits only backward edges), so a cycle means the graph
+        // was corrupted, not merely misauthored. poison and bail before realize()/execute() ever run.
+        if (hadCycle) {
+            push_error(s, "compile() found a cycle in the pass dependency graph -- the graph should be "
+                          "acyclic by construction, so this is an internal error, not an authoring one.");
+            return;
+        }
 
         // relink next-pointers to follow topo order; m_passes is now == execution order, and any
         // pass not reachable from a sink was never emitted -> dead, dropped here for free.
@@ -1441,16 +1531,13 @@ void RenderGraph::compile(bool enableAlias)
 
         // NOTE(Huerbe): transient array as DFS scratch; can't sort a one-field intrusive list in
         // place (a dep emitted before the driver reaches it clobbers its `next`, dropping
-        // disconnected nodes). recursive DFS, no cycle detection: graph is author-acyclic; add an
-        // `onstack` flag (+2 lines) only if a cyclic graph ever needs catching.
+        // disconnected nodes).
     }
 
-    // post-cull validation (development aid; e.g. release/NDEBUG,
-    // exactly like assert, so a shipping build pays none of this per-frame walk). Over the FINAL schedule
-    // (m_passes is now culled + in execution order), a read of a TRANSIENT resource that no earlier pass
-    // has produced is an authoring error: the reader would sample uninitialized contents (its writer was
-    // declared after it, or culled). walking the surviving passes makes this culling-correct and catches
-    // every surviving reader, not just the first.
+    // post-cull validation. Over the FINAL schedule (m_passes is now culled + in execution order), a read
+    // of a TRANSIENT resource that no earlier pass has produced is an authoring error: the reader would
+    // sample uninitialized contents (its writer was declared after it, or culled). Walking the surviving
+    // passes makes this culling-correct and catches every surviving reader, not just the first.
     //   imported + temporal/persistent resources  -> exempt (their value comes from outside this frame).
     //   resources with no writer at all (e.g. a host-uploaded uniform) -> exempt (hasWriter stays false).
     // bail before phase 3 so the caller never realize()/execute()s a misordered graph.
@@ -1480,8 +1567,8 @@ void RenderGraph::compile(bool enableAlias)
                     if (prevLayer[id]) {
                         ResourceNode* w = find_node(this, p->accesses[i].handle);
                         WGPUStringView wn = w ? w->id.name : WGPUStringView{};
-                        std::printf("[RenderGraph] error: pass \"%.*s\" writes temporal resource \"%.*s\" "
-                                    "layer %u -- only layer 0 (the .curr handle) is writable.\n",
+                        push_error(s, "pass \"%.*s\" writes temporal resource \"%.*s\" "
+                                    "layer %u -- only layer 0 (the .curr handle) is writable.",
                                     (int)p->id.name.length, p->id.name.data ? p->id.name.data : "",
                                     (int)wn.length, wn.data ? wn.data : "", w ? w->temporalIndex : 0u);
                         hadError = true;
@@ -1491,8 +1578,8 @@ void RenderGraph::compile(bool enableAlias)
                 if (id == 0 || external[id] || produced[id] || !hasWriter[id]) continue;
                 ResourceNode* r = find_node(this, p->accesses[i].handle);
                 WGPUStringView rn = r ? r->id.name : WGPUStringView{};
-                std::printf("[RenderGraph] error: pass \"%.*s\" reads resource \"%.*s\" before any pass "
-                            "writes it -- declare a writer of \"%.*s\" first.\n",
+                push_error(s, "pass \"%.*s\" reads resource \"%.*s\" before any pass "
+                            "writes it -- declare a writer of \"%.*s\" first.",
                             (int)p->id.name.length, p->id.name.data ? p->id.name.data : "",
                             (int)rn.length, rn.data ? rn.data : "",
                             (int)rn.length, rn.data ? rn.data : "");
@@ -1502,7 +1589,7 @@ void RenderGraph::compile(bool enableAlias)
     }
 
 
-    // phase 3: frame-independent CPU analysis -> accumulate WGPU usage + resolve concrete sizes.
+    // phase 3 — accumulate WGPU usage + resolve concrete sizes (frame-independent CPU analysis).
     // WebGPU requires the usage bit at create time; realize() then only does the device create calls.
     {
         // id->node table: O(1) handle resolution. front-arena (lives until the next create_render_graph
@@ -1566,12 +1653,11 @@ void RenderGraph::compile(bool enableAlias)
         // dead-resource culling. no separate resource liveness list needed.
     }
 
-    // phase 4: transient memory aliasing (opt-in). pack disjoint-lifetime, same-signature transients onto a
-    // shared physical object so peak VRAM tracks max simultaneous overlap, not the sum of all transients.
-    // CPU-only -> it belongs here next to phase 3, not realize(). the schedule is a single linear queue, so
-    // each transient's liveness is a closed [firstUse,lastUse] interval and greedy left-edge first-fit is
-    // optimal (same trick as linear-scan register allocation). off (enableAlias==false) -> no slots, every
-    // aliasSlot stays kNoSlot, and realize() takes the unchanged per-resource path.
+    // phase 4 — transient memory aliasing (opt-in). Pack disjoint-lifetime, same-signature transients onto
+    // a shared physical object so peak VRAM tracks max simultaneous overlap, not the sum of all transients.
+    // The schedule is a single linear queue, so each transient's liveness is a closed [firstUse,lastUse]
+    // interval and greedy left-edge first-fit is optimal (the linear-scan register-allocation trick).
+    // Off (enableAlias==false) -> no slots, every aliasSlot stays kNoSlot, realize() takes the plain path.
     if (enableAlias) {
         // eligible transients (see ResourceNode::aliasSlot): graph-owned + touched by a live pass; first
         // touch fully defines (no reading a previous occupant's bytes) and some pass writes it (don't stomp
@@ -1636,33 +1722,31 @@ void RenderGraph::compile(bool enableAlias)
             ph.freeFrom  = r->lastUse;
             r->aliasSlot = slot;
 
-            assert(ph.kind == r->kind && (isBuf
+            const bool sigOk = ph.kind == r->kind && (isBuf
                    ? ph.bufferSize == r->bufferSize
                    : (ph.dimension == r->dimension && ph.format == r->format
-                      && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height))
-                   && "alias slot signature mismatch");
+                      && ph.size.width == r->resolved.width && ph.size.height == r->resolved.height));
+            if (!sigOk) {
+                WGPUStringView rn = r->id.name;
+                push_error(s, "alias slot %u signature mismatch for resource \"%.*s\" -- "
+                            "left-edge packing put mismatched signatures on one physical slot.",
+                            slot, (int)rn.length, rn.data ? rn.data : "");
+                assert(false && "alias slot signature mismatch");
+            }
         }
     }
-
-    s.m_state = RenderGraphState::Compiled; // signal that the render graph is in read only mode ready for rendering
 
     auto t1 = std::chrono::steady_clock::now();
     s.timing_compile_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
 
-    // TODO: trap when error
-    s.m_isValid = true;
+    // Compiled unless the graph was poisoned. Ordering/cycle errors already set Failed and returned early;
+    // a phase-4 alias mismatch is the one error that falls through to here (m_errors set), so re-derive the
+    // state from m_errors rather than assuming success.
+    s.m_state = (s.m_errors == nullptr) ? RenderGraphState::Compiled : RenderGraphState::Failed;
 }
 
-// debug-only: position of `target` in the pass list = its Mermaid node id. O(n) per call.
-static uint32_t pass_index(PassNode* head, PassNode* target)
-{
-    uint32_t i = 0;
-    for (PassNode* p = head; p; p = p->next, ++i)
-        if (p == target) return i;
-    return 0;
-}
-
-// debug-only: name of the pass at execution-order position idx (empty past the end). O(n) per call.
+// name of the pass at execution-order position idx (empty past the end). O(n) per call. used by the
+// ImGui lifetime widget (imgui_layer.h) to label a resource's first/last pass.
 static WGPUStringView pass_name_at(PassNode* head, uint32_t idx)
 {
     for (PassNode* p = head; p; p = p->next) {
@@ -1672,58 +1756,9 @@ static WGPUStringView pass_name_at(PassNode* head, uint32_t idx)
     return WGPUStringView{};
 }
 
-// dump the graph as a Mermaid flowchart on stdout. passes are nodes; an edge dep -->|res| Q means Q
-// depends on dep via resource res (data/order flow points dep -> Q). edges come from the SAME
-// versioning sweep compile() uses, so the dump matches the real graph: RAW (unlabelled), plus WAW
-// and WAR tagged in the edge label, rather than an approximation. safe before or after compile():
-// the topo sort preserves the relative order of any two passes touching the same resource, so the
-// rediscovered edges are unchanged. resources with a single touch (imported inputs, unread sinks)
-// produce no pass->pass edge and don't appear.
-void debug_print_mermaid(RenderGraph* rg)
-{
-    RenderGraphStorage& s = *storage(rg);
-    std::printf("flowchart LR\n");
-
-    // node decl: stable id Pi -> pass name, indexed by list position.
-    uint32_t idx = 0;
-    for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
-        std::printf("  P%u[\"%.*s\"]\n", idx, (int)p->id.name.length, p->id.name.data ? p->id.name.data : "");
-
-    // bracket each contiguous run of same-prefix passes (shadow.cascade, bloom.*) in a subgraph -- the
-    // mermaid analogue of the DAG's group frames and the encoder debug groups. node ids resolve wherever
-    // declared, so nodes -> subgraphs -> edges renders correctly.
-    uint32_t gi = 0;
-    for (PassNode* a = s.m_passes; a; ) {
-        WGPUStringView pre = group_prefix(a->id.name);
-        PassNode* b = a->next; uint32_t gj = gi + 1;
-        while (b && sv_length(pre) && sv_eq(group_prefix(b->id.name), pre)) { b = b->next; ++gj; }
-        if (sv_length(pre) && gj - gi >= 2) {
-            std::printf("  subgraph \"%.*s\"\n", (int)sv_length(pre), pre.data);
-            for (uint32_t k = gi; k < gj; ++k) std::printf("    P%u\n", k);
-            std::printf("  end\n");
-        }
-        a = b; gi = gj;
-    }
-
-    // one edge per discovered hazard, labelled with the resource name and (for WAW/WAR) the kind.
-    sweep_resource_versions(s.m_allocator->scratch, s.m_passes, s.next_resource_id,
-        [&](PassNode* dependent, PassNode* dep, uint32_t id, HazardKind kind) {
-            ResourceNode* r = find_node(rg, { id });
-            WGPUStringView nm = r ? r->id.name : WGPUStringView{};
-            const char* tag = kind == HazardKind::WAW ? " (WAW)" : kind == HazardKind::WAR ? " (WAR)" : "";
-            std::printf("  P%u -->|\"%.*s%s\"| P%u\n",
-                        pass_index(s.m_passes, dep), (int)nm.length, nm.data ? nm.data : "", tag,
-                        pass_index(s.m_passes, dependent));
-        });
-
-    std::fflush(stdout);
-    // NOTE(Huerbe): pass_index is O(n) so the edge loop is O(n*edges); fine for a debug dump of a
-    // handful of passes. names assumed pipe/quote-free (they're identifiers) -> no escaping.
-}
-
-// rough bytes-per-texel for the formats this project creates -- used only by the aliasing memory report
-// (peak-allocation accounting), never for allocation. no block-compressed formats here, so a linear
-// width*height*layers*texel estimate is exact enough; unknown formats fall back to 4.
+// rough bytes-per-texel for the formats this project creates -- used only by the ImGui memory widgets
+// (peak-allocation accounting, imgui_layer.h), never for allocation. no block-compressed formats here,
+// so a linear width*height*layers*texel estimate is exact enough; unknown formats fall back to 4.
 static uint32_t texel_bytes(WGPUTextureFormat f)
 {
     switch (f) {
@@ -1744,92 +1779,80 @@ static uint64_t texture_bytes(WGPUExtent3D size, WGPUTextureFormat format)
     return (uint64_t)size.width * size.height * layers * texel_bytes(format);
 }
 
-// dump resource lifetimes as a Mermaid Gantt on stdout. the timeline runs over passes in execution
-// order: a "passes" row names each slot (one bar per pass), and below it each transient resource is a
-// bar from its first to its last pass. overlapping bars can't share memory; gaps between them are
-// aliasing candidates. imported resources are excluded (the graph doesn't own them); a transient no
-// surviving pass touched is reported dead and gets no bar. reads firstUse/lastUse, so call after compile().
-void debug_print_lifetimes(RenderGraph* rg)
+// layer count of a texture node (2D array depth; 1 for 1D/3D -- a 3D volume's depthOrArrayLayers is depth,
+// addressed by the view as a single 3D layer, not an array).
+static uint32_t node_layers(const ResourceNode* r)
 {
-    RenderGraphStorage& s = *storage(rg);
+    return (r->dimension == WGPUTextureDimension_2D)
+         ? (r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1) : 1;
+}
 
-    // text summary first: the chart below has no bar for a dead resource, so name them here. spans are
-    // named by the passes that bound them, not by index.
-    std::printf("resource lifetimes (by pass):\n");
-    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-        if (r->is_external()) continue;   // imported + pool-backed: no per-frame lifetime span
-        if (r->firstUse == ResourceNode::kNoPass) {
-            std::printf("  %.*s  unused (dead)\n", (int)r->id.name.length, r->id.name.data ? r->id.name.data : "");
-            continue;
-        }
-        WGPUStringView f = pass_name_at(s.m_passes, r->firstUse);
-        if (r->firstUse == r->lastUse)
-            std::printf("  %.*s  alive in %.*s\n",
-                        (int)r->id.name.length, r->id.name.data ? r->id.name.data : "",
-                        (int)f.length, f.data ? f.data : "");
-        else {
-            WGPUStringView l = pass_name_at(s.m_passes, r->lastUse);
-            std::printf("  %.*s  alive %.*s..%.*s\n",
-                        (int)r->id.name.length, r->id.name.data ? r->id.name.data : "",
-                        (int)f.length, f.data ? f.data : "",
-                        (int)l.length, l.data ? l.data : "");
-        }
+// the subresource-view cache owning a pooled physical texture (a persistent ping-pong slot, or a transient
+// / aliased object). looked up by handle so the pools' Entry-vector reallocs never dangle a stored pointer;
+// null for a texture the pools don't own (imported). O(entries), called once per texture node in realize().
+static SubviewCache* find_subcache(GraphAllocator* a, WGPUTexture tex)
+{
+    if (!tex) return nullptr;
+    for (TransientResourcePool::Entry& e : a->transient.entries)
+        if (!e.isBuffer && e.tex == tex) return &e.sub;
+    for (PersistentResourcePool::Entry& e : a->pool.entries)
+        for (uint32_t i = 0; i < PersistentResourcePool::kLayers; ++i)
+            if (e.tex[i] == tex) return &e.sub[i];
+    return nullptr;
+}
+
+// the view descriptor one access wants on node r: the declared ViewRange (dimension/counts/aspect/format)
+// with a 0 count meaning "all remaining from base" and an Undefined dimension inferred (3D volume -> 3D,
+// multi-layer -> 2DArray, else 2D). Cube/CubeArray must be declared explicitly (a texture is created as a
+// 2D array; cube-ness is a view property the graph can't infer).
+static WGPUTextureViewDescriptor view_desc_for(const ResourceNode* r, const ResourceAccess& a)
+{
+    uint32_t layers     = node_layers(r);
+    uint32_t mipCount   = a.mipCount   ? a.mipCount   : (r->mipLevelCount - a.baseMip);
+    uint32_t layerCount = a.layerCount ? a.layerCount : (layers - a.baseLayer);
+    WGPUTextureViewDimension dim = a.viewDim;
+    if (dim == WGPUTextureViewDimension_Undefined)
+        dim = (r->dimension == WGPUTextureDimension_3D) ? WGPUTextureViewDimension_3D
+            : (layerCount > 1)                          ? WGPUTextureViewDimension_2DArray
+            :                                             WGPUTextureViewDimension_2D;
+    return WGPUTextureViewDescriptor{
+        .format          = a.viewFormat ? a.viewFormat : r->format,
+        .dimension       = dim,
+        .baseMipLevel    = a.baseMip,   .mipLevelCount   = mipCount,
+        .baseArrayLayer  = a.baseLayer, .arrayLayerCount = layerCount,
+        .aspect          = a.viewAspect,
+    };
+}
+
+// does `d` equal the texture's default full view (what wgpuTextureCreateView(tex, nullptr) yields)? then the
+// node's cached r->view is it -- no build, no pooled subview. covers today's whole-2D / whole-3D / full-array
+// reads (e.g. a CSM sampled as its full 2d-array is just the default view).
+static bool is_full_view(const ResourceNode* r, const WGPUTextureViewDescriptor& d)
+{
+    uint32_t layers = node_layers(r);
+    WGPUTextureViewDimension full = (r->dimension == WGPUTextureDimension_1D) ? WGPUTextureViewDimension_1D
+                                  : (r->dimension == WGPUTextureDimension_3D) ? WGPUTextureViewDimension_3D
+                                  : (layers > 1)                              ? WGPUTextureViewDimension_2DArray
+                                  :                                             WGPUTextureViewDimension_2D;
+    return d.baseMipLevel == 0 && d.mipLevelCount == r->mipLevelCount
+        && d.baseArrayLayer == 0 && d.arrayLayerCount == layers
+        && d.aspect == WGPUTextureAspect_All && d.format == r->format && d.dimension == full;
+}
+
+// resolve the view for `desc` on node r. full view -> cached r->view. otherwise the pooled subview cache,
+// which persists across frames with its physical texture (built once, not per pass per frame). imported /
+// uncached fall back to a per-pass scratch view (freed after the pass). shared by ctx.view() + attach_view.
+static WGPUTextureView resolve_view(RenderGraphStorage& s, ResourceNode* r, const WGPUTextureViewDescriptor& desc)
+{
+    if (!r->texture) {   // imported: the caller-owned view spans the whole resource; a subresource pick is ignored
+        assert(desc.baseMipLevel == 0 && desc.baseArrayLayer == 0 &&
+               "subresource selection on an imported texture is ignored (caller owns the view)");
+        return r->view;
     }
-
-    // mermaid gantt is time-based, so map pass index i to a one-second slot (dateFormat x reads bar
-    // values as unix ms -> i*1000). the "passes" section drops a named one-second bar in each slot so
-    // the timeline reads as pass names rather than bare seconds; each resource bar then spans from its
-    // first pass to its last (+1 so a single-pass resource still fills its slot).
-    std::printf("gantt\n");
-    std::printf("  title RenderGraph resource lifetimes (timeline = passes in execution order)\n");
-    std::printf("  dateFormat x\n");
-    std::printf("  axisFormat %%S\n");
-
-    std::printf("  section passes\n");
-    uint32_t idx = 0;
-    for (PassNode* p = s.m_passes; p; p = p->next, ++idx)
-        std::printf("    %.*s :%u, %u\n",
-                    (int)p->id.name.length, p->id.name.data ? p->id.name.data : "", idx * 1000, (idx + 1) * 1000);
-
-    std::printf("  section transient\n");
-    for (ResourceNode* r = s.m_resouces; r; r = r->next) {
-        if (r->imported || r->firstUse == ResourceNode::kNoPass) continue;
-        WGPUStringView f = pass_name_at(s.m_passes, r->firstUse);
-        WGPUStringView l = pass_name_at(s.m_passes, r->lastUse);
-        std::printf("    %.*s (%.*s..%.*s) :%u, %u\n",
-                    (int)r->id.name.length, r->id.name.data ? r->id.name.data : "",
-                    (int)f.length, f.data ? f.data : "",
-                    (int)l.length, l.data ? l.data : "",
-                    r->firstUse * 1000, (r->lastUse + 1) * 1000);
-    }
-
-    // physical slots (only present when compile() ran phase 4 with aliasing on): each slot is one GPU
-    // object shared by the transients listed under it. the totals are the peak-allocation win.
-    if (s.m_slotCount) {
-        uint32_t  logical = 0;
-        uint64_t  logicalBytes = 0, physicalBytes = 0;
-        std::printf("physical slots (aliasing):\n");
-        for (uint32_t i = 0; i < s.m_slotCount; ++i) {
-            PhysicalResource& ph = s.m_slots[i];
-            uint64_t slotBytes = texture_bytes(ph.size, ph.format);
-            physicalBytes += slotBytes;
-            std::printf("  slot %u  %ux%u:", i, ph.size.width, ph.size.height);
-            for (ResourceNode* r = s.m_resouces; r; r = r->next)
-                if (r->aliasSlot == i) {
-                    ++logical; logicalBytes += slotBytes;   // a member shares the slot's signature -> same bytes
-                    std::printf(" %.*s", (int)r->id.name.length, r->id.name.data ? r->id.name.data : "");
-                }
-            std::printf("\n");
-        }
-        std::printf("  %u logical transients -> %u physical objects; aliased VRAM %llu -> %llu KB (saved %llu KB)\n",
-                    logical, s.m_slotCount, (unsigned long long)(logicalBytes / 1024),
-                    (unsigned long long)(physicalBytes / 1024),
-                    (unsigned long long)((logicalBytes - physicalBytes) / 1024));
-    }
-
-    std::fflush(stdout);
-    // NOTE(Huerbe): %S labels the axis 00..59, so it wraps past 60 passes; fine for the handful here. bump
-    // the axisFormat if a graph ever exceeds that. names assumed colon/pipe-free -> no escaping.
+    if (is_full_view(r, desc)) return r->view;
+    if (r->subviews) return r->subviews->get_or_create(r->texture, desc);
+    assert(s.viewScratchN < PassNode::kMaxAccess);
+    return s.viewScratch[s.viewScratchN++] = wgpuTextureCreateView(r->texture, &desc);
 }
 
 WGPUTextureView PassContext::view(ResourceHandle h) const
@@ -1842,37 +1865,28 @@ WGPUTextureView PassContext::view(ResourceHandle h) const
     if (!r) { return {}; }   // unknown / default handle: loud, bind nothing
     if (!r->texture) return r->view;     // imported: the caller-registered view (e.g. swapchain)
 
-    // a single-mip 2D texture's full view IS its only subresource, and a 3D volume is sampled whole, so the
-    // view already on the node is the right one; hand it back (no per-call churn, and a 3D volume must not
-    // be sliced to one 2D layer). only a mip chain / 2D array needs a per-subresource view.
-    uint32_t layers = (r->dimension == WGPUTextureDimension_2D)
-                    ? (r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1) : 1;
-    if (r->mipLevelCount <= 1 && layers <= 1)
-        return r->view;
-
-    // mip chain / array: hand back the (baseMip, baseLayer) 2D slice the body's READ access declared, pooled
-    // with the attachment views for release after the pass (exactly like attach_view in execute()).
-    // NOTE(Huerbe): a 3D mip chain would fall through and get a 2D view; none exist; revisit if one does.
-    const ResourceAccess* rd = nullptr;
+    // the view shape is inferred from this pass's access on the handle (baseMip/layer + declared ViewRange).
+    // prefer the READ access -- ctx.view() binds a texture to sample/read, and a pass may legitimately read
+    // one subresource while writing another (bloom.down samples mip i, renders mip i+1). fall back to a write
+    // for a write-only binding (a storage_write target bound via ctx.view). two differing reads are ambiguous.
+    const ResourceAccess* rd = nullptr;   // read access (drives the sampled/storage-read view)
+    const ResourceAccess* wr = nullptr;   // write fallback (storage_write target, no read in this pass)
     for (uint32_t i = 0; i < pass->accessCount; ++i) {
         const ResourceAccess& a = pass->accesses[i];
-        if (a.handle.id == h.id && !access_is_write(a.type)) {
+        if (a.handle.id != h.id) continue;
+        if (!access_is_write(a.type)) {
             assert(!rd && "ctx.view: two reads of one handle in a pass; ambiguous subresource; use ctx.texture");
             rd = &a;
+        } else {
+            wr = &a;   // last write wins; the StorageRead+StorageWrite RMW pair's write matches its read anyway
         }
     }
-    if (!rd) return r->view;   // viewed but not declared as a read in this pass -> the full view
+    const ResourceAccess* acc = rd ? rd : wr;
+    if (!acc) return r->view;   // viewed but not declared as an access in this pass -> the full view
     RenderGraphStorage& s = *storage(graph);
-    assert(rd->baseMip < r->mipLevelCount && "ctx.view: baseMip past the texture's mip count");
-    assert(rd->baseLayer < layers && "ctx.view: baseLayer past the texture's layer count");
-    WGPUTextureViewDescriptor vd{
-        .format          = r->format,
-        .dimension       = WGPUTextureViewDimension_2D,
-        .baseMipLevel    = rd->baseMip,   .mipLevelCount   = 1,
-        .baseArrayLayer  = rd->baseLayer, .arrayLayerCount = 1,
-    };
-    assert(s.viewScratchN < PassNode::kMaxAccess);
-    return s.viewScratch[s.viewScratchN++] = wgpuTextureCreateView(r->texture, &vd);
+    assert(acc->baseMip < r->mipLevelCount && "ctx.view: baseMip past the texture's mip count");
+    assert(acc->baseLayer < node_layers(r) && "ctx.view: baseLayer past the texture's layer count");
+    return resolve_view(s, r, view_desc_for(r, *acc));
 }
 
 WGPUTexture PassContext::texture(ResourceHandle h) const
@@ -1929,6 +1943,7 @@ static void realize_graph(RenderGraph* rg, WGPUDevice device)
 {
     auto t0 = std::chrono::steady_clock::now();
     RenderGraphStorage& s = *storage(rg);
+    if (s.m_state == RenderGraphState::Failed) return;   // poisoned graph: no-op (execute() also guards, this is defensive)
     assert(s.m_state == RenderGraphState::Compiled);
 
     // temporal/persistent resources: back each layer with a rotating pool texture instead of a per-frame
@@ -1998,6 +2013,13 @@ static void realize_graph(RenderGraph* rg, WGPUDevice device)
         transient.acquire(device, r->bufferSize, r->bufUsage, r->buffer);
     }
 
+    // point each texture node at the subview cache of its now-realized physical texture, so ctx.view() reuses
+    // subresource views across frames. done after every acquire (the pools' Entry vectors are stable from
+    // here to execute()); by handle, so a pool vector-realloc during the acquires above never dangles it.
+    for (ResourceNode* r = s.m_resouces; r; r = r->next)
+        if (r->kind == ResourceNode::Kind::Texture && r->texture)
+            r->subviews = find_subcache(s.m_allocator, r->texture);
+
     auto t1 = std::chrono::steady_clock::now();
     s.timing_realize_us = std::chrono::duration<float, std::micro>(t1 - t0).count();
 }
@@ -2010,8 +2032,8 @@ static void realize_graph(RenderGraph* rg, WGPUDevice device)
 void RenderGraph::execute(WGPUDevice device, WGPUCommandEncoder encoder, WGPUQueue queue, bool enableProfiling)
 {
     RenderGraphStorage& s = *storage(this);
-    if (s.m_isValid == false)
-            return; // iff errors noop
+    if (s.m_state == RenderGraphState::Failed)
+            return; // poisoned graph: no-op, caller drains getErrors()
 
     ScopedScratch scratch(s.m_allocator->scratch);
     s.viewScratch = scratch.alloc<WGPUTextureView>(PassNode::kMaxAccess);
@@ -2092,32 +2114,15 @@ void RenderGraph::execute(WGPUDevice device, WGPUCommandEncoder encoder, WGPUQue
             WGPURenderPassDepthStencilAttachment depth{};
             bool hasDepth = false;
 
-            // an attachment view is exactly one subresource. a graph-created texture may be a mip chain or
-            // array (its default full view spans many subresources -> illegal here), so build the single
-            // (baseMip, baseLayer) slice the access named and release it after the pass. imported textures
-            // (r->texture null, e.g. swapchain) keep their caller-owned registered view.
-            // NOTE(Huerbe): rebuilt per pass per frame; cache on the node keyed by subresource if it ever shows
-            // up in a profile.
-            // built views land in the shared per-pass scratch (s.viewScratch, drained after the body) so the
-            // body's own ctx.view() reads pool with these attachments. one view per access -> the per-pass
-            // access ceiling bounds it; the assert guards an overrun that construction already prevents.
+            // an attachment view is exactly one subresource (one mip, one layer): a render target can't span
+            // a mip chain or array. an attachment access carries no ViewRange, so view_desc_for yields the
+            // single (baseMip, baseLayer) 2D slice; resolve_view returns the node's full view when that IS the
+            // whole texture, else the pooled subview cache (reused across frames), else a per-pass scratch
+            // view. imported textures (r->texture null, e.g. swapchain) keep their caller-owned registered view.
             auto attach_view = [&](ResourceNode* r, const ResourceAccess& a) -> WGPUTextureView {
-                if (!r->texture) {   // imported: the caller-owned view spans the whole resource; a subresource pick is ignored
-                    assert(a.baseMip == 0 && a.baseLayer == 0 &&
-                           "subresource (baseMip/baseLayer) selection on an imported attachment is ignored");
-                    return r->view;
-                }
-                uint32_t layers = r->resolved.depthOrArrayLayers ? r->resolved.depthOrArrayLayers : 1;
                 assert(a.baseMip < r->mipLevelCount && "attachment baseMip past the texture's mip count");
-                assert(a.baseLayer < layers && "attachment baseLayer past the texture's layer count");
-                WGPUTextureViewDescriptor vd{
-                    .format          = r->format,
-                    .dimension       = WGPUTextureViewDimension_2D,
-                    .baseMipLevel    = a.baseMip,   .mipLevelCount   = 1,
-                    .baseArrayLayer  = a.baseLayer, .arrayLayerCount = 1,
-                };
-                assert(s.viewScratchN < PassNode::kMaxAccess);
-                return s.viewScratch[s.viewScratchN++] = wgpuTextureCreateView(r->texture, &vd);
+                assert((!r->texture || a.baseLayer < node_layers(r)) && "attachment baseLayer past the texture's layer count");
+                return resolve_view(s, r, view_desc_for(r, a));
             };
 
             for (uint32_t i = 0; i < p->accessCount; ++i) {
@@ -2237,7 +2242,6 @@ void RenderGraph::collect_gpu_timings()
 
 ErrorMessage* RenderGraph::getErrors()
 {
-    // TODO: implement ErrorMessages
     return storage(this)->m_errors;
 }
 
@@ -2269,7 +2273,7 @@ static void release_resources(RenderGraph* rg)
 static void use(PassNode* pass, ResourceHandle handle, AccessType type,
     WGPULoadOp load = WGPULoadOp_Undefined, WGPUStoreOp store = WGPUStoreOp_Undefined,
     WGPUColor clear = {}, float clearDepth = {},
-    uint32_t baseMip = 0, uint32_t baseLayer = 0,
+    uint32_t baseMip = 0, uint32_t baseLayer = 0, ViewRange range = {},
     WGPULoadOp stencilLoad = WGPULoadOp_Undefined, WGPUStoreOp stencilStore = WGPUStoreOp_Undefined,
     uint32_t stencilClear = 0)
 {
@@ -2301,7 +2305,8 @@ static void use(PassNode* pass, ResourceHandle handle, AccessType type,
 
     if (pass->accessCount < PassNode::kMaxAccess) {
         pass->accesses[pass->accessCount++] =
-            { handle, type, load, store, clear, clearDepth, stencilLoad, stencilStore, stencilClear, baseMip, baseLayer };
+            { handle, type, load, store, clear, clearDepth, stencilLoad, stencilStore, stencilClear, baseMip, baseLayer,
+              range.mipCount, range.layerCount, range.dim, range.aspect, range.format };
     } else {
         // hard structural cap hit (PassNode::kMaxAccess). dropping the access silently mis-renders (a missing
         // attachment/binding), so be loud right here, at the offending b.*() call.
@@ -2353,7 +2358,7 @@ void PassBuilder::resolve(ResourceHandle handle, uint32_t baseMip, uint32_t base
 void PassBuilder::depth_stencil(ResourceHandle handle, WGPULoadOp load, WGPUStoreOp store, float clearDepth, uint32_t baseMip, uint32_t baseLayer, WGPULoadOp stencilLoad, WGPUStoreOp stencilStore, uint32_t stencilClear)
 {
     assert(handle.id != 0);
-    use(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, stencilLoad, stencilStore, stencilClear);
+    use(m_new_pass, handle, AccessType::DepthStencilAttachment, load, store, {}, clearDepth, baseMip, baseLayer, {}, stencilLoad, stencilStore, stencilClear);
 }
 
 void PassBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
@@ -2363,34 +2368,34 @@ void PassBuilder::depth_stencil_read_only(ResourceHandle handle, uint32_t baseMi
     use(m_new_pass, handle, AccessType::DepthStencilReadOnly, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
 }
 
-void PassBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::sampled(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer, ViewRange range)
 {
     assert(handle.id != 0);
     assert(handle.kind == ResourceKind::Texture);
-    use(m_new_pass, handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::Sampled, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer, range);
 }
 
-void PassBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::storage_read(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer, ViewRange range)
 {
     assert(handle.id != 0);
-    use(m_new_pass, handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::StorageRead, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer, range);
 }
 
-void PassBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::storage_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer, ViewRange range)
 {
     assert(handle.id != 0);
-    use(m_new_pass, handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer);
+    use(m_new_pass, handle, AccessType::StorageWrite, WGPULoadOp_Undefined, WGPUStoreOp_Undefined, {}, {}, baseMip, baseLayer, range);
 }
 
 // in-place read-modify-write: the API mirror of WGSL `var<storage, read_write>`. records the
 // StorageRead+StorageWrite pair on one handle; in_pass_accesses_conflict whitelists exactly this
 // pairing, and the sweep's self-guards (no WAR/WAW/RAW edge from a pass to itself) keep it acyclic.
 // one logical binding, two recorded accesses.
-void PassBuilder::storage_read_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer)
+void PassBuilder::storage_read_write(ResourceHandle handle, uint32_t baseMip, uint32_t baseLayer, ViewRange range)
 {
     assert(handle.id != 0);
-    storage_read(handle, baseMip, baseLayer);
-    storage_write(handle, baseMip, baseLayer);
+    storage_read(handle, baseMip, baseLayer, range);
+    storage_write(handle, baseMip, baseLayer, range);
 }
 
 void PassBuilder::uniform(ResourceHandle handle)

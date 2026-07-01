@@ -725,18 +725,12 @@ static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHa
             b.sampled(g.normal);
             b.sampled(g.rough);
             b.sampled(g.depth);
-            b.sampled(csm);
+            // all kNumCascades layers as one texture_depth_2d_array; ctx.view(csm) now hands back exactly this.
+            b.sampled(csm, 0, 0, { .dim = WGPUTextureViewDimension_2DArray, .layerCount = kNumCascades });
             b.uniform(ubo);
             b.color(lit, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },
         [dev, ubo, g, csm](PassContext& ctx) {
-            // the body builds its own array view (graph resolves the texture; no graph-side abstraction):
-            // binds all kNumCascades layers as a single texture_depth_2d_array, like cube.sample below.
-            WGPUTextureViewDescriptor avd{
-                .format = kDepthFormat, .dimension = WGPUTextureViewDimension_2DArray,
-                .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = kNumCascades,
-            };
-            WGPUTextureView csmView = wgpuTextureCreateView(ctx.texture(csm), &avd);
             WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(lightingPipe, 0);
             WGPUBindGroupEntry e[6] = {
                 { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(SceneUBO) },
@@ -744,7 +738,7 @@ static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHa
                 { .binding = 2, .textureView = ctx.view(g.normal) },
                 { .binding = 3, .textureView = ctx.view(g.rough) },
                 { .binding = 4, .textureView = ctx.view(g.depth) },
-                { .binding = 5, .textureView = csmView },
+                { .binding = 5, .textureView = ctx.view(csm) },
             };
             WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 6, .entries = e };
             WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev, &d);
@@ -753,7 +747,6 @@ static ResourceHandle build_lighting(RenderGraph* rg, WGPUDevice dev, ResourceHa
             wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);
-            wgpuTextureViewRelease(csmView);
         });
     return lit;
 }
@@ -838,21 +831,16 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
     rg->add_pass("fog.inject"_rid, PassKind::Compute,
         [&](PassBuilder& b) {
             b.uniform(ubo);
-            b.sampled(csm);
+            // one depth-2d-array view spanning all cascades, exactly like the lighting body.
+            b.sampled(csm, 0, 0, { .dim = WGPUTextureViewDimension_2DArray, .layerCount = kNumCascades });
             b.sampled(scatter.prev);
             b.storage_write(scatter.curr);
         },
         [dev, ubo, csm, scatter, ix, iy, iz](PassContext& ctx) {
-            // CSM bound as one depth-2d-array view spanning all cascades, exactly like the lighting body.
-            WGPUTextureViewDescriptor avd{
-                .format = kDepthFormat, .dimension = WGPUTextureViewDimension_2DArray,
-                .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = kNumCascades,
-            };
-            WGPUTextureView csmView = wgpuTextureCreateView(ctx.texture(csm), &avd);
             WGPUBindGroupLayout l = wgpuComputePipelineGetBindGroupLayout(fogInjectPipe, 0);
             WGPUBindGroupEntry e[5] = {
                 { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(SceneUBO) },
-                { .binding = 1, .textureView = csmView },
+                { .binding = 1, .textureView = ctx.view(csm) },
                 { .binding = 2, .sampler = linSampler },
                 { .binding = 3, .textureView = ctx.view(scatter.prev) },   // default full-volume 3D view
                 { .binding = 4, .textureView = ctx.view(scatter.curr) },
@@ -864,7 +852,6 @@ static ResourceHandle build_volumetrics(RenderGraph* rg, const DemoEnv& env, Res
             wgpuComputePassEncoderDispatchWorkgroups(ctx.compute, ix, iy, iz);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);
-            wgpuTextureViewRelease(csmView);
         });
 
     // integrate: scatter.curr -> integrated volume, accumulating in-scatter + transmittance per column.
@@ -943,19 +930,16 @@ static ResourceHandle build_cube(RenderGraph* rg, WGPUDevice dev, ResourceHandle
     rg->add_pass("cube.sample"_rid, PassKind::Graphics,
         [&](PassBuilder& b) {
             b.uniform(ubo);     // camera basis for the ray
-            b.sampled(cube);
+            // all 6 faces as one texture_cube; Cube must be declared (a texture is a 2D array; cube-ness is a
+            // view property the graph can't infer). ctx.view(cube) now returns exactly this.
+            b.sampled(cube, 0, 0, { .dim = WGPUTextureViewDimension_Cube, .layerCount = 6 });
             b.color(scene, WGPULoadOp_Clear, WGPUStoreOp_Store, WGPUColor{0, 0, 0, 1});
         },
         [dev, ubo, cube](PassContext& ctx) {
-            WGPUTextureViewDescriptor cvd{
-                .format = kColorFormat, .dimension = WGPUTextureViewDimension_Cube,
-                .baseMipLevel = 0, .mipLevelCount = 1, .baseArrayLayer = 0, .arrayLayerCount = 6,
-            };
-            WGPUTextureView cubeView = wgpuTextureCreateView(ctx.texture(cube), &cvd);
             WGPUBindGroupLayout l = wgpuRenderPipelineGetBindGroupLayout(cubeSamplePipe, 0);
             WGPUBindGroupEntry e[3] = {
                 { .binding = 0, .buffer = ctx.buffer(ubo), .offset = 0, .size = sizeof(SceneUBO) },
-                { .binding = 1, .textureView = cubeView },
+                { .binding = 1, .textureView = ctx.view(cube) },
                 { .binding = 2, .sampler = linSampler },
             };
             WGPUBindGroupDescriptor d{ .layout = l, .entryCount = 3, .entries = e };
@@ -965,7 +949,6 @@ static ResourceHandle build_cube(RenderGraph* rg, WGPUDevice dev, ResourceHandle
             wgpuRenderPassEncoderDraw(ctx.render, 3, 1, 0, 0);
             wgpuBindGroupRelease(bg);
             wgpuBindGroupLayoutRelease(l);
-            wgpuTextureViewRelease(cubeView);
         });
     return scene;
 }

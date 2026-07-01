@@ -121,6 +121,20 @@ struct PassContext
     uint32_t buffer_size(ResourceHandle h) const;
 };
 
+// Optional view shape for a sampled/storage read: everything beyond the (baseMip, baseLayer) the read
+// methods already take. Defaults reproduce today's single-subresource 2D view, so `b.sampled(h)` is
+// unchanged. Set `dim` to reach a Cube/2DArray view, or bump the counts for a mip/layer range; leave
+// `dim` Undefined to infer (2DArray if layerCount>1, 3D for a volume, else 2D). Attachments ignore this
+// (a render target is always one mip/one layer) -- it rides the read builders only.
+struct ViewRange
+{
+    WGPUTextureViewDimension dim = WGPUTextureViewDimension_Undefined; // Undefined = infer from texture
+    uint32_t mipCount   = 1;                                           // subresource mips, from baseMip
+    uint32_t layerCount = 1;                                           // subresource layers, from baseLayer
+    WGPUTextureAspect aspect = WGPUTextureAspect_All;
+    WGPUTextureFormat format = WGPUTextureFormat_Undefined;            // Undefined = the texture's format
+};
+
 struct PassBuilder
 {
     // Color attachment (render passes only).
@@ -133,13 +147,14 @@ struct PassBuilder
     // MSAA resolve target. Call right after the color() it resolves. Must be single-sample with same
     // format and size. Dawn validates. Can be imported (e.g. resolve into the swapchain).
     void resolve(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
-    // Sampled (read-only in shader).
-    void sampled(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
-    void storage_read(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
-    void storage_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    // Sampled (read-only in shader). Pass a ViewRange for a Cube/2DArray/range/aspect view; ctx.view()
+    // then hands the body exactly this view (no more hand-rolled wgpuTextureCreateView in pass bodies).
+    void sampled(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0, ViewRange range = {});
+    void storage_read(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0, ViewRange range = {});
+    void storage_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0, ViewRange range = {});
     // Storage read+write on one resource in a single pass. Maps to WGSL var<storage, read_write>.
     // In-dispatch race is the shader's responsibility (own-slot / atomics only).
-    void storage_read_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0);
+    void storage_read_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0, ViewRange range = {});
     // Uniform buffer.
     void uniform(ResourceHandle handle);
     // Transfer (copy) source / destination.
@@ -215,8 +230,8 @@ struct RenderGraph
 
     // Declare a pass. Declaration order defines SSA versions: declare a resource's writer before
     // its readers. Reading a transient resource before any writer is an authoring error: compile()
-    // returns false. Imported resources read before an in-graph write is legal (normal WAR).
-    // Order-independent declaration is not supported.
+    // poisons the graph (see below). Imported resources read before an in-graph write is legal
+    // (normal WAR). Order-independent declaration is not supported.
     template<typename BuilderFn, typename ExecuteFn>
     void add_pass(ResourceId id, PassKind kind, BuilderFn&& setup, ExecuteFn&& executeFn)
     {
@@ -228,9 +243,11 @@ struct RenderGraph
         end_pass(builder);
     }
 
-    // Build the DAG, cull dead passes, topo-sort, accumulate usage. Returns false on ordering error
-    // (read-before-write of a transient).
-    // enableAlias: pack disjoint-lifetime transients onto shared GPU objects to cut peak VRAM.
+    // Build the DAG, cull dead passes, topo-sort, accumulate usage. On an ordering error
+    // (read-before-write of a transient, or a cyclic pass DAG) it poisons the graph instead of
+    // returning a status: the graph enters a Failed state, realize()/execute() become no-ops, and
+    // getErrors() reports why. enableAlias: pack disjoint-lifetime transients onto shared GPU objects
+    // to cut peak VRAM.
     void compile(bool enableAlias);
 
     // Record passes into a caller-owned encoder. enableProfiling: per-pass GPU timestamps (needs
@@ -265,8 +282,7 @@ private:
 };
 
 // Create the `GraphAllocator`
-// arenaSize defaults to 1 MB for now
-GraphAllocator* create_allocator(size_t arenaSize = 1u << 20);
+GraphAllocator* create_allocator();
 
 // Destroys a `GraphAllocator`
 void destroy_allocator(GraphAllocator* allocator);
@@ -275,12 +291,6 @@ void destroy_allocator(GraphAllocator* allocator);
 // Don't ever store the in instance of the `RenderGraph`
 // Calling this invalidates the old `RenderGraph`
 RenderGraph* create_render_graph(GraphAllocator* allocator);
-
-// Dump the compiled graph as a Mermaid flowchart to stdout.
-void debug_print_mermaid(RenderGraph* rg);
-
-// Dump transient resource lifetimes as a Mermaid Gantt chart.
-void debug_print_lifetimes(RenderGraph* rg);
 
 }// RG
 #endif // RENDERGRAPH_H
