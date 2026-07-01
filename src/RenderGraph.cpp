@@ -156,7 +156,7 @@ struct PersistentResourcePool
         }
         entries.emplace_back();
         Entry& e = entries.back();
-        e.name.assign(id.name.data ? id.name.data : "", sv_length(id.name));   // TODO: get rid of std::string 
+        e.name.assign(id.name.data ? id.name.data : "", sv_length(id.name));   // TODO: get rid of std::string
         e.id = { id.value, {e.name.data(), e.name.size()}};
         e.lastTouched = evictClock;
         e.layers = layers;
@@ -786,7 +786,7 @@ struct PassNode
     PassNode* next{}; // ptr to the next pass node of the render graph
 };
 
-// walk the `NodeAdjacency` to get all adjacent nodes 
+// walk the `NodeAdjacency` to get all adjacent nodes
 struct NodeAdjacency
 {
     PassNode* pass{};
@@ -837,7 +837,7 @@ struct RenderGraphStorage
     uint32_t                m_slotCount{};
     // execute() scratch: subresource views built for the current pass (attachments + the body's ctx.view()),
     // released after the body. reset per pass; one view per access, so the per-pass access ceiling bounds it.
-    WGPUTextureView         viewScratch[PassNode::kMaxAccess]{};
+    WGPUTextureView*         viewScratch{};
     uint32_t                viewScratchN{};
     bool                    m_isValid{}; // if `m_isValid` is `false` execute becomes a noop. The client needs to check for error messages
     ErrorMessage*           m_errors{}; // linked list of error messages
@@ -985,6 +985,11 @@ ResourceHandle RenderGraph::create_image(ResourceId id, const TextureDesc& desc)
     validate_texture_desc(desc);
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
@@ -1011,6 +1016,11 @@ ResourceHandle RenderGraph::create_buffer(ResourceId id, const BufferDesc& desc)
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
@@ -1030,6 +1040,11 @@ ResourceHandle RenderGraph::importe_image(ResourceId id, WGPUTextureView view, W
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Texture };
@@ -1049,6 +1064,11 @@ ResourceHandle RenderGraph::import_buffer(ResourceId id, WGPUBuffer buffer)
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
 
     resouce->handle = { s.next_resource_id++, ResourceKind::Buffer };
@@ -1070,6 +1090,11 @@ TemporalResource RenderGraph::create_temporal_image(ResourceId id, const Texture
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     s.m_allocator->pool.touch(id, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
@@ -1106,6 +1131,11 @@ TemporalResource RenderGraph::create_temporal_buffer(ResourceId id, const Buffer
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     s.m_allocator->pool.touch(id, PersistentResourcePool::kLayers, hash);
 
     TemporalResource out{};
@@ -1132,6 +1162,11 @@ ResourceHandle RenderGraph::create_persistent_buffer(ResourceId id, const Buffer
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     s.m_allocator->pool.touch(id, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
@@ -1154,6 +1189,11 @@ ResourceHandle RenderGraph::create_persistent_image(ResourceId id, const Texture
 {
     RenderGraphStorage& s = *storage(this);
     assert(s.m_state == RenderGraphState::Recording && "Render graph is in read only mode after compile()");
+
+    for(ResourceNode* r = s.m_resouces; r; r = r->next){
+        assert(!(r->id == id) && "ResourceIds must to be unique");
+    }
+
     s.m_allocator->pool.touch(id, 1);   // single layer: slot() always resolves to 0, no rotation
 
     ResourceNode* resouce = s.m_allocator->make<ResourceNode>();
@@ -1891,9 +1931,9 @@ static void realize_graph(RenderGraph* rg, WGPUDevice device)
         if (!r->persistent) continue;
         PersistentResourcePool::Entry* e = pool.find(r->id);
         if (!e) continue;
-        if (r->kind == ResourceNode::Kind::Texture) 
+        if (r->kind == ResourceNode::Kind::Texture)
             e->usage    |= r->texUsage;
-        else                                       
+        else
             e->bufUsage |= r->bufUsage;
     }
 
@@ -1961,6 +2001,9 @@ void RenderGraph::execute(WGPUDevice device, WGPUCommandEncoder encoder, WGPUQue
     RenderGraphStorage& s = *storage(this);
     if (s.m_isValid == false)
             return; // iff errors noop
+
+    ScopedScratch scratch(s.m_allocator->scratch);
+    s.viewScratch = scratch.alloc<WGPUTextureView>(PassNode::kMaxAccess);
 
     // Realize GPU resources first
     realize_graph(this, device);
