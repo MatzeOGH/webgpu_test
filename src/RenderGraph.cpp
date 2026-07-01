@@ -1230,7 +1230,18 @@ PassBuilder RenderGraph::begin_pass(ResourceId id, PassKind kind)
 
 void RenderGraph::end_pass(PassBuilder& builder)
 {
-    list_append(&storage(this)->m_passes, builder.m_new_pass);
+    PassNode* pass = builder.m_new_pass;
+    if (pass->initTarget.id) {
+        bool wrote = false;
+        for (uint32_t i = 0; i < pass->accessCount; ++i)
+            if (pass->accesses[i].handle.id == pass->initTarget.id && access_is_write(pass->accesses[i].type)) {
+                wrote = true;
+                break;
+            }
+        assert(wrote && "initialize() target must also be written by this pass (e.g. .color()/.storage_write()) -- "
+                         "initialize() only gates skip/run, it is not itself a write");
+    }
+    list_append(&storage(this)->m_passes, pass);
 }
 
 void* RenderGraph::alloc_exec(size_t size, size_t align)
