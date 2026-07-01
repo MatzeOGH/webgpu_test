@@ -598,6 +598,7 @@ static bool  fogOn = true;   // froxel volumetric fog; default on so the new pas
 static bool  aliasDemoOn = false;   // R2: insert a disjoint-lifetime scratch chain that exercises phase-4 aliasing
 static bool  forceKeepDemoOn = false;   // Q1: a side-effect-only pass kept alive by force_keep() (else culled)
 static bool  bufAliasDemoOn = true;   // B4: transient-BUFFER disjoint-lifetime chain (exercises buffer aliasing)
+static bool  copyDemoOn = false;   // texture<->texture snapshot + texture<->buffer readback via the copy() API
 // Q6: history invalidation epoch. bumped on frame gap (demo switch) or manual reset; used as the hash
 // for temporal resources so the pool destroys+recreates both layers (zeros .prev).
 static uint64_t historyEpoch = 1;
@@ -1238,6 +1239,48 @@ static void build_buffer_alias_test(RenderGraph* rg, const DemoEnv& env, bool en
     }
 }
 
+// copy-feature demo: proves the unified copy()/ctx.copy_*_info() API end to end. Leg A is a
+// texture-to-texture snapshot of `scene` into a persistent history texture; leg B copies that
+// snapshot into a plain transient buffer to exercise the texture->buffer path
+// (copy_dst_buffer/bytesPerRow alignment). No CPU readback -- mapping a buffer back is a much
+// slower, separate concern the demo doesn't need to prove; a clean run (no GPU error) is enough
+// to show both copy() directions are wired correctly.
+static void build_copy_test(RenderGraph* rg, const DemoEnv& env, ResourceHandle scene, bool enabled)
+{
+    if (!enabled) return;
+    ResourceHandle history = rg->create_persistent_image("copy.history"_rid, {
+        .dimension = WGPUTextureDimension_2D, .format = kSwapFormat,
+        .sizeKind = SizeKind::Relative, .scaleX = 1.0f, .scaleY = 1.0f, .relativeTo = scene,
+    });
+
+    // history is persistent -> is_sink() roots this pass automatically (persistent counts as
+    // external, same as imported); no force_keep() needed.
+    rg->add_pass("copy.snapshot"_rid, PassKind::Transfer,
+        [&](PassBuilder& b) { b.copy(scene, history); },
+        [scene, history](PassContext& ctx) {
+            WGPUTexelCopyTextureInfo src = ctx.copy_src_info(scene);
+            WGPUTexelCopyTextureInfo dst = ctx.copy_dst_info(history);
+            WGPUExtent3D ext = ctx.copy_extent_src(scene);
+            wgpuCommandEncoderCopyTextureToTexture(ctx.encoder, &src, &dst, &ext);
+        });
+
+    // leg B: texture -> buffer, GPU-side only. `buf` is transient with nothing reading it in-graph,
+    // so it needs force_keep() (is_sink() only roots a write to an imported/persistent resource).
+    // kSwapFormat is BGRA8Unorm -> 4 bytes/texel.
+    uint32_t bpr = aligned_bytes_per_row(env.width, 4);
+    ResourceHandle buf = rg->create_buffer("copy.dstbuf"_rid, { .size = uint64_t(bpr) * env.height });
+    rg->add_pass("copy.tobuf"_rid, PassKind::Transfer,
+        [&](PassBuilder& b) { b.copy(history, buf); b.force_keep(); },
+        [history, buf, bpr](PassContext& ctx) {
+            WGPUExtent3D ext = ctx.copy_extent_src(history);
+            WGPUTexelCopyTextureInfo src = ctx.copy_src_info(history);
+            // rowsPerImage must be the real row count, not 0 -- 0 means "zero rows", not "undefined"
+            // (that sentinel is WGPU_COPY_STRIDE_UNDEFINED / UINT32_MAX, only valid for a 1-row copy).
+            WGPUTexelCopyBufferInfo dst = ctx.copy_dst_buffer(buf, { .offset = 0, .bytesPerRow = bpr, .rowsPerImage = ext.height });
+            wgpuCommandEncoderCopyTextureToBuffer(ctx.encoder, &src, &dst, &ext);
+        });
+}
+
 // present: blit the final scene colour to the swapchain (the chain's sink).
 static void build_present(RenderGraph* rg, WGPUDevice dev, ResourceHandle scene, ResourceHandle swap)
 {
@@ -1624,6 +1667,7 @@ static void deferred_build(const DemoEnv& env, RenderGraph* rg, ResourceHandle s
     scene = build_alias_test(rg, env, scene, swap, aliasDemoOn);   // R2: off by default; exercises phase-4 aliasing
     scene = build_forcekeep_test(rg, scene, swap, forceKeepDemoOn);   // Q1: off by default; side pass kept by force_keep()
     build_buffer_alias_test(rg, env, bufAliasDemoOn);   // B4: off by default; transient-buffer alias chain (compute side passes)
+    build_copy_test(rg, env, scene, copyDemoOn);   // off by default; texture<->texture snapshot + texture<->buffer readback
     build_present(rg, dev, scene, swap);
 }
 
@@ -1638,6 +1682,7 @@ static void deferred_ui()
     ImGui::Checkbox("Alias test", &aliasDemoOn);
     ImGui::Checkbox("force_keep test", &forceKeepDemoOn);
     ImGui::Checkbox("Buffer alias test", &bufAliasDemoOn);
+    ImGui::Checkbox("Copy test", &copyDemoOn);
     if (ImGui::Button("Reset history")) ++historyEpoch;
     if (fogOn) {
         ImGui::SliderFloat("Fog density",    &fogDensity,       0.0f, 0.5f);

@@ -118,7 +118,23 @@ struct PassContext
     WGPUTexture texture(ResourceHandle h) const;
     WGPUBuffer buffer(ResourceHandle h) const;
     WGPUExtent3D texture_size(ResourceHandle h) const;
-    uint32_t buffer_size(ResourceHandle h) const;
+    uint64_t buffer_size(ResourceHandle h) const;
+
+    // Copy-info resolvers: pull the ONE copy() access declared with h as src/dst in this pass and
+    // fold its baseMip/baseLayer into the descriptor -- mip goes to .mipLevel, baseLayer adds onto
+    // origin.z (2D-array layer and 3D volume z-offset share that field, so they compose). Split by
+    // direction, not one direction-agnostic resolver, because a same-texture copy() can legally
+    // declare h as both src (at one mip/layer) and dst (at another) in one pass.
+    WGPUTexelCopyTextureInfo copy_src_info(ResourceHandle h, WGPUOrigin3D origin = {}, WGPUTextureAspect aspect = WGPUTextureAspect_All) const;
+    WGPUTexelCopyTextureInfo copy_dst_info(ResourceHandle h, WGPUOrigin3D origin = {}, WGPUTextureAspect aspect = WGPUTextureAspect_All) const;
+    // copySize for a copy() involving h: mip-shifted width/height of the declared src/dst access
+    // (depthOrArrayLayers is not mip-shifted -- only width/height halve per level).
+    WGPUExtent3D copy_extent_src(ResourceHandle h) const;
+    WGPUExtent3D copy_extent_dst(ResourceHandle h) const;
+    // Buffer side of a copy(): confirms a matching access was declared, returns {layout, buffer}.
+    // mip/layer don't apply to buffers -- layout is the caller's own data-shape choice.
+    WGPUTexelCopyBufferInfo copy_src_buffer(ResourceHandle h, WGPUTexelCopyBufferLayout layout) const;
+    WGPUTexelCopyBufferInfo copy_dst_buffer(ResourceHandle h, WGPUTexelCopyBufferLayout layout) const;
 };
 
 // Optional view shape for a sampled/storage read: everything beyond the (baseMip, baseLayer) the read
@@ -134,6 +150,15 @@ struct ViewRange
     WGPUTextureAspect aspect = WGPUTextureAspect_All;
     WGPUTextureFormat format = WGPUTextureFormat_Undefined;            // Undefined = the texture's format
 };
+
+// WebGPU requires bytesPerRow in a buffer<->texture copy to be a 256-byte multiple whenever the
+// copy spans more than one row. Pure math -- caller supplies texelBlockBytes for their own
+// format; no format table here, that's the caller's job.
+inline uint32_t aligned_bytes_per_row(uint32_t widthTexels, uint32_t texelBlockBytes)
+{
+    uint32_t raw = widthTexels * texelBlockBytes;
+    return (raw + 255u) & ~255u;
+}
 
 struct PassBuilder
 {
@@ -157,9 +182,17 @@ struct PassBuilder
     void storage_read_write(ResourceHandle handle, uint32_t baseMip = 0, uint32_t baseLayer = 0, ViewRange range = {});
     // Uniform buffer.
     void uniform(ResourceHandle handle);
-    // Transfer (copy) source / destination.
-    void copy_src(ResourceHandle handle);
-    void copy_dst(ResourceHandle handle);
+    // Transfer passes only: declares a copy in one call -- CopySrc on `src` (at srcMip/srcLayer) +
+    // CopyDst on `dst` (at dstMip/dstLayer). mip/layer are texture-only (asserted 0 for a buffer handle).
+    // Several copy() calls per pass may touch one resource (each copy command is its own WebGPU usage
+    // scope, ordered by encoder order); the ctx.copy_*_info resolvers, though, need an unambiguous
+    // handle+direction per pass -- declare more and the body builds its copy infos by hand.
+    // src == dst is legal (a same-texture copy between non-overlapping subresources, e.g. layer i
+    // into layer j) but asserted against the exact same subresource, which WebGPU forbids as an
+    // overlapping in-place copy. NOT for mip-chain/Hi-Z generation: CopyTextureToTexture can't
+    // resize (mip i and mip i+1 have different extents) -- use a blit pass instead
+    // (sampled(baseMip=i) + color()/storage_write(baseMip=i+1), same as the bloom demo).
+    void copy(ResourceHandle src, ResourceHandle dst, uint32_t srcMip = 0, uint32_t srcLayer = 0, uint32_t dstMip = 0, uint32_t dstLayer = 0);
     // Buffer-only: vertex, index, indirect args.
     void vertex_buffer(ResourceHandle handle);
     void index_buffer(ResourceHandle handle);
@@ -178,6 +211,7 @@ struct PassBuilder
     void force_keep();
 
     PassNode* m_new_pass{};
+    RenderGraph* m_graph{};   // owning graph; lets the builder assert a handle belongs to this frame
 };
 struct GraphAllocator;
 
@@ -257,8 +291,8 @@ struct RenderGraph
     // event pump a few frames later. No-op if profiling was off.
     void collect_gpu_timings();
 
-    // Query for errors. is null when no errors where found
-    // TODO: add error messages
+    // Errors compile() found. Null when the graph compiled clean. Messages are arena-owned:
+    // valid until the next create_render_graph() resets the frame.
     ErrorMessage* getErrors();
 
 private:
@@ -287,8 +321,8 @@ GraphAllocator* create_allocator();
 // Destroys a `GraphAllocator`
 void destroy_allocator(GraphAllocator* allocator);
 
-// Create render graph that is ready for recording.
-// Don't ever store the in instance of the `RenderGraph`
+// Create a render graph that is ready for recording.
+// Never store the returned `RenderGraph` (or its handles) across frames.
 // Calling this invalidates the old `RenderGraph`
 RenderGraph* create_render_graph(GraphAllocator* allocator);
 

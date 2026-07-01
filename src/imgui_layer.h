@@ -2591,7 +2591,7 @@ static void rg_draw_timings(RenderGraphStorage& s)
 		ImGui::Dummy(ImVec2(15, 0));
 		ImGui::SameLine();
 		char id[80];
-		std::snprintf(id, sizeof(id), "%.*s##series%u", (int)gp.series[si].name.length, gp.series[si].name.data, si);
+		std::snprintf(id, sizeof(id), "%s##series%u", gp.series[si].name, si);
 		ImGui::Checkbox(id, &gp.series[si].enabled);
 		ImGui::SameLine(ImGui::GetContentRegionAvail().x - 70.0f);
 		ImGui::Text("%6.1f us", gp.historyLen ? gp.series[si].v[readCol] : 0.0f);
@@ -2620,7 +2620,7 @@ static void imgui_layer_draw_graph(RenderGraph* rg)
 		ImGui::Text("  gpu %.2f ms", totalUs / 1000.0f);
 		if (ImGui::IsItemHovered() && ImGui::BeginTooltip()) {
 			for (uint32_t i = 0; i < gp.resultCount; ++i)
-				ImGui::Text("%6.1f us  %.*s", gp.resultUs[i], (int)gp.resultNames[i].length, gp.resultNames[i].data);
+				ImGui::Text("%6.1f us  %s", gp.resultUs[i], gp.resultNames[i]);
 			ImGui::EndTooltip();
 		}
 	}
