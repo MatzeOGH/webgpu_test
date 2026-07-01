@@ -137,7 +137,7 @@ struct PersistentResourcePool
 
     struct Entry
     {
-        ResourceId           id{};
+        uint64_t             idValue = 0;         // ResourceId::value; name identity lives in `name` below
         std::string          name;               // identity across frames (arena names don't persist)
         uint64_t             frame  = 0;          // rotation counter, bumped once per touch (declaration)
         uint64_t             lastTouched = 0;     // pool evictClock at the last touch; stale entries are freed
@@ -152,6 +152,7 @@ struct PersistentResourcePool
 
         // what the live textures were created with; a mismatch forces a recreate (resize/format/usage).
         bool                 created       = false;
+        uint64_t             createdClock  = UINT64_MAX;  // evictClock at last (re)create; catches same-frame recreate
         WGPUExtent3D         size          = {};
         WGPUTextureFormat    format        = WGPUTextureFormat_Undefined;
         WGPUTextureDimension dim           = WGPUTextureDimension_Undefined;
@@ -178,7 +179,7 @@ struct PersistentResourcePool
     Entry* find(ResourceId id)
     {
         for (Entry& e : entries)
-            if (e.id.value == id.value && sv_eq(WGPUStringView{ e.name.c_str(), e.name.size() }, id.name))
+            if (e.idValue == id.value && sv_eq(WGPUStringView{ e.name.c_str(), e.name.size() }, id.name))
                 return &e;
         return nullptr;
     }
@@ -197,8 +198,8 @@ struct PersistentResourcePool
         }
         entries.emplace_back();
         Entry& e = entries.back();
-        e.name.assign(id.name.data ? id.name.data : "", sv_length(id.name));   // TODO: get rid of std::string
-        e.id = { id.value, {e.name.data(), e.name.size()}};
+        e.name.assign(id.name.data ? id.name.data : "", sv_length(id.name));
+        e.idValue = id.value;
         e.lastTouched = evictClock;
         e.layers = layers;
         e.historyHash = hash;
@@ -225,6 +226,9 @@ struct PersistentResourcePool
             && e->sampleCount == sampleCount
             && e->usageAtCreate == e->usage;
         if (same) return;
+        // a recreate after another layer node already realized this frame would dangle that node's cached
+        // tex/view -- layer nodes of one entry must agree on the descriptor (they come from one declaration).
+        assert(e->createdClock != evictClock && "temporal layer nodes disagree on texture descriptor");
         destroy(e);
         e->size = size; e->format = format; e->dim = dim; e->mipLevelCount = mipLevelCount; e->sampleCount = sampleCount; e->usageAtCreate = e->usage;
         for (uint32_t i = 0; i < e->layers; ++i) {
@@ -241,6 +245,7 @@ struct PersistentResourcePool
             e->view[i] = wgpuTextureCreateView(e->tex[i], nullptr);
         }
         e->created = true;
+        e->createdClock = evictClock;
     }
 
     // (re)create the entry's `layers` buffers when missing or size/usage
@@ -251,6 +256,7 @@ struct PersistentResourcePool
     {
         bool same = e->created && e->bufferSize == size && e->bufUsageAtCreate == e->bufUsage;
         if (same) return;
+        assert(e->createdClock != evictClock && "temporal layer nodes disagree on buffer descriptor");
         destroy(e);
         e->bufferSize = size; e->bufUsageAtCreate = e->bufUsage;
         for (uint32_t i = 0; i < e->layers; ++i) {
@@ -262,6 +268,7 @@ struct PersistentResourcePool
             e->buf[i] = wgpuDeviceCreateBuffer(device, &d);
         }
         e->created = true;
+        e->createdClock = evictClock;
     }
 
     void destroy(Entry* e)
@@ -285,7 +292,7 @@ struct PersistentResourcePool
         for (size_t i = entries.size(); i-- > 0; )
             if (evictClock - entries[i].lastTouched >= kRetain) {   // lastTouched <= evictClock -> no underflow
                 destroy(&entries[i]);
-                entries[i] = entries.back();
+                if (i + 1 != entries.size()) entries[i] = std::move(entries.back());   // guard self-move on the last slot
                 entries.pop_back();
             }
         ++evictClock;
@@ -922,8 +929,6 @@ static RenderGraphStorage* storage(RenderGraph* rg)
     return reinterpret_cast<RenderGraphStorage*>(reinterpret_cast<uint8_t*>(rg) + GraphAllocator::align_up(sizeof(RenderGraph), alignof(RenderGraphStorage)));
 }
 
-// appends newNode to the end of the intrusive list via its tail pointer (O(1)).
-// works for any node with a `next` pointer (ResourceNode, PassNode, ErrorMessage)
 template<typename T>
 static void list_append(T** head, T** tail, T* newNode)
 {
@@ -932,15 +937,14 @@ static void list_append(T** head, T** tail, T* newNode)
     *tail = newNode;
 }
 
-// arena-copy a formatted message, append it (tail = detection order), and poison the graph.
-// once poisoned, realize + execute become no-ops; the caller drains getErrors() to learn why.
+// append an error message and switch the graph to its failed state
 static void push_error(RenderGraphStorage& s, const char* fmt, ...)
 {
     char buf[512];
     va_list ap; va_start(ap, fmt);
     std::vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    std::printf("[RenderGraph] error: %s\n", buf);   // keep the old console breadcrumb too
+    std::printf("[RenderGraph] error: %s\n", buf);
     if (ErrorMessage* e = s.m_allocator->make<ErrorMessage>()) {
         e->message = s.m_allocator->copy_string(WGPUStringView{ buf, std::strlen(buf) });
         list_append(&s.m_errors, &s.m_errorsTail, e);
@@ -983,7 +987,7 @@ void destroy_allocator(GraphAllocator* allocator)
 {
     allocator->front.free_all();
     allocator->scratch.free_all();
-    delete allocator;   // runs the pool/transient/profiler destructors (they release GPU handles)
+    delete allocator;
 }
 
 RenderGraph* create_render_graph(GraphAllocator* allocator)
@@ -2082,6 +2086,7 @@ static void realize_graph(RenderGraph* rg, WGPUDevice device)
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (!r->persistent) continue;
         PersistentResourcePool::Entry* e = pool.find(r->id);
+        assert(e && "persistent node without pool entry -- touch() at declaration should have created it");
         if (!e) continue;
         if (r->kind == ResourceNode::Kind::Texture)
             e->usage    |= r->texUsage;
@@ -2092,6 +2097,7 @@ static void realize_graph(RenderGraph* rg, WGPUDevice device)
     for (ResourceNode* r = s.m_resouces; r; r = r->next) {
         if (!r->persistent) continue;
         PersistentResourcePool::Entry* e = pool.find(r->id);
+        assert(e && "persistent node without pool entry -- touch() at declaration should have created it");
         if (!e) continue;
         uint32_t sl = pool.slot(*e, r->temporalIndex);
         if (r->kind == ResourceNode::Kind::Texture) {
